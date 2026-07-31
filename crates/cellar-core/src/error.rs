@@ -36,7 +36,7 @@ impl fmt::Display for ReadinessBlocker {
 }
 
 /// An application error independent of any transport or runtime framework.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum CellarError {
     #[error("invalid input")]
     InvalidInput,
@@ -57,6 +57,21 @@ pub enum CellarError {
         #[source]
         source: Box<dyn Error + Send + Sync + 'static>,
     },
+}
+
+impl fmt::Debug for CellarError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput => formatter.write_str("InvalidInput"),
+            Self::Unauthenticated => formatter.write_str("Unauthenticated"),
+            Self::Forbidden => formatter.write_str("Forbidden"),
+            Self::Conflict => formatter.write_str("Conflict"),
+            Self::InvalidRange => formatter.write_str("InvalidRange"),
+            Self::StorageFull => formatter.write_str("StorageFull"),
+            Self::Unavailable => formatter.write_str("Unavailable"),
+            Self::Internal { .. } => formatter.write_str("Internal { source: <redacted> }"),
+        }
+    }
 }
 
 impl CellarError {

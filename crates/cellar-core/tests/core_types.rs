@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use cellar_core::{
-    CellarError, FileEntryId, IdParseError, OperationId, ProjectId, ReadinessBlocker, TrashId,
+    CellarError, FileEntryId, OperationId, ParseIdError, ProjectId, ReadinessBlocker, TrashId,
     UploadId,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -24,7 +24,7 @@ where
         + Eq
         + std::fmt::Debug
         + std::fmt::Display
-        + FromStr<Err = IdParseError>
+        + FromStr<Err = ParseIdError>
         + Serialize
         + DeserializeOwned,
 {
@@ -37,6 +37,7 @@ where
     assert_eq!(text.parse::<T>().expect("display should parse"), id);
 
     let json = serde_json::to_string(&id).expect("ID should serialize");
+    assert_eq!(json, format!("\"{text}\""));
     assert_eq!(
         serde_json::from_str::<T>(&json).expect("ID should deserialize"),
         id
@@ -72,8 +73,42 @@ fn identifiers_are_opaque_uuid_v7_value_types() {
 
 #[test]
 fn identifiers_report_a_typed_parse_error() {
-    let error: IdParseError = ProjectId::from_str("not-a-uuid").expect_err("input is invalid");
+    let error: ParseIdError = ProjectId::from_str("not-a-uuid").expect_err("input is invalid");
+    assert!(matches!(error, ParseIdError::InvalidUuid(_)));
     assert!(!error.to_string().is_empty());
+}
+
+fn assert_rejects_non_v7<T>()
+where
+    T: std::fmt::Debug + FromStr<Err = ParseIdError> + DeserializeOwned,
+{
+    let non_v7_ids = [
+        "00000000-0000-0000-0000-000000000000",
+        "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "550e8400-e29b-41d4-a716-446655440000",
+    ];
+
+    for value in non_v7_ids {
+        assert!(matches!(
+            value.parse::<T>(),
+            Err(ParseIdError::WrongVersion)
+        ));
+
+        let json = format!("\"{value}\"");
+        assert!(
+            serde_json::from_str::<T>(&json).is_err(),
+            "{value} must be rejected during JSON deserialization"
+        );
+    }
+}
+
+#[test]
+fn identifiers_reject_non_v7_text_and_json() {
+    assert_rejects_non_v7::<ProjectId>();
+    assert_rejects_non_v7::<FileEntryId>();
+    assert_rejects_non_v7::<UploadId>();
+    assert_rejects_non_v7::<OperationId>();
+    assert_rejects_non_v7::<TrashId>();
 }
 
 #[test]
@@ -118,8 +153,15 @@ fn cellar_errors_have_stable_category_codes() {
         assert_eq!(error.code(), expected_code);
         assert!(!error.to_string().is_empty());
     }
+}
 
-    let internal = CellarError::internal(std::io::Error::other("sensitive backend details"));
+#[test]
+fn internal_errors_redact_sources_from_outward_formatting() {
+    const SENSITIVE_MARKER: &str = "sensitive-backend-marker";
+    let internal = CellarError::internal(std::io::Error::other(SENSITIVE_MARKER));
+
     assert_eq!(internal.code(), "internal");
-    assert!(!internal.to_string().contains("sensitive backend details"));
+    assert!(std::error::Error::source(&internal).is_some());
+    assert!(!internal.to_string().contains(SENSITIVE_MARKER));
+    assert!(!format!("{internal:?}").contains(SENSITIVE_MARKER));
 }

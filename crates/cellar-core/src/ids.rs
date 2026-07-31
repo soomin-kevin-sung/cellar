@@ -1,15 +1,22 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use serde::{Deserialize, Deserializer, Serialize};
+use thiserror::Error;
+use uuid::{Uuid, Version};
 
-/// The error returned when parsing an identifier from text.
-pub type IdParseError = uuid::Error;
+/// An error returned when text does not contain a valid UUID-v7 identifier.
+#[derive(Debug, Error)]
+pub enum ParseIdError {
+    #[error("invalid UUID syntax")]
+    InvalidUuid(#[source] uuid::Error),
+    #[error("identifier UUID must be version 7")]
+    WrongVersion,
+}
 
 macro_rules! define_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
         pub struct $name(Uuid);
 
         impl $name {
@@ -33,10 +40,25 @@ macro_rules! define_id {
         }
 
         impl FromStr for $name {
-            type Err = IdParseError;
+            type Err = ParseIdError;
 
             fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(value).map(Self)
+                let uuid = Uuid::parse_str(value).map_err(ParseIdError::InvalidUuid)?;
+                if uuid.get_version() != Some(Version::SortRand) {
+                    return Err(ParseIdError::WrongVersion);
+                }
+
+                Ok(Self(uuid))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                value.parse().map_err(serde::de::Error::custom)
             }
         }
     };
