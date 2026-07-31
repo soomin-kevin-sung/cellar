@@ -490,14 +490,55 @@ async fn malformed_utf8_text_uses_deterministic_raw_byte_ordering() {
 }
 
 #[tokio::test]
-async fn panicking_comparator_never_unwinds_across_sqlite() {
+async fn malformed_text_is_disjoint_from_valid_equivalence_classes() {
+    let db = TestDb::new();
+    let collation = FilenameCollation::windows_ordinal_ci_v1(|left, right| {
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
+    let pool = open_pool(&db.path, collation)
+        .await
+        .expect("open pool with case-insensitive test comparator");
+
+    let (valid_equal, raw_between, malformed_before_upper, malformed_before_lower): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT
+               'A' = 'a' COLLATE WINDOWS_ORDINAL_CI_V1,
+               ('A' COLLATE BINARY < CAST(x'5080' AS TEXT)
+                AND CAST(x'5080' AS TEXT) COLLATE BINARY < 'a'),
+               CAST(x'5080' AS TEXT) COLLATE WINDOWS_ORDINAL_CI_V1 < 'A',
+               CAST(x'5080' AS TEXT) COLLATE WINDOWS_ORDINAL_CI_V1 < 'a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("compare malformed and equivalent valid values");
+    assert_eq!(valid_equal, 1);
+    assert_eq!(raw_between, 1);
+    assert_eq!((malformed_before_upper, malformed_before_lower), (1, 1));
+
+    let invalid_order: i64 = sqlx::query_scalar(
+        "SELECT CAST(x'5080' AS TEXT) COLLATE WINDOWS_ORDINAL_CI_V1
+                < CAST(x'5180' AS TEXT)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("compare two malformed values by raw bytes");
+    assert_eq!(invalid_order, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn comparator_panic_interrupts_write_and_poisons_connection() {
     const CHILD_ENV: &str = "CELLAR_DB_PANIC_COLLATION_CHILD";
     if std::env::var_os(CHILD_ENV).is_none() {
         let status = std::process::Command::new(
             std::env::current_exe().expect("locate migration test executable"),
         )
         .arg("--exact")
-        .arg("panicking_comparator_never_unwinds_across_sqlite")
+        .arg("comparator_panic_interrupts_write_and_poisons_connection")
         .arg("--nocapture")
         .env(CHILD_ENV, "1")
         .status()
@@ -509,20 +550,61 @@ async fn panicking_comparator_never_unwinds_across_sqlite() {
     let db = TestDb::new();
     let previous_panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let collation =
-        FilenameCollation::windows_ordinal_ci_v1(|_, _| panic!("intentional comparator panic"));
+    struct PanicAgainOnDrop;
+    impl Drop for PanicAgainOnDrop {
+        fn drop(&mut self) {
+            panic!("panic payload destructor must never run");
+        }
+    }
+    let collation = FilenameCollation::windows_ordinal_ci_v1(|left, right| {
+        if left == "panic" || right == "panic" {
+            std::panic::panic_any(PanicAgainOnDrop);
+        }
+        left.cmp(right)
+    });
     let pool = open_pool(&db.path, collation)
         .await
         .expect("open pool with panicking comparator");
-    let forward: i64 = sqlx::query_scalar("SELECT 'alpha' COLLATE WINDOWS_ORDINAL_CI_V1 < 'bravo'")
-        .fetch_one(&pool)
+    let mut connection = pool.acquire().await.expect("acquire one connection");
+    sqlx::query(
+        "CREATE TABLE panic_write (
+           name TEXT NOT NULL COLLATE WINDOWS_ORDINAL_CI_V1 UNIQUE
+         )",
+    )
+    .execute(&mut *connection)
+    .await
+    .expect("create selective-panic table");
+    sqlx::query("INSERT INTO panic_write (name) VALUES ('alpha')")
+        .execute(&mut *connection)
         .await
-        .expect("panic falls back to byte ordering");
-    let reverse: i64 = sqlx::query_scalar("SELECT 'bravo' COLLATE WINDOWS_ORDINAL_CI_V1 < 'alpha'")
-        .fetch_one(&pool)
+        .expect("insert non-panicking seed");
+
+    let panic_insert = sqlx::query("INSERT INTO panic_write (name) VALUES ('panic')")
+        .execute(&mut *connection)
+        .await;
+    assert!(
+        panic_insert.is_err(),
+        "panicking comparison committed a row"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM panic_write")
+        .fetch_one(&mut *connection)
         .await
-        .expect("panic fallback is deterministic");
-    assert_eq!((forward, reverse), (1, 0));
+        .expect("count rows after interrupted insert");
+    assert_eq!(count, 1);
+
+    let poisoned_insert = sqlx::query("INSERT INTO panic_write (name) VALUES ('bravo')")
+        .execute(&mut *connection)
+        .await;
+    assert!(
+        poisoned_insert.is_err(),
+        "poisoned connection accepted a later indexed write"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM panic_write")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("count rows after poisoned insert");
+    assert_eq!(count, 1);
+    drop(connection);
     pool.close().await;
     std::panic::set_hook(previous_panic_hook);
 }

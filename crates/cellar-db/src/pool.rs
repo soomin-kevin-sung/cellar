@@ -1,14 +1,21 @@
 use std::{
+    any::Any,
     cmp::Ordering,
     ffi::{CStr, c_int, c_void},
+    mem,
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     slice, str,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Duration,
 };
 
-use libsqlite3_sys::{SQLITE_OK, SQLITE_UTF8, sqlite3, sqlite3_create_collation_v2};
+use libsqlite3_sys::{
+    SQLITE_OK, SQLITE_UTF8, sqlite3, sqlite3_create_collation_v2, sqlite3_interrupt,
+};
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -52,6 +59,8 @@ impl FilenameCollation {
 
 struct CollationContext {
     comparator: Arc<Comparator>,
+    handle: *mut sqlite3,
+    poisoned: AtomicBool,
 }
 
 /// Opens Cellar's local SQLite pool and registers its versioned filename
@@ -134,6 +143,8 @@ fn register_collation(
 ) -> Result<(), sqlx::Error> {
     let context = Box::into_raw(Box::new(CollationContext {
         comparator: collation.comparator,
+        handle,
+        poisoned: AtomicBool::new(false),
     }));
     // SAFETY: `handle` is borrowed from SQLx's locked handle for the duration
     // of this call. `context` is a valid boxed allocation transferred to
@@ -155,11 +166,13 @@ fn register_collation(
     // SQLite does not invoke xDestroy when registration fails. Reclaim the
     // allocation here, catching even a pathological comparator destructor so
     // no Rust panic escapes this registration boundary.
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: registration failed, so ownership was not transferred and
         // `context` still points to the unique Box allocated above.
         unsafe { drop(Box::from_raw(context)) };
-    }));
+    })) {
+        quarantine_panic_payload(payload);
+    }
     Err(sqlx::Error::Protocol(
         "filename collation registration failed".into(),
     ))
@@ -172,8 +185,41 @@ unsafe extern "C" fn compare_collation(
     right_len: c_int,
     right_ptr: *const c_void,
 ) -> c_int {
+    match catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: SQLite invokes this callback only with the context and byte
+        // buffers registered for this connection. `compare_collation_inner`
+        // validates lengths and null pointers before constructing slices.
+        unsafe { compare_collation_inner(context, left_len, left_ptr, right_len, right_ptr) }
+    })) {
+        Ok(comparison) => comparison,
+        Err(payload) => {
+            quarantine_panic_payload(payload);
+            // SAFETY: a non-null callback context remains owned by SQLite for
+            // the full callback. Poisoning after quarantining ensures no panic
+            // payload destructor can unwind across this FFI boundary.
+            unsafe { poison_context(context) };
+            0
+        }
+    }
+}
+
+unsafe fn compare_collation_inner(
+    context: *mut c_void,
+    left_len: c_int,
+    left_ptr: *const c_void,
+    right_len: c_int,
+    right_ptr: *const c_void,
+) -> c_int {
     if context.is_null() {
         return ordering_to_sqlite(left_len.cmp(&right_len));
+    }
+
+    // SAFETY: SQLite retains the boxed context until it invokes xDestroy and
+    // serializes this connection's use while SQLx's worker owns the handle.
+    let context = unsafe { &*context.cast::<CollationContext>() };
+    if context.poisoned.load(AtomicOrdering::Acquire) {
+        interrupt(context);
+        return 0;
     }
 
     // SAFETY: SQLite calls a UTF-8 collation with buffers valid for the stated
@@ -186,18 +232,46 @@ unsafe extern "C" fn compare_collation(
     let Some(right) = (unsafe { sqlite_bytes(right_ptr, right_len) }) else {
         return ordering_to_sqlite(left_len.cmp(&right_len));
     };
-    let raw_fallback = ordering_to_sqlite(left.cmp(right));
 
-    let (Ok(left), Ok(right)) = (str::from_utf8(left), str::from_utf8(right)) else {
-        return raw_fallback;
-    };
-    // SAFETY: SQLite retains the boxed context until it invokes xDestroy, and
-    // serializes use of this connection while SQLx's worker owns the handle.
-    let comparator = unsafe { &*context.cast::<CollationContext>() };
-    match catch_unwind(AssertUnwindSafe(|| (comparator.comparator)(left, right))) {
-        Ok(ordering) => ordering_to_sqlite(ordering),
-        Err(_) => raw_fallback,
+    match (str::from_utf8(left), str::from_utf8(right)) {
+        (Err(_), Err(_)) => ordering_to_sqlite(left.cmp(right)),
+        (Err(_), Ok(_)) => -1,
+        (Ok(_), Err(_)) => 1,
+        (Ok(left), Ok(right)) => {
+            match catch_unwind(AssertUnwindSafe(|| (context.comparator)(left, right))) {
+                Ok(ordering) => ordering_to_sqlite(ordering),
+                Err(payload) => {
+                    // A panic payload may itself have a panicking destructor.
+                    // Quarantine it before poisoning or interrupting so no
+                    // unwind can cross the SQLite callback boundary.
+                    quarantine_panic_payload(payload);
+                    poison(context);
+                    0
+                }
+            }
+        }
     }
+}
+
+unsafe fn poison_context(context: *mut c_void) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller is an active SQLite callback, so the registered
+    // context remains valid until xDestroy runs after the callback returns.
+    poison(unsafe { &*context.cast::<CollationContext>() });
+}
+
+fn poison(context: &CollationContext) {
+    context.poisoned.store(true, AtomicOrdering::Release);
+    interrupt(context);
+}
+
+fn interrupt(context: &CollationContext) {
+    // SAFETY: the handle is the same live sqlite3 connection that owns this
+    // context. SQLite explicitly permits sqlite3_interrupt from any thread,
+    // including while a statement is executing.
+    unsafe { sqlite3_interrupt(context.handle) };
 }
 
 unsafe fn sqlite_bytes<'a>(pointer: *const c_void, length: c_int) -> Option<&'a [u8]> {
@@ -217,11 +291,22 @@ unsafe extern "C" fn destroy_collation(context: *mut c_void) {
     if context.is_null() {
         return;
     }
-    let _ = catch_unwind(AssertUnwindSafe(|| {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: SQLite calls xDestroy exactly once for the context whose Box
         // ownership was transferred by successful registration.
         unsafe { drop(Box::from_raw(context.cast::<CollationContext>())) };
-    }));
+    })) {
+        quarantine_panic_payload(payload);
+    }
+}
+
+fn quarantine_panic_payload(payload: Box<dyn Any + Send>) {
+    // Deliberately leak only the panic payload produced by a violated
+    // comparator/destructor contract. Dropping an arbitrary payload can panic
+    // again; forgetting it is the only way to guarantee the C ABI never sees
+    // a Rust unwind. This path is exceptional and bounded to one tiny leak per
+    // contract violation.
+    mem::forget(payload);
 }
 
 const fn ordering_to_sqlite(ordering: Ordering) -> c_int {
