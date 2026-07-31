@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use cellar_auth::{
     AccessClaims, AccessValidator, AccessValidatorConfig, JwksFetchError, JwksFetcher,
     JwksResponse, OwnerMode, select_access_jwt_header,
 };
+use jsonwebtoken::crypto::sign;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
@@ -21,6 +22,7 @@ use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{Notify, Semaphore};
 use url::Url;
 
 const ISSUER: &str = "https://cellar.cloudflareaccess.com";
@@ -78,9 +80,37 @@ fn keys() -> &'static TestKeys {
 #[derive(Clone)]
 enum FetchOutcome {
     Body(Vec<u8>),
+    BodyWithMaxAge(Vec<u8>, Duration),
     Delayed(Duration, Vec<u8>),
+    Gated(Arc<FetchGate>, Vec<u8>),
     Error,
     Panic,
+}
+
+struct FetchGate {
+    started: AtomicBool,
+    started_notify: Notify,
+    release: Semaphore,
+}
+
+impl FetchGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: AtomicBool::new(false),
+            started_notify: Notify::new(),
+            release: Semaphore::new(0),
+        })
+    }
+
+    async fn wait_started(&self) {
+        while !self.started.load(Ordering::SeqCst) {
+            self.started_notify.notified().await;
+        }
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 struct MockFetcher {
@@ -129,8 +159,21 @@ impl JwksFetcher for MockFetcher {
                 Cursor::new(body),
                 Some(Duration::from_secs(600)),
             )),
+            FetchOutcome::BodyWithMaxAge(body, max_age) => {
+                Ok(JwksResponse::new(200, Cursor::new(body), Some(max_age)))
+            }
             FetchOutcome::Delayed(delay, body) => {
                 tokio::time::sleep(delay).await;
+                Ok(JwksResponse::new(
+                    200,
+                    Cursor::new(body),
+                    Some(Duration::from_secs(600)),
+                ))
+            }
+            FetchOutcome::Gated(gate, body) => {
+                gate.started.store(true, Ordering::SeqCst);
+                gate.started_notify.notify_waiters();
+                gate.release.acquire().await.expect("fetch gate").forget();
                 Ok(JwksResponse::new(
                     200,
                     Cursor::new(body),
@@ -205,6 +248,16 @@ fn token_with_header(
         &EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).expect("RSA encoding key"),
     )
     .expect("encode JWT")
+}
+
+fn raw_signed_token(header_json: &str, claims_json: &str, key: &TestKey) -> String {
+    let header = URL_SAFE_NO_PAD.encode(header_json);
+    let claims = URL_SAFE_NO_PAD.encode(claims_json);
+    let message = format!("{header}.{claims}");
+    let encoding_key =
+        EncodingKey::from_rsa_pem(key.private_pem.as_bytes()).expect("RSA encoding key");
+    let signature = sign(message.as_bytes(), &encoding_key, Algorithm::RS256).expect("sign JWT");
+    format!("{message}.{signature}")
 }
 
 fn hs256_token(claims: &Value) -> String {
@@ -494,6 +547,69 @@ async fn rejects_algorithm_typ_and_kid_confusion_before_fetch() {
 }
 
 #[tokio::test]
+async fn rejects_critical_and_duplicate_jose_header_members_before_fetch() {
+    let fetcher = MockFetcher::new([]);
+    let validator = validator(fetcher.clone());
+
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(keys().first.kid.into());
+    header.crit = Some(vec!["cellar-extension".into()]);
+    header
+        .extras
+        .insert("cellar-extension".into(), "required".into());
+    let critical = encode(
+        &header,
+        &claims(),
+        &EncodingKey::from_rsa_pem(keys().first.private_pem.as_bytes()).expect("RSA encoding key"),
+    )
+    .expect("critical JWT");
+    assert_code(
+        &validator,
+        &critical,
+        enrolled(),
+        "unsupported_critical_header",
+    )
+    .await;
+
+    let now = now();
+    let duplicate_header = raw_signed_token(
+        r#"{"alg":"RS256","alg":"RS256","typ":"JWT","kid":"key-1"}"#,
+        &format!(
+            r#"{{"iss":"{ISSUER}","aud":["{AUDIENCE}"],"sub":"{OWNER_SUBJECT}","email":"{OWNER_EMAIL}","exp":{},"nbf":{},"iat":{},"type":"app"}}"#,
+            now + 300,
+            now - 30,
+            now - 30
+        ),
+        &keys().first,
+    );
+    assert_code(&validator, &duplicate_header, enrolled(), "malformed_token").await;
+    assert_eq!(fetcher.calls(), 0);
+}
+
+#[tokio::test]
+async fn rejects_duplicate_claim_members_after_signature_verification() {
+    let now = now();
+    let duplicate_claims = raw_signed_token(
+        r#"{"alg":"RS256","typ":"JWT","kid":"key-1"}"#,
+        &format!(
+            r#"{{"iss":"{ISSUER}","aud":["{AUDIENCE}"],"sub":"{OWNER_SUBJECT}","sub":"other","email":"{OWNER_EMAIL}","exp":{},"nbf":{},"iat":{},"type":"app"}}"#,
+            now + 300,
+            now - 30,
+            now - 30
+        ),
+        &keys().first,
+    );
+    let fetcher = MockFetcher::new([FetchOutcome::Body(jwks(&[&keys().first]))]);
+    assert_code(
+        &validator(fetcher),
+        &duplicate_claims,
+        enrolled(),
+        "malformed_claims",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn rejects_forged_signature() {
     let fetcher = MockFetcher::new([FetchOutcome::Body(jwks(&[&keys().first]))]);
     let forged = token_with_header(
@@ -561,7 +677,7 @@ async fn rejects_malformed_and_oversized_encoded_tokens_before_fetch() {
     assert_eq!(fetcher.calls(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unknown_kid_refreshes_once_and_accepts_rotated_key() {
     let fetcher = MockFetcher::new([
         FetchOutcome::Body(jwks(&[&keys().first])),
@@ -573,7 +689,7 @@ async fn unknown_kid_refreshes_once_and_accepts_rotated_key() {
         .validate(&token_with(&keys().first, &claims()), enrolled())
         .await
         .expect("initial key");
-    tokio::time::sleep(Duration::from_millis(2)).await;
+    tokio::time::advance(Duration::from_millis(2)).await;
     validator
         .validate(&token_with(&keys().rotated, &claims()), enrolled())
         .await
@@ -586,8 +702,8 @@ async fn unsupported_jwk_key_type_use_and_alg_are_never_cached() {
     let invalid = serde_json::to_vec(&json!({
         "keys": [
             {"kty":"EC", "use":"sig", "alg":"RS256", "kid":"key-1", "n":keys().first.n, "e":keys().first.e},
-            {"kty":"RSA", "use":"enc", "alg":"RS256", "kid":"key-1", "n":keys().first.n, "e":keys().first.e},
-            {"kty":"RSA", "use":"sig", "alg":"RS512", "kid":"key-1", "n":keys().first.n, "e":keys().first.e}
+            {"kty":"RSA", "use":"enc", "alg":"RS256", "kid":"invalid-use", "n":keys().first.n, "e":keys().first.e},
+            {"kty":"RSA", "use":"sig", "alg":"RS512", "kid":"invalid-alg", "n":keys().first.n, "e":keys().first.e}
         ]
     }))
     .expect("invalid JWKS");
@@ -596,7 +712,71 @@ async fn unsupported_jwk_key_type_use_and_alg_are_never_cached() {
         &validator(fetcher),
         &token_with(&keys().first, &claims()),
         enrolled(),
-        "unknown_kid",
+        "jwks_malformed",
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn fully_filtered_jwks_is_not_cached_as_fresh_empty_cache() {
+    let unsupported = serde_json::to_vec(&json!({
+        "keys": [{"kty":"EC", "use":"sig", "alg":"ES256", "kid":"other"}]
+    }))
+    .expect("unsupported JWKS");
+    let fetcher = MockFetcher::new([
+        FetchOutcome::Body(unsupported),
+        FetchOutcome::Body(jwks(&[&keys().first])),
+    ]);
+    let validator = AccessValidator::new(
+        config()
+            .with_min_refresh_interval(Duration::from_secs(300))
+            .with_failure_backoff(Duration::from_millis(30)),
+        fetcher.clone(),
+    );
+    let token = token_with(&keys().first, &claims());
+
+    assert_code(&validator, &token, enrolled(), "jwks_malformed").await;
+    tokio::time::advance(Duration::from_millis(31)).await;
+    validator
+        .validate(&token, enrolled())
+        .await
+        .expect("empty cache retries after bounded failure backoff");
+    assert_eq!(fetcher.calls(), 2);
+}
+
+#[tokio::test]
+async fn duplicate_kid_is_rejected_before_jwk_compatibility_filtering() {
+    let duplicate = serde_json::to_vec(&json!({
+        "keys": [
+            keys().first.jwk(),
+            {"kty":"EC", "use":"sig", "alg":"ES256", "kid":"key-1"}
+        ]
+    }))
+    .expect("duplicate-kid JWKS");
+    let fetcher = MockFetcher::new([FetchOutcome::Body(duplicate)]);
+    assert_code(
+        &validator(fetcher),
+        &token_with(&keys().first, &claims()),
+        enrolled(),
+        "jwks_malformed",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn duplicate_jwk_json_member_is_rejected() {
+    let duplicate_member = format!(
+        r#"{{"keys":[{{"kty":"RSA","use":"sig","alg":"RS256","kid":"key-1","kid":"key-2","n":"{}","e":"{}"}}]}}"#,
+        keys().first.n,
+        keys().first.e
+    )
+    .into_bytes();
+    let fetcher = MockFetcher::new([FetchOutcome::Body(duplicate_member)]);
+    assert_code(
+        &validator(fetcher),
+        &token_with(&keys().first, &claims()),
+        enrolled(),
+        "jwks_malformed",
     )
     .await;
 }
@@ -638,7 +818,7 @@ async fn oversized_malformed_and_too_many_key_sets_fail_closed() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_covers_fetch_and_fails_closed() {
     let fetcher = MockFetcher::new([FetchOutcome::Delayed(
         Duration::from_millis(100),
@@ -657,7 +837,7 @@ async fn timeout_covers_fetch_and_fails_closed() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_also_covers_streaming_response_body() {
     struct StalledFetcher;
 
@@ -706,10 +886,8 @@ async fn oversized_jwk_fields_fail_closed() {
 
 #[tokio::test]
 async fn concurrent_unknown_kid_refresh_is_single_flight() {
-    let fetcher = MockFetcher::new([FetchOutcome::Delayed(
-        Duration::from_millis(40),
-        jwks(&[&keys().first]),
-    )]);
+    let gate = FetchGate::new();
+    let fetcher = MockFetcher::new([FetchOutcome::Gated(gate.clone(), jwks(&[&keys().first]))]);
     let validator = Arc::new(validator(fetcher.clone()));
     let token = Arc::new(token_with(&keys().first, &claims()));
 
@@ -721,6 +899,9 @@ async fn concurrent_unknown_kid_refresh_is_single_flight() {
             validator.validate(&token, enrolled()).await
         }));
     }
+    gate.wait_started().await;
+    assert_eq!(fetcher.calls(), 1);
+    gate.release();
     for task in tasks {
         task.await
             .expect("validation task")
@@ -731,10 +912,8 @@ async fn concurrent_unknown_kid_refresh_is_single_flight() {
 
 #[tokio::test]
 async fn cancelled_waiter_does_not_cancel_or_wedge_shared_refresh() {
-    let fetcher = MockFetcher::new([FetchOutcome::Delayed(
-        Duration::from_millis(40),
-        jwks(&[&keys().first]),
-    )]);
+    let gate = FetchGate::new();
+    let fetcher = MockFetcher::new([FetchOutcome::Gated(gate.clone(), jwks(&[&keys().first]))]);
     let validator = Arc::new(validator(fetcher.clone()));
     let token = token_with(&keys().first, &claims());
 
@@ -743,14 +922,18 @@ async fn cancelled_waiter_does_not_cancel_or_wedge_shared_refresh() {
         let token = token.clone();
         tokio::spawn(async move { validator.validate(&token, enrolled()).await })
     };
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    gate.wait_started().await;
     task.abort();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    task.await.expect_err("validation waiter cancelled");
+    gate.release();
 
-    validator
-        .validate(&token, enrolled())
-        .await
-        .expect("detached refresh completed after waiter cancellation");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        validator.validate(&token, enrolled()),
+    )
+    .await
+    .expect("refresh completion timeout")
+    .expect("detached refresh completed after waiter cancellation");
     assert_eq!(fetcher.calls(), 1);
 }
 
@@ -778,7 +961,7 @@ async fn unknown_kid_refresh_is_rate_limited_between_attempts() {
     .await;
     assert_eq!(fetcher.calls(), 1);
 
-    tokio::time::sleep(Duration::from_millis(35)).await;
+    tokio::time::advance(Duration::from_millis(35)).await;
     validator
         .validate(&token_with(&keys().rotated, &claims()), enrolled())
         .await
@@ -786,12 +969,12 @@ async fn unknown_kid_refresh_is_rate_limited_between_attempts() {
     assert_eq!(fetcher.calls(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_or_panicked_refresh_does_not_wedge_later_retry() {
     for first in [FetchOutcome::Error, FetchOutcome::Panic] {
         let fetcher = MockFetcher::new([first, FetchOutcome::Body(jwks(&[&keys().first]))]);
         let validator = AccessValidator::new(
-            config().with_min_refresh_interval(Duration::from_millis(10)),
+            config().with_failure_backoff(Duration::from_millis(10)),
             fetcher.clone(),
         );
         let token = token_with(&keys().first, &claims());
@@ -802,7 +985,7 @@ async fn failed_or_panicked_refresh_does_not_wedge_later_retry() {
             .expect_err("first refresh fails");
         assert_eq!(first_error.code(), "jwks_refresh_failed");
 
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        tokio::time::advance(Duration::from_millis(15)).await;
         validator
             .validate(&token, enrolled())
             .await
@@ -811,7 +994,31 @@ async fn failed_or_panicked_refresh_does_not_wedge_later_retry() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn failed_mandatory_refresh_uses_bounded_backoff_without_fetch_storm() {
+    let fetcher = MockFetcher::new([
+        FetchOutcome::Error,
+        FetchOutcome::Body(jwks(&[&keys().first])),
+    ]);
+    let validator = AccessValidator::new(
+        config().with_failure_backoff(Duration::from_millis(30)),
+        fetcher.clone(),
+    );
+    let token = token_with(&keys().first, &claims());
+
+    assert_code(&validator, &token, enrolled(), "jwks_refresh_failed").await;
+    assert_code(&validator, &token, enrolled(), "jwks_refresh_failed").await;
+    assert_eq!(fetcher.calls(), 1);
+
+    tokio::time::advance(Duration::from_millis(31)).await;
+    validator
+        .validate(&token, enrolled())
+        .await
+        .expect("mandatory refresh retries after bounded failure backoff");
+    assert_eq!(fetcher.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn stale_known_key_requires_successful_refresh() {
     let fetcher = MockFetcher::new([
         FetchOutcome::Body(jwks(&[&keys().first])),
@@ -829,8 +1036,77 @@ async fn stale_known_key_requires_successful_refresh() {
         .validate(&token, enrolled())
         .await
         .expect("fresh cached key");
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::advance(Duration::from_millis(10)).await;
     assert_code(&validator, &token, enrolled(), "jwks_refresh_failed").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mandatory_expired_cache_refresh_ignores_unknown_kid_interval() {
+    let fetcher = MockFetcher::new([
+        FetchOutcome::BodyWithMaxAge(jwks(&[&keys().first]), Duration::from_secs(1)),
+        FetchOutcome::BodyWithMaxAge(jwks(&[&keys().first]), Duration::from_secs(1)),
+    ]);
+    let validator = AccessValidator::new(
+        config().with_min_refresh_interval(Duration::from_secs(300)),
+        fetcher.clone(),
+    );
+    let token = token_with(&keys().first, &claims());
+
+    validator
+        .validate(&token, enrolled())
+        .await
+        .expect("initial mandatory refresh");
+    tokio::time::advance(Duration::from_secs(2)).await;
+    validator
+        .validate(&token, enrolled())
+        .await
+        .expect("expired cache performs mandatory refresh");
+    assert_eq!(fetcher.calls(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_refresh_installing_requested_kid_is_observed_before_rate_limit() {
+    let gate = FetchGate::new();
+    let fetcher = MockFetcher::new([
+        FetchOutcome::Body(jwks(&[&keys().first])),
+        FetchOutcome::Gated(gate.clone(), jwks(&[&keys().rotated])),
+    ]);
+    let validator = Arc::new(AccessValidator::new(
+        config()
+            .with_cache_ttl(Duration::from_secs(600))
+            .with_min_refresh_interval(Duration::from_secs(300)),
+        fetcher.clone(),
+    ));
+    validator
+        .validate(&token_with(&keys().first, &claims()), enrolled())
+        .await
+        .expect("prime cache");
+    tokio::time::advance(Duration::from_secs(301)).await;
+
+    let rotated = Arc::new(token_with(&keys().rotated, &claims()));
+    let refresher = {
+        let validator = validator.clone();
+        let rotated = rotated.clone();
+        tokio::spawn(async move { validator.validate(&rotated, enrolled()).await })
+    };
+    gate.wait_started().await;
+    let racing_waiter = validator.validate(&rotated, enrolled());
+    tokio::pin!(racing_waiter);
+    tokio::select! {
+        biased;
+        result = &mut racing_waiter => panic!("racing waiter completed before refresh: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    gate.release();
+
+    refresher
+        .await
+        .expect("refresher task")
+        .expect("refresher validation");
+    racing_waiter
+        .await
+        .expect("racing waiter observes installed key");
+    assert_eq!(fetcher.calls(), 2);
 }
 
 #[test]
@@ -855,6 +1131,33 @@ fn configuration_requires_https_and_nonempty_identity_values() {
             .expect_err("invalid secure configuration");
         assert_eq!(error.code(), "invalid_auth_config");
     }
+}
+
+#[tokio::test]
+async fn canonicalizes_configured_issuer_but_requires_exact_canonical_claim() {
+    let canonicalized = AccessValidatorConfig::new(
+        "HTTPS://CELLAR.CLOUDFLAREACCESS.COM:443/",
+        AUDIENCE,
+        "HTTPS://CELLAR.CLOUDFLAREACCESS.COM:443/cdn-cgi/access/certs",
+    )
+    .expect("canonicalizable Cloudflare origin")
+    .with_min_refresh_interval(Duration::from_millis(1));
+    let fetcher = MockFetcher::new([FetchOutcome::Body(jwks(&[&keys().first]))]);
+    let validator = AccessValidator::new(canonicalized, fetcher);
+    validator
+        .validate(&token_with(&keys().first, &claims()), enrolled())
+        .await
+        .expect("canonical Cloudflare iss");
+
+    let mut noncanonical_claim = claims();
+    noncanonical_claim["iss"] = json!("HTTPS://CELLAR.CLOUDFLAREACCESS.COM:443");
+    assert_code(
+        &validator,
+        &token_with(&keys().first, &noncanonical_claim),
+        enrolled(),
+        "invalid_issuer",
+    )
+    .await;
 }
 
 #[test]

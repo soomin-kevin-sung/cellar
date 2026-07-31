@@ -88,6 +88,7 @@ struct CacheState {
     refreshing: bool,
     generation: u64,
     last_attempt: Option<Instant>,
+    last_failure: Option<(Instant, AuthError)>,
     last_result: Option<Result<(), AuthError>>,
 }
 
@@ -109,70 +110,73 @@ impl JwksCache {
     }
 
     pub(crate) async fn key(self: &Arc<Self>, kid: &str) -> Result<Arc<DecodingKey>, AuthError> {
-        {
-            let state = self.state.lock().await;
-            if state
-                .expires_at
-                .is_some_and(|expires_at| expires_at > Instant::now())
-                && let Some(key) = state.keys.get(kid)
-            {
+        let mut refreshed = false;
+        loop {
+            let mut state = self.state.lock().await;
+            let observed_generation = state.generation;
+            let now = Instant::now();
+            let fresh = state.expires_at.is_some_and(|expires_at| expires_at > now);
+            if fresh && let Some(key) = state.keys.get(kid) {
                 return Ok(key.clone());
             }
-        }
+            if refreshed {
+                return Err(AuthError::new(if fresh {
+                    "unknown_kid"
+                } else {
+                    "jwks_stale"
+                }));
+            }
 
-        self.refresh().await?;
-
-        let state = self.state.lock().await;
-        if state
-            .expires_at
-            .is_none_or(|expires_at| expires_at <= Instant::now())
-        {
-            return Err(AuthError::new("jwks_stale"));
-        }
-        state
-            .keys
-            .get(kid)
-            .cloned()
-            .ok_or_else(|| AuthError::new("unknown_kid"))
-    }
-
-    async fn refresh(self: &Arc<Self>) -> Result<(), AuthError> {
-        let observed_generation;
-        {
-            let mut state = self.state.lock().await;
-            observed_generation = state.generation;
             if !state.refreshing {
-                let now = Instant::now();
-                if state.last_attempt.is_some_and(|last_attempt| {
-                    now.saturating_duration_since(last_attempt) < self.config.min_refresh_interval()
-                }) {
+                let optional_unknown_kid_probe = fresh;
+                if !optional_unknown_kid_probe
+                    && let Some((failed_at, error)) = state.last_failure
+                    && now.saturating_duration_since(failed_at) < self.config.failure_backoff()
+                {
+                    return Err(error);
+                }
+                if optional_unknown_kid_probe
+                    && state.last_attempt.is_some_and(|last_attempt| {
+                        now.saturating_duration_since(last_attempt)
+                            < self.config.min_refresh_interval()
+                    })
+                {
                     return Err(AuthError::new("jwks_refresh_rate_limited"));
                 }
                 state.refreshing = true;
                 state.last_attempt = Some(now);
-                let cache = self.clone();
-                tokio::spawn(async move {
-                    let worker_cache = cache.clone();
-                    let worker = tokio::spawn(async move { worker_cache.fetch_keys().await });
-                    let result = match worker.await {
-                        Ok(result) => result,
-                        Err(_) => Err(AuthError::new("jwks_refresh_failed")),
-                    };
-                    cache.complete_refresh(result).await;
-                });
+                self.spawn_refresh();
             }
-        }
+            drop(state);
 
+            self.wait_for_refresh(observed_generation).await?;
+            refreshed = true;
+        }
+    }
+
+    fn spawn_refresh(self: &Arc<Self>) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let worker_cache = cache.clone();
+            let worker = tokio::spawn(async move { worker_cache.fetch_keys().await });
+            let result = match worker.await {
+                Ok(result) => result,
+                Err(_) => Err(AuthError::new("jwks_refresh_failed")),
+            };
+            cache.complete_refresh(result).await;
+        });
+    }
+
+    async fn wait_for_refresh(&self, observed_generation: u64) -> Result<(), AuthError> {
         loop {
             let notified = self.changed.notified();
-            {
-                let state = self.state.lock().await;
-                if state.generation != observed_generation {
-                    return state
-                        .last_result
-                        .unwrap_or_else(|| Err(AuthError::new("jwks_refresh_failed")));
-                }
+            let state = self.state.lock().await;
+            if state.generation != observed_generation {
+                return state
+                    .last_result
+                    .unwrap_or_else(|| Err(AuthError::new("jwks_refresh_failed")));
             }
+            drop(state);
             notified.await;
         }
     }
@@ -186,9 +190,11 @@ impl JwksCache {
             Ok((keys, lifetime)) => {
                 state.keys = keys;
                 state.expires_at = Some(Instant::now() + lifetime);
+                state.last_failure = None;
                 state.last_result = Some(Ok(()));
             }
             Err(error) => {
+                state.last_failure = Some((Instant::now(), error));
                 state.last_result = Some(Err(error));
             }
         }
@@ -272,6 +278,9 @@ fn parse_jwks(
         if key.kid.is_empty() || key.kid.len() > MAX_JWK_FIELD_BYTES {
             return Err(AuthError::new("jwks_malformed"));
         }
+        if !seen_kids.insert(key.kid.clone()) {
+            return Err(AuthError::new("jwks_malformed"));
+        }
         if key.kty.len() > MAX_JWK_FIELD_BYTES
             || key
                 .key_use
@@ -289,9 +298,6 @@ fn parse_jwks(
             || key.alg.as_deref() != Some("RS256")
         {
             continue;
-        }
-        if !seen_kids.insert(key.kid.clone()) {
-            return Err(AuthError::new("jwks_malformed"));
         }
         let (Some(n), Some(e)) = (key.n, key.e) else {
             return Err(AuthError::new("jwks_malformed"));
@@ -327,6 +333,9 @@ fn parse_jwks(
         let decoding_key = DecodingKey::from_rsa_components(&n, &e)
             .map_err(|_| AuthError::new("jwks_malformed"))?;
         keys.insert(key.kid, Arc::new(decoding_key));
+    }
+    if keys.is_empty() {
+        return Err(AuthError::new("jwks_malformed"));
     }
     Ok(keys)
 }

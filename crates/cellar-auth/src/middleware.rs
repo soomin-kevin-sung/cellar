@@ -2,6 +2,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use url::Url;
@@ -22,6 +24,8 @@ const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const DEFAULT_FAILURE_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_CLOCK_SKEW: Duration = Duration::from_secs(60);
 const MAX_KID_BYTES: usize = 512;
 
@@ -66,6 +70,7 @@ pub struct AccessValidatorConfig {
     cache_ttl: Duration,
     fetch_timeout: Duration,
     min_refresh_interval: Duration,
+    failure_backoff: Duration,
 }
 
 impl AccessValidatorConfig {
@@ -105,6 +110,7 @@ impl AccessValidatorConfig {
             cache_ttl: DEFAULT_CACHE_TTL,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             min_refresh_interval: DEFAULT_REFRESH_INTERVAL,
+            failure_backoff: DEFAULT_FAILURE_BACKOFF,
         })
     }
 
@@ -150,6 +156,12 @@ impl AccessValidatorConfig {
         self
     }
 
+    #[must_use]
+    pub fn with_failure_backoff(mut self, value: Duration) -> Self {
+        self.failure_backoff = value.clamp(Duration::from_millis(1), MAX_FAILURE_BACKOFF);
+        self
+    }
+
     pub const fn max_token_len(&self) -> usize {
         self.max_token_len
     }
@@ -189,6 +201,10 @@ impl AccessValidatorConfig {
     pub(crate) const fn min_refresh_interval(&self) -> Duration {
         self.min_refresh_interval
     }
+
+    pub(crate) const fn failure_backoff(&self) -> Duration {
+        self.failure_backoff
+    }
 }
 
 fn normalize_issuer(value: &str) -> Result<String, AuthError> {
@@ -206,7 +222,7 @@ fn normalize_issuer(value: &str) -> Result<String, AuthError> {
     {
         return Err(AuthError::new("invalid_auth_config"));
     }
-    Ok(value.trim_end_matches('/').to_owned())
+    Ok(parsed.origin().ascii_serialization())
 }
 
 #[derive(Clone)]
@@ -246,6 +262,19 @@ impl AccessValidator {
         }
         if encoded_token.is_empty() || encoded_token.split('.').count() != 3 {
             return Err(AuthError::new("malformed_token"));
+        }
+
+        let encoded_header = encoded_token
+            .split_once('.')
+            .map(|(header, _)| header)
+            .ok_or_else(|| AuthError::new("malformed_token"))?;
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(encoded_header)
+            .map_err(|_| AuthError::new("malformed_token"))?;
+        let header_fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&header_bytes).map_err(|_| AuthError::new("malformed_token"))?;
+        if header_fields.contains_key("crit") {
+            return Err(AuthError::new("unsupported_critical_header"));
         }
 
         let header = decode_header(encoded_token).map_err(|_| AuthError::new("malformed_token"))?;

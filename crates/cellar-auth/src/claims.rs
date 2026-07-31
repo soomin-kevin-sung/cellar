@@ -80,7 +80,7 @@ pub(crate) fn validate_claims(
     {
         return Err(AuthError::new("invalid_audience"));
     }
-    if claims.exp.saturating_add(clock_skew_seconds) < now {
+    if claims.exp.saturating_add(clock_skew_seconds) <= now {
         return Err(AuthError::new("token_expired"));
     }
     let latest_allowed = now.saturating_add(clock_skew_seconds);
@@ -120,4 +120,58 @@ pub(crate) fn validate_claims(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AccessClaims, OwnerMode, validate_claims};
+
+    const NOW: i64 = 10_000;
+    const SKEW: i64 = 30;
+
+    fn claims() -> AccessClaims {
+        AccessClaims {
+            iss: "https://cellar.cloudflareaccess.com".into(),
+            aud: vec!["audience".into()],
+            sub: "owner".into(),
+            email: None,
+            exp: NOW + 300,
+            nbf: NOW,
+            iat: NOW,
+            r#type: "app".into(),
+        }
+    }
+
+    fn validate(claims: &AccessClaims) -> Result<(), crate::AuthError> {
+        validate_claims(
+            claims,
+            "https://cellar.cloudflareaccess.com",
+            "audience",
+            SKEW,
+            NOW,
+            OwnerMode::Enrolled {
+                owner_subject: "owner",
+            },
+        )
+    }
+
+    #[test]
+    fn rejects_expiration_at_exact_skew_boundary() {
+        let mut claims = claims();
+        claims.exp = NOW - SKEW;
+        assert_eq!(
+            validate(&claims)
+                .expect_err("exclusive exp boundary")
+                .code(),
+            "token_expired"
+        );
+    }
+
+    #[test]
+    fn accepts_nbf_and_iat_at_exact_skew_boundary() {
+        let mut claims = claims();
+        claims.nbf = NOW + SKEW;
+        claims.iat = NOW + SKEW;
+        validate(&claims).expect("inclusive nbf/iat skew boundary");
+    }
 }
