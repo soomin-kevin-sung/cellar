@@ -1,0 +1,587 @@
+use std::{cmp::Ordering, path::PathBuf, sync::Arc};
+
+use cellar_db::{DbError, FilenameComparator, migrate, open_pool};
+use sqlx::{Executor, Row, SqlitePool};
+use tempfile::TempDir;
+
+struct TestDb {
+    _directory: TempDir,
+    path: PathBuf,
+}
+
+impl TestDb {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().expect("create temporary database directory");
+        let path = directory.path().join("cellar.sqlite3");
+        Self {
+            _directory: directory,
+            path,
+        }
+    }
+
+    async fn open(&self) -> SqlitePool {
+        open_pool(&self.path, test_comparator())
+            .await
+            .expect("open database pool")
+    }
+}
+
+#[cfg(windows)]
+fn test_comparator() -> FilenameComparator {
+    Arc::new(compare_string_ordinal_ignore_case)
+}
+
+#[cfg(not(windows))]
+fn test_comparator() -> FilenameComparator {
+    Arc::new(str::cmp)
+}
+
+#[cfg(windows)]
+fn compare_string_ordinal_ignore_case(left: &str, right: &str) -> Ordering {
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn CompareStringOrdinal(
+            string1: *const u16,
+            string1_len: i32,
+            string2: *const u16,
+            string2_len: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+
+    let left: Vec<u16> = left.encode_utf16().collect();
+    let right: Vec<u16> = right.encode_utf16().collect();
+    // SAFETY: both pointers remain valid for their explicitly supplied lengths.
+    match unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left.len()
+                .try_into()
+                .expect("left filename length fits i32"),
+            right.as_ptr(),
+            right
+                .len()
+                .try_into()
+                .expect("right filename length fits i32"),
+            1,
+        )
+    } {
+        1 => Ordering::Less,
+        2 => Ordering::Equal,
+        3 => Ordering::Greater,
+        result => panic!("CompareStringOrdinal failed with result {result}"),
+    }
+}
+
+async fn migrated_db() -> (TestDb, SqlitePool) {
+    let db = TestDb::new();
+    let pool = db.open().await;
+    migrate(&pool).await.expect("run migrations");
+    (db, pool)
+}
+
+async fn insert_project(pool: &SqlitePool, id: &str) {
+    sqlx::query(
+        "INSERT INTO project
+         (id, name, status, version, created_at, updated_at)
+         VALUES (?, 'Project', 'active', 1, '2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("insert project");
+}
+
+async fn insert_file(
+    pool: &SqlitePool,
+    id: &str,
+    project_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+    state: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO file_entry
+         (id, project_id, parent_id, exact_name, kind, platform_kind, size,
+          mtime_filetime_100ns, hash_state, state, revision, scan_generation, observed_at)
+         VALUES (?, ?, ?, ?, 'file', 'windows_file_id', 0, 0, 'unknown', ?, 1, 0,
+                 '2026-07-31T00:00:00Z')",
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(parent_id)
+    .bind(name)
+    .bind(state)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn insert_upload(
+    pool: &SqlitePool,
+    id: &str,
+    project_id: &str,
+    parent_id: Option<&str>,
+    name: &str,
+    state: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO upload_session
+         (id, project_id, destination_parent_id, destination_name, expected_size,
+          committed_offset, state, expires_at)
+         VALUES (?, ?, ?, ?, 10, 0, ?, '2026-08-01T00:00:00Z')",
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(parent_id)
+    .bind(name)
+    .bind(state)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test]
+async fn migrations_are_versioned_and_safe_under_concurrent_execution() {
+    let db = TestDb::new();
+    let first = db.open().await;
+    let second = db.open().await;
+
+    let (left, right) = tokio::join!(migrate(&first), migrate(&second));
+    left.expect("first migration succeeds");
+    right.expect("second migration succeeds");
+
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM cellar_schema_migration ORDER BY version")
+            .fetch_all(&first)
+            .await
+            .expect("read migration versions");
+    assert_eq!(versions, [1, 2]);
+
+    first.close().await;
+    second.close().await;
+}
+
+#[tokio::test]
+async fn migrations_reject_an_unknown_schema_version_without_leaking_sql() {
+    let (_db, pool) = migrated_db().await;
+    sqlx::query(
+        "INSERT INTO cellar_schema_migration (version, name, fingerprint)
+         VALUES (99, 'future', 'future')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert future schema marker");
+
+    let error = migrate(&pool)
+        .await
+        .expect_err("future schema must be rejected");
+    assert!(matches!(error, DbError::SchemaVersion));
+    assert_eq!(error.to_string(), "database schema version is unsupported");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn every_pool_connection_has_required_sqlite_pragmas() {
+    let db = TestDb::new();
+    let pool = db.open().await;
+    let mut connections = Vec::new();
+    for _ in 0..4 {
+        connections.push(pool.acquire().await.expect("acquire pooled connection"));
+    }
+
+    for connection in &mut connections {
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read journal mode");
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read synchronous");
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read foreign keys");
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut **connection)
+            .await
+            .expect("read busy timeout");
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(busy_timeout, 5_000);
+    }
+
+    drop(connections);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn foreign_keys_reject_cross_project_parents() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    insert_project(&pool, "p2").await;
+    insert_file(&pool, "parent", "p1", None, "parent", "live")
+        .await
+        .expect("insert parent");
+
+    assert!(
+        insert_file(&pool, "child", "p2", Some("parent"), "child", "live")
+            .await
+            .is_err()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn all_state_columns_reject_unknown_values() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+
+    let statements = [
+        "INSERT INTO project (id, name, status, version, created_at, updated_at)
+         VALUES ('bad-project', 'x', 'unknown', 1, 't', 't')",
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size, mtime_filetime_100ns,
+          hash_state, state, revision, scan_generation, observed_at)
+         VALUES ('bad-file-state', 'p1', 'a', 'file', 'x', 0, 0, 'unknown',
+                 'unknown', 1, 0, 't')",
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size, mtime_filetime_100ns,
+          hash_state, state, revision, scan_generation, observed_at)
+         VALUES ('bad-file-kind', 'p1', 'b', 'symlink', 'x', 0, 0, 'unknown',
+                 'live', 1, 0, 't')",
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size, mtime_filetime_100ns,
+          hash_state, state, revision, scan_generation, observed_at)
+         VALUES ('bad-hash-state', 'p1', 'c', 'file', 'x', 0, 0, 'invalid',
+                 'live', 1, 0, 't')",
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset, state, expires_at)
+         VALUES ('bad-upload', 'p1', 'a', 0, 0, 'unknown', 't')",
+        "INSERT INTO operation
+         (id, project_id, kind, state, payload_version, payload, created_at, updated_at)
+         VALUES ('bad-operation', 'p1', 'x', 'unknown', 1, '{}', 't', 't')",
+        "INSERT INTO trash_item
+         (id, project_id, original_path_snapshot, storage_path, deleted_at, purge_after, state)
+         VALUES ('bad-trash', 'p1', 'a', 'store-a', 't', 't', 'unknown')",
+        "INSERT INTO audit_event
+         (event_id, source, action, result, occurred_at, details)
+         VALUES ('bad-audit', 'unknown', 'x', 'x', 't', '{}')",
+    ];
+
+    for statement in statements {
+        assert!(
+            pool.execute(statement).await.is_err(),
+            "constraint unexpectedly accepted: {statement}"
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn numeric_versions_sizes_offsets_and_hash_lengths_are_checked() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+
+    let statements = [
+        "INSERT INTO project (id, name, status, version, created_at, updated_at)
+         VALUES ('version-zero', 'x', 'active', 0, 't', 't')",
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size, mtime_filetime_100ns,
+          hash_state, state, revision, scan_generation, observed_at)
+         VALUES ('size-negative', 'p1', 'a', 'file', 'x', -1, 0, 'unknown',
+                 'live', 1, 0, 't')",
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size, mtime_filetime_100ns,
+          hash_state, state, revision, scan_generation, observed_at)
+         VALUES ('revision-zero', 'p1', 'b', 'file', 'x', 0, 0, 'unknown',
+                 'live', 0, 0, 't')",
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size, mtime_filetime_100ns,
+          hash, hash_state, state, revision, scan_generation, observed_at)
+         VALUES ('short-hash', 'p1', 'c', 'file', 'x', 0, 0, x'00', 'ready',
+                 'live', 1, 0, 't')",
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset, state, expires_at)
+         VALUES ('negative-size', 'p1', 'u1', -1, 0, 'created', 't')",
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset, state, expires_at)
+         VALUES ('negative-offset', 'p1', 'u2', 1, -1, 'created', 't')",
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset, state, expires_at)
+         VALUES ('large-offset', 'p1', 'u3', 1, 2, 'created', 't')",
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset, expected_hash,
+          state, expires_at)
+         VALUES ('short-expected-hash', 'p1', 'u4', 1, 0, x'00', 'created', 't')",
+        "INSERT INTO operation
+         (id, kind, state, payload_version, payload, created_at, updated_at)
+         VALUES ('bad-payload-version', 'x', 'pending', 0, '{}', 't', 't')",
+    ];
+
+    for statement in statements {
+        assert!(
+            pool.execute(statement).await.is_err(),
+            "constraint unexpectedly accepted: {statement}"
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn live_root_and_child_names_are_unique_but_inactive_names_are_reusable() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    insert_file(&pool, "root-a", "p1", None, "same.txt", "live")
+        .await
+        .expect("insert live root");
+    assert!(
+        insert_file(&pool, "root-b", "p1", None, "same.txt", "settling")
+            .await
+            .is_err()
+    );
+    insert_file(&pool, "root-c", "p1", None, "same.txt", "missing")
+        .await
+        .expect("inactive root name may be reused");
+
+    insert_file(&pool, "dir", "p1", None, "dir", "live")
+        .await
+        .expect("insert directory-shaped parent");
+    insert_file(&pool, "child-a", "p1", Some("dir"), "same.txt", "settling")
+        .await
+        .expect("insert settling child");
+    assert!(
+        insert_file(&pool, "child-b", "p1", Some("dir"), "same.txt", "live")
+            .await
+            .is_err()
+    );
+    insert_file(&pool, "child-c", "p1", Some("dir"), "same.txt", "trashed")
+        .await
+        .expect("inactive child name may be reused");
+    pool.close().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn filename_uniqueness_uses_windows_ordinal_ignore_case() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    insert_file(&pool, "a", "p1", None, "Résumé.TXT", "live")
+        .await
+        .expect("insert first spelling");
+
+    assert!(
+        insert_file(&pool, "b", "p1", None, "résumé.txt", "live")
+            .await
+            .is_err()
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn active_uploads_reserve_root_and_child_destinations() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    insert_file(&pool, "dir", "p1", None, "dir", "live")
+        .await
+        .expect("insert parent");
+
+    insert_upload(&pool, "root-a", "p1", None, "target.bin", "created")
+        .await
+        .expect("reserve root");
+    assert!(
+        insert_upload(&pool, "root-b", "p1", None, "target.bin", "committing")
+            .await
+            .is_err()
+    );
+    insert_upload(&pool, "root-c", "p1", None, "target.bin", "complete")
+        .await
+        .expect("completed reservation is released");
+
+    insert_upload(
+        &pool,
+        "child-a",
+        "p1",
+        Some("dir"),
+        "target.bin",
+        "uploading",
+    )
+    .await
+    .expect("reserve child");
+    assert!(
+        insert_upload(
+            &pool,
+            "child-b",
+            "p1",
+            Some("dir"),
+            "target.bin",
+            "verifying",
+        )
+        .await
+        .is_err()
+    );
+    insert_upload(
+        &pool,
+        "child-c",
+        "p1",
+        Some("dir"),
+        "target.bin",
+        "cancelled",
+    )
+    .await
+    .expect("cancelled reservation is released");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn project_cover_requires_same_project_and_is_cleared_when_file_is_removed() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    insert_project(&pool, "p2").await;
+    insert_file(&pool, "cover", "p1", None, "cover.jpg", "live")
+        .await
+        .expect("insert cover");
+
+    assert!(
+        sqlx::query("INSERT INTO project_cover (project_id, file_entry_id) VALUES ('p2', 'cover')")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("INSERT INTO project_cover (project_id, file_entry_id) VALUES ('p1', 'cover')")
+        .execute(&pool)
+        .await
+        .expect("insert matching cover");
+    sqlx::query("DELETE FROM file_entry WHERE id = 'cover'")
+        .execute(&pool)
+        .await
+        .expect("delete covered file");
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM project_cover")
+        .fetch_one(&pool)
+        .await
+        .expect("count covers");
+    assert_eq!(count, 0);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pending_chunks_are_all_null_or_all_present_and_in_bounds() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+
+    sqlx::query(
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset, state, expires_at)
+         VALUES ('none', 'p1', 'none', 10, 0, 'uploading', 't')",
+    )
+    .execute(&pool)
+    .await
+    .expect("all-null pending chunk");
+    sqlx::query(
+        "INSERT INTO upload_session
+         (id, project_id, destination_name, expected_size, committed_offset,
+          pending_offset, pending_length, pending_digest, state, expires_at)
+         VALUES ('present', 'p1', 'present', 10, 2, 2, 8, zeroblob(32), 'uploading', 't')",
+    )
+    .execute(&pool)
+    .await
+    .expect("valid pending chunk");
+
+    let invalid = [
+        "VALUES ('partial', 'p1', 'partial', 10, 0, 0, NULL, NULL, 'uploading', 't')",
+        "VALUES ('wrong-offset', 'p1', 'wrong-offset', 10, 2, 3, 1, zeroblob(32), 'uploading', 't')",
+        "VALUES ('zero-length', 'p1', 'zero-length', 10, 0, 0, 0, zeroblob(32), 'uploading', 't')",
+        "VALUES ('out-of-bounds', 'p1', 'out-of-bounds', 10, 8, 8, 3, zeroblob(32), 'uploading', 't')",
+        "VALUES ('short-digest', 'p1', 'short-digest', 10, 0, 0, 1, x'00', 'uploading', 't')",
+    ];
+    for values in invalid {
+        let statement = format!(
+            "INSERT INTO upload_session
+             (id, project_id, destination_name, expected_size, committed_offset,
+              pending_offset, pending_length, pending_digest, state, expires_at)
+             {values}"
+        );
+        assert!(
+            pool.execute(statement.as_str()).await.is_err(),
+            "constraint unexpectedly accepted {values}"
+        );
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn audit_events_do_not_cascade_with_projects() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    sqlx::query(
+        "INSERT INTO audit_event
+         (event_id, source, project_id, action, result, occurred_at, details)
+         VALUES ('event', 'web', 'p1', 'create', 'ok', 't', '{}')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert audit event");
+
+    assert!(
+        sqlx::query("DELETE FROM project WHERE id = 'p1'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event")
+        .fetch_one(&pool)
+        .await
+        .expect("count audit events");
+    assert_eq!(count, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn schema_contains_all_descriptive_columns() {
+    let (_db, pool) = migrated_db().await;
+    let expected = [
+        (
+            "project",
+            "id,name,description,status,version,created_at,updated_at,deleted_at",
+        ),
+        (
+            "file_entry",
+            "id,project_id,parent_id,exact_name,kind,platform_kind,volume_serial,filesystem_file_id,size,mtime_filetime_100ns,hash,hash_state,state,revision,scan_generation,observed_at",
+        ),
+        ("project_cover", "project_id,file_entry_id"),
+        (
+            "upload_session",
+            "id,project_id,destination_parent_id,destination_name,expected_size,committed_offset,expected_hash,pending_offset,pending_length,pending_digest,state,expires_at",
+        ),
+        (
+            "operation",
+            "id,project_id,kind,state,payload_version,payload,error,created_at,updated_at",
+        ),
+        (
+            "trash_item",
+            "id,project_id,root_entry_id,original_path_snapshot,storage_path,deleted_at,purge_after,state",
+        ),
+        (
+            "audit_event",
+            "sequence,event_id,operation_id,source,project_id,target_id,path_snapshot,action,result,occurred_at,details",
+        ),
+    ];
+
+    for (table, column_list) in expected {
+        let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&pool)
+            .await
+            .expect("read table columns");
+        let actual: Vec<String> = rows
+            .iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        let expected: Vec<&str> = column_list.split(',').collect();
+        assert_eq!(actual, expected, "columns for {table}");
+    }
+    pool.close().await;
+}
