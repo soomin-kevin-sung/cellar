@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use cellar_config::{
     BootstrapClaim, CellarConfig, ConfigError, PersistedConfig, load_config, save_config,
 };
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use url::Url;
 
@@ -248,6 +249,49 @@ fn config_toml_round_trips() {
     assert_eq!(load_config(&path).unwrap(), persisted);
 }
 
+fn enrolled_config(storage_root: &Path) -> CellarConfig {
+    let mut config = unenrolled_config(storage_root);
+    config.bootstrap_owner_email = None;
+    config.owner_subject = Some("cf-access-subject".to_owned());
+    config
+}
+
+#[test]
+fn enrolled_config_with_bootstrap_claim_is_rejected_on_save() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let persisted = PersistedConfig {
+        config: enrolled_config(directory.path()),
+        bootstrap_claim: Some(BootstrapClaim::new(&CLAIM_CODE, 2_000_000_000)),
+    };
+
+    assert_eq!(
+        persisted.validate().unwrap_err().code(),
+        "bootstrap_claim_forbidden_when_enrolled"
+    );
+    assert_eq!(
+        save_config(&path, &persisted).unwrap_err().code(),
+        "bootstrap_claim_forbidden_when_enrolled"
+    );
+    assert!(!path.exists());
+}
+
+#[test]
+fn enrolled_config_with_bootstrap_claim_is_rejected_on_load() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let persisted = PersistedConfig {
+        config: enrolled_config(directory.path()),
+        bootstrap_claim: Some(BootstrapClaim::new(&CLAIM_CODE, 2_000_000_000)),
+    };
+    fs::write(&path, toml::to_string(&persisted).unwrap()).unwrap();
+
+    assert_eq!(
+        load_config(&path).unwrap_err().code(),
+        "bootstrap_claim_forbidden_when_enrolled"
+    );
+}
+
 #[test]
 fn claim_record_never_contains_plaintext_and_verifies_in_constant_time() {
     let claim = BootstrapClaim::new(&CLAIM_CODE, 2_000_000_000);
@@ -259,6 +303,24 @@ fn claim_record_never_contains_plaintext_and_verifies_in_constant_time() {
     let wrong_code = [0xa5; 32];
     assert!(!claim.verify(&wrong_code, 1_999_999_999));
     assert!(!claim.verify(&CLAIM_CODE, 2_000_000_001));
+}
+
+#[test]
+fn claim_verifier_bytes_are_redacted_from_debug_output() {
+    let directory = tempdir().unwrap();
+    let claim = BootstrapClaim::new(&CLAIM_CODE, 2_000_000_000);
+    let verifier_marker = format!("{:?}", Sha256::digest(CLAIM_CODE).to_vec());
+    let persisted = PersistedConfig {
+        config: unenrolled_config(directory.path()),
+        bootstrap_claim: Some(claim.clone()),
+    };
+
+    let claim_debug = format!("{claim:?}");
+    let persisted_debug = format!("{persisted:?}");
+    assert!(!claim_debug.contains(&verifier_marker));
+    assert!(!persisted_debug.contains(&verifier_marker));
+    assert!(claim_debug.contains("<redacted>"));
+    assert!(persisted_debug.contains("<redacted>"));
 }
 
 #[test]
@@ -301,6 +363,70 @@ fn loading_absent_malformed_or_invalid_config_fails_closed() {
         load_config(&path).unwrap_err().code(),
         "external_origin_must_be_https"
     );
+}
+
+#[test]
+fn unknown_top_level_config_field_fails_closed() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let persisted = PersistedConfig {
+        config: unenrolled_config(directory.path()),
+        bootstrap_claim: None,
+    };
+    let mut document = toml::Value::try_from(&persisted).unwrap();
+    document
+        .as_table_mut()
+        .unwrap()
+        .insert("unexpected".to_owned(), toml::Value::Boolean(true));
+    fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+
+    assert_eq!(load_config(&path).unwrap_err().code(), "config_parse_error");
+}
+
+#[test]
+fn unknown_security_config_field_is_rejected() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let persisted = PersistedConfig {
+        config: unenrolled_config(directory.path()),
+        bootstrap_claim: None,
+    };
+    let mut document = toml::Value::try_from(persisted).unwrap();
+    document
+        .get_mut("config")
+        .unwrap()
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "orgin_port".to_owned(),
+            toml::Value::Integer(i64::from(8443)),
+        );
+    fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+
+    assert_eq!(load_config(&path).unwrap_err().code(), "config_parse_error");
+}
+
+#[test]
+fn unknown_bootstrap_claim_field_is_rejected() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let persisted = PersistedConfig {
+        config: unenrolled_config(directory.path()),
+        bootstrap_claim: Some(BootstrapClaim::new(&CLAIM_CODE, 2_000_000_000)),
+    };
+    let mut document = toml::Value::try_from(persisted).unwrap();
+    document
+        .get_mut("bootstrap_claim")
+        .unwrap()
+        .as_table_mut()
+        .unwrap()
+        .insert(
+            "plaintext_code".to_owned(),
+            toml::Value::String("secret".to_owned()),
+        );
+    fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+
+    assert_eq!(load_config(&path).unwrap_err().code(), "config_parse_error");
 }
 
 #[test]

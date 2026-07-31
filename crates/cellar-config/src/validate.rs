@@ -57,6 +57,8 @@ pub enum ConfigError {
     OwnerSubjectEmpty,
     #[error("owner subject must not contain surrounding whitespace")]
     OwnerSubjectNotTrimmed,
+    #[error("bootstrap claim is forbidden after owner enrollment")]
+    BootstrapClaimForbiddenWhenEnrolled,
     #[error("storage root must be an absolute path")]
     StorageRootMustBeAbsolute,
     #[error("origin port must be nonzero")]
@@ -100,6 +102,7 @@ impl ConfigError {
             Self::BootstrapOwnerEmailNotTrimmed => "bootstrap_owner_email_not_trimmed",
             Self::OwnerSubjectEmpty => "owner_subject_empty",
             Self::OwnerSubjectNotTrimmed => "owner_subject_not_trimmed",
+            Self::BootstrapClaimForbiddenWhenEnrolled => "bootstrap_claim_forbidden_when_enrolled",
             Self::StorageRootMustBeAbsolute => "storage_root_must_be_absolute",
             Self::OriginPortMustBeNonzero => "origin_port_must_be_nonzero",
             Self::HealthPortMustBeNonzero => "health_port_must_be_nonzero",

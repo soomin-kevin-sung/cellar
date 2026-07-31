@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use crate::ConfigError;
 
 /// Security-sensitive Cellar configuration supplied by the service host.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CellarConfig {
     pub external_origin: Url,
     pub team_domain: Url,
@@ -28,10 +30,21 @@ impl CellarConfig {
 }
 
 /// Persisted bootstrap-claim metadata. The plaintext claim is never retained.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootstrapClaim {
     claim_code_sha256: [u8; 32],
     pub expires_at_unix_seconds: i64,
+}
+
+impl fmt::Debug for BootstrapClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapClaim")
+            .field("claim_code_sha256", &"<redacted>")
+            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .finish()
+    }
 }
 
 impl BootstrapClaim {
@@ -57,9 +70,30 @@ fn hash_claim_code(claim_code: &[u8; 32]) -> [u8; 32] {
 }
 
 /// On-disk `config.toml` representation.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedConfig {
-    #[serde(flatten)]
     pub config: CellarConfig,
     pub bootstrap_claim: Option<BootstrapClaim>,
+}
+
+impl fmt::Debug for PersistedConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistedConfig")
+            .field("config", &self.config)
+            .field("bootstrap_claim", &self.bootstrap_claim)
+            .finish()
+    }
+}
+
+impl PersistedConfig {
+    /// Validates both the core configuration and cross-record enrollment state.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.config.validate()?;
+        if self.config.owner_subject.is_some() && self.bootstrap_claim.is_some() {
+            return Err(ConfigError::BootstrapClaimForbiddenWhenEnrolled);
+        }
+        Ok(())
+    }
 }
