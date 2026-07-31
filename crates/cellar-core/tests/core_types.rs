@@ -111,6 +111,37 @@ fn identifiers_reject_non_v7_text_and_json() {
     assert_rejects_non_v7::<TrashId>();
 }
 
+fn assert_binary_serde_invariants<T>()
+where
+    T: Copy + Default + Eq + std::fmt::Debug + Serialize + DeserializeOwned,
+{
+    let id = T::default();
+    let encoded =
+        bincode::serde::encode_to_vec(id, bincode::config::standard()).expect("ID should encode");
+    let (decoded, bytes_read): (T, usize) =
+        bincode::serde::decode_from_slice(&encoded, bincode::config::standard())
+            .expect("ID should decode");
+    assert_eq!(bytes_read, encoded.len());
+    assert_eq!(decoded, id);
+
+    let non_v7 = String::from("550e8400-e29b-41d4-a716-446655440000");
+    let encoded_non_v7 =
+        bincode::serde::encode_to_vec(non_v7, bincode::config::standard()).expect("text encodes");
+    assert!(
+        bincode::serde::decode_from_slice::<T, _>(&encoded_non_v7, bincode::config::standard())
+            .is_err()
+    );
+}
+
+#[test]
+fn identifiers_have_format_invariant_binary_serde() {
+    assert_binary_serde_invariants::<ProjectId>();
+    assert_binary_serde_invariants::<FileEntryId>();
+    assert_binary_serde_invariants::<UploadId>();
+    assert_binary_serde_invariants::<OperationId>();
+    assert_binary_serde_invariants::<TrashId>();
+}
+
 #[test]
 fn readiness_blockers_have_stable_codes_and_display() {
     let cases = [

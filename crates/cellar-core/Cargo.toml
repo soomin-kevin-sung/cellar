@@ -12,4 +12,5 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bincode = { version = "2", default-features = false, features = ["serde", "std"] }
 serde_json.workspace = true

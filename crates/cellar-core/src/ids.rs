@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::{Uuid, Version};
 
@@ -16,7 +16,7 @@ pub enum ParseIdError {
 
 macro_rules! define_id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
         pub struct $name(Uuid);
 
         impl $name {
@@ -36,6 +36,15 @@ macro_rules! define_id {
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(formatter, "{}", self.0.hyphenated())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.collect_str(self)
             }
         }
 
