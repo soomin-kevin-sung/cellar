@@ -1,5 +1,4 @@
 use std::{
-    array,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -14,6 +13,7 @@ use rcgen::{
     Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use x509_parser::{
@@ -32,6 +32,9 @@ const TRANSACTION_MARKER: &str = ".cellar-origin-tls.transaction";
 const OPERATION_LOCK: &str = ".cellar-origin-tls.lock";
 const ESTABLISHMENT_MARKER: &str = ".cellar-origin-tls.established";
 const ESTABLISHMENT_MARKER_CONTENT: &[u8] = b"cellar-origin-tls-established:v1\n";
+const ROTATION_PENDING_RECORD: &str = ".cellar-origin-tls.rotation-pending";
+const ROTATION_RECORD_HEADER: &str = "cellar-origin-ca-rotation:v1\n";
+const ROTATION_ROUTE_UPDATE: &str = "cloudflared-ca-pool-and-route";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OriginTlsPaths {
@@ -46,6 +49,7 @@ pub struct TlsMaterial {
     private_key: SecretPrivateKey,
     ca_certificate: CertificateDer<'static>,
     warnings: Vec<TlsWarning>,
+    pending_rotation: Option<PendingOriginCaRotation>,
 }
 
 struct SecretPrivateKey(PrivateKeyDer<'static>);
@@ -59,6 +63,41 @@ impl Drop for SecretPrivateKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TlsWarning {
     CaRotationRequired,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct PendingOriginCaRotation {
+    fingerprint_sha256: String,
+    ca_certificate: CertificateDer<'static>,
+}
+
+impl std::fmt::Debug for PendingOriginCaRotation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingOriginCaRotation")
+            .field("fingerprint_sha256", &self.fingerprint_sha256)
+            .field("ca_certificate_len", &self.ca_certificate.as_ref().len())
+            .field("cloudflared_ca_pool_and_route_update_required", &true)
+            .finish()
+    }
+}
+
+impl PendingOriginCaRotation {
+    pub fn fingerprint_sha256(&self) -> &str {
+        &self.fingerprint_sha256
+    }
+
+    pub fn ca_certificate(&self) -> &CertificateDer<'static> {
+        &self.ca_certificate
+    }
+
+    pub fn cloudflared_ca_pool_and_route_update_required(&self) -> bool {
+        true
+    }
+
+    pub fn route_update_material(&self) -> &'static str {
+        ROTATION_ROUTE_UPDATE
+    }
 }
 
 pub struct OriginCaRotation {
@@ -85,6 +124,12 @@ impl OriginCaRotation {
     pub fn cloudflared_ca_pool_and_route_update_required(&self) -> bool {
         true
     }
+
+    pub fn pending_rotation(&self) -> &PendingOriginCaRotation {
+        self.material
+            .pending_rotation()
+            .expect("rotation results always carry durable pending state")
+    }
 }
 
 impl std::fmt::Debug for TlsMaterial {
@@ -94,6 +139,7 @@ impl std::fmt::Debug for TlsMaterial {
             .field("certificate_chain_len", &self.certificate_chain.len())
             .field("private_key", &"[redacted]")
             .field("ca_certificate_len", &self.ca_certificate.as_ref().len())
+            .field("pending_rotation", &self.pending_rotation)
             .finish()
     }
 }
@@ -113,6 +159,10 @@ impl TlsMaterial {
 
     pub fn warnings(&self) -> &[TlsWarning] {
         &self.warnings
+    }
+
+    pub fn pending_rotation(&self) -> Option<&PendingOriginCaRotation> {
+        self.pending_rotation.as_ref()
     }
 }
 
@@ -154,6 +204,16 @@ pub enum TlsError {
         rotation: Box<OriginCaRotation>,
         marker_error: String,
     },
+    #[error(
+        "the pending origin CA rotation record is missing, corrupt, or does not match the active CA"
+    )]
+    PendingRotationInvalid,
+    #[error("no origin CA rotation is awaiting cloudflared deployment acknowledgment")]
+    NoPendingRotation,
+    #[error(
+        "the origin CA rotation acknowledgment fingerprint does not match the pending rotation"
+    )]
+    RotationFingerprintMismatch,
     #[cfg(test)]
     #[error("injected crash after {0}")]
     InjectedCrash(&'static str),
@@ -201,6 +261,19 @@ pub fn rotate_origin_ca(
     rotate_origin_ca_impl(paths, now, true)
 }
 
+/// Acknowledges that cloudflared now trusts the pending origin CA rotation.
+/// The pending record is removed only when the expected SHA-256 fingerprint
+/// exactly matches the durably recorded rotation.
+pub fn acknowledge_origin_ca_rotation(
+    paths: &OriginTlsPaths,
+    expected_fingerprint: &str,
+) -> Result<(), TlsError> {
+    if !is_elevated_administrator().map_err(TlsError::AdministratorCheck)? {
+        return Err(TlsError::AdministratorRequired);
+    }
+    acknowledge_origin_ca_rotation_impl(paths, expected_fingerprint, true)
+}
+
 impl TlsError {
     /// Returns the committed rotation when trust changed even though publishing
     /// establishment state failed. Callers must still update cloudflared.
@@ -223,9 +296,11 @@ fn ensure_origin_tls_impl(
     let _lock = acquire_operation_lock(directory, protect_private_keys)?;
     recover_transaction(paths, directory)?;
     let established = establishment_is_recorded(directory, protect_private_keys)?;
+    let pending = load_pending_rotation(directory, protect_private_keys)?;
 
     match load_existing(paths, now, established)? {
         ExistingState::Valid(existing) => {
+            validate_pending_rotation(pending.as_ref(), &existing.bundle.ca_cert_der)?;
             if existing.leaf_not_after - now > RENEWAL_WINDOW {
                 if protect_private_keys {
                     secure_existing_keys(paths)?;
@@ -233,21 +308,32 @@ fn ensure_origin_tls_impl(
                 ensure_establishment_marker(directory, established, protect_private_keys)?;
                 let warning = (existing.ca_not_after < now + LEAF_LIFETIME)
                     .then_some(TlsWarning::CaRotationRequired);
-                return Ok(existing.bundle.into_material(warning));
+                return Ok(existing
+                    .bundle
+                    .into_material(warning)
+                    .with_pending_rotation(pending));
             }
 
             if existing.ca_not_after >= now + LEAF_LIFETIME {
                 let renewed = renew_leaf(*existing, now)?;
                 persist_bundle(paths, directory, &renewed, protect_private_keys)?;
                 ensure_establishment_marker(directory, established, protect_private_keys)?;
-                return Ok(renewed.into_material(None));
+                return Ok(renewed.into_material(None).with_pending_rotation(pending));
+            }
+            if protect_private_keys {
+                secure_existing_keys(paths)?;
             }
             ensure_establishment_marker(directory, established, protect_private_keys)?;
             return Ok(existing
                 .bundle
-                .into_material(Some(TlsWarning::CaRotationRequired)));
+                .into_material(Some(TlsWarning::CaRotationRequired))
+                .with_pending_rotation(pending));
         }
-        ExistingState::Uninitialized => {}
+        ExistingState::Uninitialized => {
+            if pending.is_some() {
+                return Err(TlsError::PendingRotationInvalid);
+            }
+        }
     }
 
     let generated = generate_bundle(now)?;
@@ -267,10 +353,44 @@ fn rotate_origin_ca_impl(
     let _lock = acquire_operation_lock(directory, protect_private_keys)?;
     recover_transaction(paths, directory)?;
     let established = establishment_is_recorded(directory, protect_private_keys)?;
+    if let Some(pending) = load_pending_rotation(directory, protect_private_keys)? {
+        let existing =
+            load_and_validate(paths, now).map_err(|()| TlsError::PendingRotationInvalid)?;
+        validate_pending_rotation(Some(&pending), &existing.bundle.ca_cert_der)?;
+        if protect_private_keys {
+            secure_existing_keys(paths)?;
+        }
+        let rotation = OriginCaRotation {
+            material: existing
+                .bundle
+                .into_material(None)
+                .with_pending_rotation(Some(pending)),
+        };
+        if let Err(error) =
+            ensure_establishment_marker(directory, established, protect_private_keys)
+        {
+            return Err(TlsError::RotationCommitted {
+                rotation: Box::new(rotation),
+                marker_error: error.to_string(),
+            });
+        }
+        return Ok(rotation);
+    }
     let generated = generate_bundle(now)?;
-    persist_bundle(paths, directory, &generated, protect_private_keys)?;
+    let pending = PendingOriginCaRotation::from_bundle(&generated);
+    let pending_record = pending.record_bytes(&generated.ca_cert_pem);
+    persist_rotation_bundle(
+        paths,
+        directory,
+        &generated,
+        &pending_record,
+        protect_private_keys,
+        PersistenceFault::None,
+    )?;
     let rotation = OriginCaRotation {
-        material: generated.into_material(None),
+        material: generated
+            .into_material(None)
+            .with_pending_rotation(Some(pending)),
     };
     if let Err(error) = ensure_establishment_marker(directory, established, protect_private_keys) {
         return Err(TlsError::RotationCommitted {
@@ -279,6 +399,35 @@ fn rotate_origin_ca_impl(
         });
     }
     Ok(rotation)
+}
+
+fn acknowledge_origin_ca_rotation_impl(
+    paths: &OriginTlsPaths,
+    expected_fingerprint: &str,
+    protect: bool,
+) -> Result<(), TlsError> {
+    let directory = common_directory(paths)?;
+    fs::create_dir_all(directory)
+        .map_err(|source| io_error("create directory", directory, source))?;
+    let _lock = acquire_operation_lock(directory, protect)?;
+    recover_transaction(paths, directory)?;
+    let established = establishment_is_recorded(directory, protect)?;
+    let pending = load_pending_rotation(directory, protect)?.ok_or(TlsError::NoPendingRotation)?;
+    if pending.fingerprint_sha256 != expected_fingerprint {
+        return Err(TlsError::RotationFingerprintMismatch);
+    }
+    let ca_pem = fs::read(&paths.ca_cert).map_err(|source| {
+        io_error(
+            "read active CA for rotation acknowledgment",
+            &paths.ca_cert,
+            source,
+        )
+    })?;
+    let ca_der =
+        certificate_der_from_pem(&ca_pem).map_err(|()| TlsError::PendingRotationInvalid)?;
+    validate_pending_rotation(Some(&pending), &ca_der)?;
+    ensure_establishment_marker(directory, established, protect)?;
+    durable_remove_marker(&directory.join(ROTATION_PENDING_RECORD))
 }
 
 #[cfg(test)]
@@ -457,6 +606,95 @@ fn ensure_establishment_marker(
         PersistenceFault::None,
     )?;
     rename_staged_file(&staged, &marker)
+}
+
+impl PendingOriginCaRotation {
+    fn from_bundle(bundle: &Bundle) -> Self {
+        Self {
+            fingerprint_sha256: sha256_fingerprint(&bundle.ca_cert_der),
+            ca_certificate: CertificateDer::from(bundle.ca_cert_der.clone()),
+        }
+    }
+
+    fn record_bytes(&self, ca_pem: &[u8]) -> Vec<u8> {
+        let mut record = format!(
+            "{ROTATION_RECORD_HEADER}sha256:{}\nroute:{ROTATION_ROUTE_UPDATE}\n",
+            self.fingerprint_sha256
+        )
+        .into_bytes();
+        record.extend_from_slice(ca_pem);
+        record
+    }
+}
+
+fn sha256_fingerprint(der: &[u8]) -> String {
+    Sha256::digest(der)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn load_pending_rotation(
+    directory: &Path,
+    protect: bool,
+) -> Result<Option<PendingOriginCaRotation>, TlsError> {
+    let path = directory.join(ROTATION_PENDING_RECORD);
+    if !transaction_path_exists(&path)? {
+        return Ok(None);
+    }
+    if !transaction_path_is_file(&path)? {
+        return Err(TlsError::PendingRotationInvalid);
+    }
+    let bytes =
+        fs::read(&path).map_err(|source| io_error("read pending CA rotation", &path, source))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| TlsError::PendingRotationInvalid)?;
+    let mut lines = text.splitn(4, '\n');
+    if lines.next() != Some(ROTATION_RECORD_HEADER.trim_end()) {
+        return Err(TlsError::PendingRotationInvalid);
+    }
+    let fingerprint = lines
+        .next()
+        .and_then(|line| line.strip_prefix("sha256:"))
+        .ok_or(TlsError::PendingRotationInvalid)?;
+    if fingerprint.len() != 64
+        || !fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(TlsError::PendingRotationInvalid);
+    }
+    let expected_route = format!("route:{ROTATION_ROUTE_UPDATE}");
+    if lines.next() != Some(expected_route.as_str()) {
+        return Err(TlsError::PendingRotationInvalid);
+    }
+    let ca_pem = lines.next().ok_or(TlsError::PendingRotationInvalid)?;
+    let ca_der = certificate_der_from_pem(ca_pem.as_bytes())
+        .map_err(|()| TlsError::PendingRotationInvalid)?;
+    if sha256_fingerprint(&ca_der) != fingerprint {
+        return Err(TlsError::PendingRotationInvalid);
+    }
+    if protect {
+        #[cfg(windows)]
+        secure_existing_protected_file(&path)?;
+        #[cfg(not(windows))]
+        set_owner_only_permissions(&path)?;
+    }
+    Ok(Some(PendingOriginCaRotation {
+        fingerprint_sha256: fingerprint.to_owned(),
+        ca_certificate: CertificateDer::from(ca_der),
+    }))
+}
+
+fn validate_pending_rotation(
+    pending: Option<&PendingOriginCaRotation>,
+    active_ca_der: &[u8],
+) -> Result<(), TlsError> {
+    if let Some(pending) = pending
+        && pending.ca_certificate.as_ref() != active_ca_der
+    {
+        return Err(TlsError::PendingRotationInvalid);
+    }
+    Ok(())
 }
 
 fn load_existing(
@@ -682,7 +920,15 @@ impl Bundle {
             ))),
             ca_certificate,
             warnings: warning.into_iter().collect(),
+            pending_rotation: None,
         }
+    }
+}
+
+impl TlsMaterial {
+    fn with_pending_rotation(mut self, pending: Option<PendingOriginCaRotation>) -> Self {
+        self.pending_rotation = pending;
+        self
     }
 }
 
@@ -713,6 +959,8 @@ enum PersistenceFault {
     MarkerReplacement(TransactionState),
     #[cfg(test)]
     RollbackStep(usize),
+    #[cfg(test)]
+    CrashAfterCommittedMarker,
     #[cfg(test)]
     Cleanup,
 }
@@ -748,7 +996,36 @@ fn persist_bundle_impl(
     protect_private_keys: bool,
     fault: PersistenceFault,
 ) -> Result<(), TlsError> {
-    let files = [
+    persist_bundle_transaction(paths, directory, bundle, None, protect_private_keys, fault)
+}
+
+fn persist_rotation_bundle(
+    paths: &OriginTlsPaths,
+    directory: &Path,
+    bundle: &Bundle,
+    pending_record: &[u8],
+    protect_private_keys: bool,
+    fault: PersistenceFault,
+) -> Result<(), TlsError> {
+    persist_bundle_transaction(
+        paths,
+        directory,
+        bundle,
+        Some(pending_record),
+        protect_private_keys,
+        fault,
+    )
+}
+
+fn persist_bundle_transaction(
+    paths: &OriginTlsPaths,
+    directory: &Path,
+    bundle: &Bundle,
+    pending_record: Option<&[u8]>,
+    protect_private_keys: bool,
+    fault: PersistenceFault,
+) -> Result<(), TlsError> {
+    let mut files = vec![
         TransactionFile {
             target: &paths.ca_cert,
             contents: &bundle.ca_cert_pem,
@@ -770,8 +1047,22 @@ fn persist_bundle_impl(
             private: true,
         },
     ];
-    let stages: [PathBuf; 4] = array::from_fn(|index| sibling_path(files[index].target, "stage"));
-    let backups: [PathBuf; 4] = array::from_fn(|index| sibling_path(files[index].target, "backup"));
+    let pending_path = directory.join(ROTATION_PENDING_RECORD);
+    if let Some(contents) = pending_record {
+        files.push(TransactionFile {
+            target: &pending_path,
+            contents,
+            private: true,
+        });
+    }
+    let stages = files
+        .iter()
+        .map(|file| sibling_path(file.target, "stage"))
+        .collect::<Vec<_>>();
+    let backups = files
+        .iter()
+        .map(|file| sibling_path(file.target, "backup"))
+        .collect::<Vec<_>>();
     let marker = directory.join(TRANSACTION_MARKER);
 
     let mut staged_files = Vec::with_capacity(files.len());
@@ -809,7 +1100,13 @@ fn persist_bundle_impl(
             }
         }
     }
-    if let Err(error) = publish_marker(&marker, original_mask, TransactionState::Prepared, fault) {
+    if let Err(error) = publish_marker(
+        &marker,
+        original_mask,
+        files.len(),
+        TransactionState::Prepared,
+        fault,
+    ) {
         drop(staged_files);
         cleanup_stages(&stages, &marker);
         return Err(error);
@@ -847,7 +1144,13 @@ fn persist_bundle_impl(
                 ));
             }
         }
-        publish_marker(&marker, original_mask, TransactionState::Committed, fault)
+        publish_marker(
+            &marker,
+            original_mask,
+            files.len(),
+            TransactionState::Committed,
+            fault,
+        )
     })();
 
     if let Err(commit_error) = commit_result {
@@ -869,6 +1172,11 @@ fn persist_bundle_impl(
             )));
         }
         return Err(commit_error);
+    }
+
+    #[cfg(test)]
+    if fault == PersistenceFault::CrashAfterCommittedMarker {
+        return Err(TlsError::InjectedCrash("durable committed marker"));
     }
 
     #[cfg(test)]
@@ -1034,6 +1342,7 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), TlsError> {
 fn publish_marker(
     path: &Path,
     original_mask: u8,
+    file_count: usize,
     state: TransactionState,
     fault: PersistenceFault,
 ) -> Result<(), TlsError> {
@@ -1050,7 +1359,7 @@ fn publish_marker(
         TransactionState::Prepared => "prepared",
         TransactionState::Committed => "committed",
     };
-    write!(file, "{state_text}:{original_mask:02x}")
+    write!(file, "{state_text}:{original_mask:02x}:{file_count}")
         .map_err(|source| io_error("write transaction marker", &marker_stage, source))?;
     file.flush()
         .map_err(|source| io_error("flush transaction marker", &marker_stage, source))?;
@@ -1070,14 +1379,22 @@ fn publish_marker(
 }
 
 fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), TlsError> {
-    let targets = [
+    let pending_path = directory.join(ROTATION_PENDING_RECORD);
+    let all_targets = [
         paths.ca_cert.as_path(),
         paths.ca_key.as_path(),
         paths.leaf_cert.as_path(),
         paths.leaf_key.as_path(),
+        pending_path.as_path(),
     ];
-    let stages: [PathBuf; 4] = array::from_fn(|index| sibling_path(targets[index], "stage"));
-    let backups: [PathBuf; 4] = array::from_fn(|index| sibling_path(targets[index], "backup"));
+    let all_stages = all_targets
+        .iter()
+        .map(|target| sibling_path(target, "stage"))
+        .collect::<Vec<_>>();
+    let all_backups = all_targets
+        .iter()
+        .map(|target| sibling_path(target, "backup"))
+        .collect::<Vec<_>>();
     let marker = directory.join(TRANSACTION_MARKER);
 
     if transaction_path_exists(&marker)? {
@@ -1085,10 +1402,26 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
         File::open(&marker)
             .and_then(|mut file| file.read_to_string(&mut text))
             .map_err(|source| io_error("read transaction marker", &marker, source))?;
-        let (state, mask) = text
-            .trim()
-            .split_once(':')
-            .ok_or_else(|| TlsError::Recovery("invalid transaction marker format".to_owned()))?;
+        let fields = text.trim().split(':').collect::<Vec<_>>();
+        if !(fields.len() == 2 || fields.len() == 3) {
+            return Err(TlsError::Recovery(
+                "invalid transaction marker format".to_owned(),
+            ));
+        }
+        let state = fields[0];
+        let mask = fields[1];
+        let file_count = if fields.len() == 3 {
+            fields[2]
+                .parse::<usize>()
+                .map_err(|error| TlsError::Recovery(format!("invalid file count: {error}")))?
+        } else {
+            4
+        };
+        if !(4..=5).contains(&file_count) {
+            return Err(TlsError::Recovery(
+                "invalid transaction file count".to_owned(),
+            ));
+        }
         let state = match state {
             "prepared" => TransactionState::Prepared,
             "committed" => TransactionState::Committed,
@@ -1100,26 +1433,38 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
         };
         let original_mask = u8::from_str_radix(mask, 16)
             .map_err(|error| TlsError::Recovery(format!("invalid transaction marker: {error}")))?;
-        let files = targets.map(|target| TransactionFile {
-            target,
-            contents: &[],
-            private: false,
-        });
+        let allowed_mask = (1_u16 << file_count) - 1;
+        if u16::from(original_mask) & !allowed_mask != 0 {
+            return Err(TlsError::Recovery(
+                "transaction marker contains out-of-range file bits".to_owned(),
+            ));
+        }
+        let targets = &all_targets[..file_count];
+        let stages = &all_stages[..file_count];
+        let backups = &all_backups[..file_count];
+        let files = targets
+            .iter()
+            .map(|target| TransactionFile {
+                target,
+                contents: &[],
+                private: false,
+            })
+            .collect::<Vec<_>>();
         let mut all_targets_are_files = true;
         for target in targets {
             all_targets_are_files &= transaction_path_is_file(target)?;
         }
         if state == TransactionState::Committed && all_targets_are_files {
-            cleanup_after_commit(&stages, &backups, &marker);
+            cleanup_after_commit(stages, backups, &marker);
         } else {
-            rollback_files(&files, &stages, &backups, original_mask, &marker, directory)
+            rollback_files(&files, stages, backups, original_mask, &marker, directory)
                 .map_err(|error| TlsError::Recovery(error.to_string()))?;
         }
     } else {
-        for stage in &stages {
+        for stage in &all_stages {
             best_effort_remove(stage);
         }
-        for backup in &backups {
+        for backup in &all_backups {
             best_effort_remove(backup);
         }
         best_effort_remove(&sibling_path(&marker, "stage"));
@@ -1129,9 +1474,9 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
 }
 
 fn rollback_files(
-    files: &[TransactionFile<'_>; 4],
-    stages: &[PathBuf; 4],
-    backups: &[PathBuf; 4],
+    files: &[TransactionFile<'_>],
+    stages: &[PathBuf],
+    backups: &[PathBuf],
     original_mask: u8,
     marker: &Path,
     _directory: &Path,
@@ -1148,9 +1493,9 @@ fn rollback_files(
 }
 
 fn rollback_files_impl(
-    files: &[TransactionFile<'_>; 4],
-    stages: &[PathBuf; 4],
-    backups: &[PathBuf; 4],
+    files: &[TransactionFile<'_>],
+    stages: &[PathBuf],
+    backups: &[PathBuf],
     original_mask: u8,
     marker: &Path,
     _directory: &Path,
@@ -1216,14 +1561,14 @@ fn transaction_path_is_file(path: &Path) -> Result<bool, TlsError> {
     }
 }
 
-fn cleanup_stages(stages: &[PathBuf; 4], marker: &Path) {
+fn cleanup_stages(stages: &[PathBuf], marker: &Path) {
     for stage in stages {
         best_effort_remove(stage);
     }
     best_effort_remove(&sibling_path(marker, "stage"));
 }
 
-fn cleanup_after_commit(stages: &[PathBuf; 4], backups: &[PathBuf; 4], marker: &Path) {
+fn cleanup_after_commit(stages: &[PathBuf], backups: &[PathBuf], marker: &Path) {
     let mut cleanup_complete = true;
     for stage in stages {
         cleanup_complete &= remove_if_exists(stage).is_ok();
@@ -1664,6 +2009,231 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgment_backfills_missing_establishment_marker_before_consuming_pending_rotation() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let marker = temp.path().join(ESTABLISHMENT_MARKER);
+        let marker_stage = sibling_path(&marker, "stage");
+        fs::create_dir(&marker_stage).unwrap();
+
+        let error = rotate_origin_ca_impl(&paths, now, false).unwrap_err();
+        let fingerprint = error
+            .committed_rotation()
+            .expect("rotation must report committed trust")
+            .pending_rotation()
+            .fingerprint_sha256()
+            .to_owned();
+
+        assert!(acknowledge_origin_ca_rotation_impl(&paths, &fingerprint, false).is_err());
+        assert!(temp.path().join(ROTATION_PENDING_RECORD).is_file());
+        assert!(!marker.exists());
+
+        fs::remove_dir(marker_stage).unwrap();
+        acknowledge_origin_ca_rotation_impl(&paths, &fingerprint, false).unwrap();
+        assert_eq!(fs::read(&marker).unwrap(), ESTABLISHMENT_MARKER_CONTENT);
+        assert!(!temp.path().join(ROTATION_PENDING_RECORD).exists());
+
+        for path in [
+            &paths.ca_cert,
+            &paths.ca_key,
+            &paths.leaf_cert,
+            &paths.leaf_key,
+        ] {
+            fs::remove_file(path).unwrap();
+        }
+        assert!(matches!(
+            ensure_origin_tls_for_test(&paths, now).unwrap_err(),
+            TlsError::EstablishedMaterialMissing
+        ));
+    }
+
+    #[test]
+    fn pending_rotation_survives_restart_blocks_rerotation_and_requires_matching_ack() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        ensure_origin_tls_for_test(&paths, now).unwrap();
+
+        let rotated = rotate_origin_ca_impl(&paths, now + Duration::days(1), false).unwrap();
+        let fingerprint = rotated.pending_rotation().fingerprint_sha256().to_owned();
+        assert_eq!(
+            rotated.pending_rotation().route_update_material(),
+            ROTATION_ROUTE_UPDATE
+        );
+        let ca_serial = serial(rotated.material().ca_certificate());
+
+        let restarted = ensure_origin_tls_for_test(&paths, now + Duration::days(1)).unwrap();
+        assert_eq!(
+            restarted
+                .pending_rotation()
+                .expect("pending rotation must survive restart")
+                .fingerprint_sha256(),
+            fingerprint
+        );
+        let repeated = rotate_origin_ca_impl(&paths, now + Duration::days(2), false).unwrap();
+        assert_eq!(
+            repeated.pending_rotation().fingerprint_sha256(),
+            fingerprint
+        );
+        assert_eq!(serial(repeated.material().ca_certificate()), ca_serial);
+
+        let error = acknowledge_origin_ca_rotation_impl(&paths, "00", false).unwrap_err();
+        assert!(matches!(error, TlsError::RotationFingerprintMismatch));
+        assert!(
+            ensure_origin_tls_for_test(&paths, now + Duration::days(2))
+                .unwrap()
+                .pending_rotation()
+                .is_some()
+        );
+
+        acknowledge_origin_ca_rotation_impl(&paths, &fingerprint, false).unwrap();
+        assert!(
+            ensure_origin_tls_for_test(&paths, now + Duration::days(2))
+                .unwrap()
+                .pending_rotation()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn committed_marker_crash_recovers_exact_pending_rotation() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        ensure_origin_tls_for_test(&paths, now).unwrap();
+        let bundle = generate_bundle(now + Duration::days(1)).unwrap();
+        let pending = PendingOriginCaRotation::from_bundle(&bundle);
+        let record = pending.record_bytes(&bundle.ca_cert_pem);
+
+        let error = persist_rotation_bundle(
+            &paths,
+            temp.path(),
+            &bundle,
+            &record,
+            false,
+            TestPersistenceFault::CrashAfterCommittedMarker,
+        )
+        .unwrap_err();
+        assert!(matches!(error, TlsError::InjectedCrash(_)));
+        assert!(
+            fs::read_to_string(temp.path().join(TRANSACTION_MARKER))
+                .unwrap()
+                .starts_with("committed:")
+        );
+
+        let recovered = ensure_origin_tls_for_test(&paths, now + Duration::days(1)).unwrap();
+
+        assert_eq!(
+            recovered.pending_rotation().unwrap().fingerprint_sha256(),
+            pending.fingerprint_sha256()
+        );
+        assert_eq!(
+            recovered.ca_certificate().as_ref(),
+            pending.ca_certificate().as_ref()
+        );
+        assert!(!temp.path().join(TRANSACTION_MARKER).exists());
+    }
+
+    #[test]
+    fn prepared_rotation_rolls_back_ca_and_pending_record_together() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = ensure_origin_tls_for_test(&paths, now).unwrap();
+        let original_ca_serial = serial(original.ca_certificate());
+        let bundle = generate_bundle(now + Duration::days(1)).unwrap();
+        let pending = PendingOriginCaRotation::from_bundle(&bundle);
+        let record = pending.record_bytes(&bundle.ca_cert_pem);
+
+        let error = persist_rotation_bundle(
+            &paths,
+            temp.path(),
+            &bundle,
+            &record,
+            false,
+            TestPersistenceFault::CrashAfterReplacement(4),
+        )
+        .unwrap_err();
+        assert!(matches!(error, TlsError::InjectedCrash(_)));
+
+        recover_transaction(&paths, temp.path()).unwrap();
+
+        let recovered = ensure_origin_tls_for_test(&paths, now).unwrap();
+        assert_eq!(serial(recovered.ca_certificate()), original_ca_serial);
+        assert!(recovered.pending_rotation().is_none());
+        assert!(!temp.path().join(ROTATION_PENDING_RECORD).exists());
+    }
+
+    #[test]
+    fn persist_return_before_response_is_replayed_as_same_pending_rotation() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        ensure_origin_tls_for_test(&paths, now).unwrap();
+        let bundle = generate_bundle(now + Duration::days(1)).unwrap();
+        let pending = PendingOriginCaRotation::from_bundle(&bundle);
+        let record = pending.record_bytes(&bundle.ca_cert_pem);
+
+        persist_rotation_bundle(
+            &paths,
+            temp.path(),
+            &bundle,
+            &record,
+            false,
+            TestPersistenceFault::None,
+        )
+        .unwrap();
+        // Simulate process death here, after persistence returned but before an
+        // OriginCaRotation response could be constructed or delivered.
+        let recovered = ensure_origin_tls_for_test(&paths, now + Duration::days(1)).unwrap();
+
+        assert_eq!(
+            recovered.pending_rotation().unwrap().fingerprint_sha256(),
+            pending.fingerprint_sha256()
+        );
+        let repeated = rotate_origin_ca_impl(&paths, now + Duration::days(2), false).unwrap();
+        assert_eq!(
+            repeated.pending_rotation().fingerprint_sha256(),
+            pending.fingerprint_sha256()
+        );
+    }
+
+    #[test]
+    fn corrupt_pending_record_fails_closed_without_rerotation_or_ack() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        ensure_origin_tls_for_test(&paths, now).unwrap();
+        let rotated = rotate_origin_ca_impl(&paths, now + Duration::days(1), false).unwrap();
+        let ca_serial = serial(rotated.material().ca_certificate());
+        fs::write(
+            temp.path().join(ROTATION_PENDING_RECORD),
+            b"corrupt pending rotation",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ensure_origin_tls_for_test(&paths, now + Duration::days(1)).unwrap_err(),
+            TlsError::PendingRotationInvalid
+        ));
+        assert!(matches!(
+            rotate_origin_ca_impl(&paths, now + Duration::days(2), false).unwrap_err(),
+            TlsError::PendingRotationInvalid
+        ));
+        assert!(matches!(
+            acknowledge_origin_ca_rotation_impl(&paths, "00", false).unwrap_err(),
+            TlsError::PendingRotationInvalid
+        ));
+        assert_eq!(
+            serial(&CertificateDer::from(
+                certificate_der_from_pem(&fs::read(&paths.ca_cert).unwrap()).unwrap()
+            )),
+            ca_serial
+        );
+    }
+
+    #[test]
     fn concurrent_initialization_publishes_one_consistent_generation() {
         use std::sync::{Arc, Barrier};
 
@@ -1896,6 +2466,40 @@ mod tests {
             ];
             assert_eq!(after, before, "recovery failed for {fault:?}");
         }
+    }
+
+    #[test]
+    fn legacy_two_field_prepared_marker_rolls_back_original_bundle() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = generate_bundle(now).unwrap();
+        persist_bundle(&paths, temp.path(), &original, false).unwrap();
+        let before = [
+            fs::read(&paths.ca_cert).unwrap(),
+            fs::read(&paths.ca_key).unwrap(),
+            fs::read(&paths.leaf_cert).unwrap(),
+            fs::read(&paths.leaf_key).unwrap(),
+        ];
+        let ca_backup = sibling_path(&paths.ca_cert, "backup");
+        fs::rename(&paths.ca_cert, &ca_backup).unwrap();
+        fs::write(&paths.ca_cert, b"interrupted replacement").unwrap();
+        fs::write(temp.path().join(TRANSACTION_MARKER), b"prepared:0f").unwrap();
+
+        recover_transaction(&paths, temp.path()).unwrap();
+
+        assert_eq!(
+            before,
+            [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ]
+        );
+        assert!(!temp.path().join(TRANSACTION_MARKER).exists());
+        assert!(!ca_backup.exists());
+        assert!(!temp.path().join(ROTATION_PENDING_RECORD).exists());
     }
 
     #[test]

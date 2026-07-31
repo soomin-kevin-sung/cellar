@@ -1,7 +1,8 @@
 use std::fs;
 
 use cellar_service::tls::{
-    OriginTlsPaths, TlsError, TlsWarning, ensure_origin_tls, rotate_origin_ca,
+    OriginTlsPaths, TlsError, TlsWarning, acknowledge_origin_ca_rotation, ensure_origin_tls,
+    rotate_origin_ca,
 };
 use tempfile::TempDir;
 use time::{Duration, OffsetDateTime};
@@ -212,6 +213,9 @@ fn medium_integrity_process_cannot_rotate_the_origin_ca() {
     let error = rotate_origin_ca(&paths, now).expect_err("medium token must be denied");
 
     assert!(matches!(error, TlsError::AdministratorRequired));
+    let error = acknowledge_origin_ca_rotation(&paths, "00")
+        .expect_err("medium token must not acknowledge a rotation");
+    assert!(matches!(error, TlsError::AdministratorRequired));
     assert!(!paths.ca_cert.exists());
 }
 
@@ -331,4 +335,12 @@ fn explicit_admin_rotation_changes_ca_and_signals_cloudflared_update() {
         serial(rotated.material().ca_certificate())
     );
     assert!(rotated.cloudflared_ca_pool_and_route_update_required());
+    let fingerprint = rotated.pending_rotation().fingerprint_sha256().to_owned();
+    acknowledge_origin_ca_rotation(&paths, &fingerprint).unwrap();
+    assert!(
+        ensure_origin_tls(&paths, now + Duration::days(1))
+            .unwrap()
+            .pending_rotation()
+            .is_none()
+    );
 }
