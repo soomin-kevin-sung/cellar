@@ -1,1 +1,11 @@
 .superpowers/
+/target/
+/artifacts/
+/web/node_modules/
+/web/dist/
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.pfx
+.env
