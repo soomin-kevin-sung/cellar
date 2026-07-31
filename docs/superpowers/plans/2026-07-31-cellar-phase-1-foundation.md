@@ -10,6 +10,21 @@
 
 ---
 
+## Parallel Execution
+
+| Wave | Task | `depends_on` | Exclusive ownership domain |
+|---|---|---|---|
+| 0 | P1-T1 | none | workspace manifests, crate entry points, `.gitignore` |
+| 1 | P1-T2 | P1-T1 | `cellar-core` identifiers, errors, ports |
+| 1 | P1-T3 | P1-T1 | `cellar-config` |
+| 2 | P1-T4 | P1-T2 | migrations and `cellar-db` pool/migration modules |
+| 2 | P1-T5 | P1-T3 | TLS module and Windows key ACL |
+| 2 | P1-T6 | P1-T3 | `cellar-auth` JWT/JWKS middleware |
+| 3 | P1-T7 | P1-T3, P1-T4, P1-T6 | enrollment, CSRF, session route |
+| 4 | P1-T8 | P1-T2 through P1-T7 | Windows preflight/service adapter and service composition |
+
+Tasks in the same wave may run concurrently. The coordinator integrates them in task-ID order and runs `cargo test --workspace` after each wave; Wave 4 then runs the full Gate 1 commands from the roadmap. Task file lists below are exclusive: any required Cargo manifest or shared `lib.rs` edit not already listed must be reserved by the coordinator before editing.
+
 ### Task 1: Scaffold the Rust workspace and quality gates
 
 **Files:**

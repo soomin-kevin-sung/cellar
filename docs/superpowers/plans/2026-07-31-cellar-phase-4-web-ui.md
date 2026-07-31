@@ -10,6 +10,20 @@
 
 ---
 
+## Parallel Execution
+
+| Wave | Task | `depends_on` | Exclusive ownership domain |
+|---|---|---|---|
+| 0 | P4-T1 | Gate 3 | web toolchain, application entry point, providers |
+| 1 | P4-T2 | P4-T1 | design tokens, shell, base interaction components |
+| 1 | P4-T3 | P4-T1 | typed API, SSE, enrollment, session state |
+| 2 | P4-T4 | P4-T2, P4-T3 | project feature directory |
+| 2 | P4-T5 | P4-T2, P4-T3 | file feature directory and file icon |
+| 2 | P4-T6 | P4-T2, P4-T3 | transfer feature directory |
+| 3 | P4-T7 | P4-T4, P4-T5, P4-T6 | preview, trash, settings, recent items, final E2E integration |
+
+Tasks in the same wave may run concurrently because their feature directories are disjoint. Shared router, navigation, or provider wiring is reserved for the coordinator during wave integration unless explicitly listed by one task. After each wave run `npm --prefix web run lint`, `npm --prefix web run typecheck`, and `npm --prefix web run test`; Wave 3 then runs the full Gate 4 commands.
+
 ### Task 1: Scaffold the web application and quality gates
 
 **Files:**

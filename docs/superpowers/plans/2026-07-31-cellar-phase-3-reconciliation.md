@@ -10,6 +10,19 @@
 
 ---
 
+## Parallel Execution
+
+| Wave | Task | `depends_on` | Exclusive ownership domain |
+|---|---|---|---|
+| 0 | P3-T1 | Gate 2 | Windows identity, filename comparison, DB collation |
+| 0 | P3-T2 | Gate 2 | bounded Windows watcher |
+| 1 | P3-T3 | P3-T1, P3-T2 | reconciliation state machine and file-repository scan writes |
+| 2 | P3-T4 | P3-T3 | settling and bounded hash queue |
+| 3 | P3-T5 | P3-T4 | operation-event reconciliation and recovery bridge |
+| 4 | P3-T6 | P3-T5 | backup/restore CLI and recovered-project reconciliation |
+
+Only Wave 0 is intentionally parallel. P3-T3 through P3-T6 all modify `reconcile.rs`, so they execute serially to preserve one owner for the state machine. The coordinator runs the targeted tests named by each task after integration and runs the full Gate 3 commands after Wave 4.
+
 ### Task 1: Implement Windows identity and ordinal filename comparison
 
 **Files:**

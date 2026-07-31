@@ -10,6 +10,21 @@
 
 ---
 
+## Parallel Execution
+
+| Wave | Task | `depends_on` | Exclusive ownership domain |
+|---|---|---|---|
+| 0 | P2-T1 | Gate 1 | project domain, repository, and project routes |
+| 0 | P2-T2 | Gate 1 | storage names/ports and Windows handle operations |
+| 1 | P2-T3 | P2-T1, P2-T2 | file-entry catalog, repository, and listing route |
+| 1 | P2-T4 | P2-T1, P2-T2 | upload session domain, repository, and routes |
+| 2 | P2-T5 | P2-T3, P2-T4 | operation journal, upload publication, recovery base |
+| 2 | P2-T6 | P2-T3 | range parsing and download branch of the file route |
+| 3 | P2-T7 | P2-T5, P2-T6 | mutation branch of the file route and recovery |
+| 4 | P2-T8 | P2-T7 | trash route, project deletion, and recovery extension |
+
+Tasks in the same wave may run concurrently. The coordinator integrates them in task-ID order and runs `cargo test --workspace` after each wave; Wave 4 then runs the full Gate 2 commands from the roadmap. `routes/files.rs` is handed from P2-T3 to P2-T6 and then P2-T7, while `recovery.rs` is handed from P2-T5 to P2-T7 and then P2-T8, so those tasks must never overlap.
+
 ### Task 1: Implement project domain, repository, and API
 
 **Files:**

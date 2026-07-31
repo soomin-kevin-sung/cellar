@@ -10,6 +10,20 @@
 
 ---
 
+## Parallel Execution
+
+| Wave | Task | `depends_on` | Exclusive ownership domain |
+|---|---|---|---|
+| 0 | P5-T1 | Gate 4 | embedded web assets and API asset routing |
+| 1 | P5-T2 | P5-T1 | release builder, manifest schema, package verification |
+| 2 | P5-T3 | P5-T2 | installer, service CLI, Cloudflare setup guide |
+| 3 | P5-T4 | P5-T3 | updater and rollback state |
+| 3 | P5-T5 | P5-T3 | uninstaller |
+| 3 | P5-T6 | P5-T3 | Cloudflare/security smoke automation and checklist |
+| 4 | P5-T7 | P5-T4, P5-T5, P5-T6 | VM orchestration, scale tests, current-PC install report |
+
+Wave 3 may run concurrently only in separate disposable Windows VMs or isolated VM snapshots; update, uninstall, and Cloudflare smoke tests must not target the same installed instance. The coordinator integrates in task-ID order, rebuilds the package after any release-input change, and runs the full Gate 5 commands before the current PC is modified.
+
 ### Task 1: Embed the production web application
 
 **Files:**

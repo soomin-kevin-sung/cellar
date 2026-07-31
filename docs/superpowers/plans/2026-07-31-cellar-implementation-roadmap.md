@@ -18,7 +18,7 @@
 
 ## Plan Sequence
 
-Implement these plans in order:
+Phase gates remain sequential, while tasks inside each phase run according to the parallel waves below:
 
 1. `docs/superpowers/plans/2026-07-31-cellar-phase-1-foundation.md`
 2. `docs/superpowers/plans/2026-07-31-cellar-phase-2-core-files.md`
@@ -26,7 +26,61 @@ Implement these plans in order:
 4. `docs/superpowers/plans/2026-07-31-cellar-phase-4-web-ui.md`
 5. `docs/superpowers/plans/2026-07-31-cellar-phase-5-release.md`
 
-Do not start a phase until the prior phase's full verification command passes and its review findings are resolved.
+Do not start a phase until the prior phase's full verification command passes and its review findings are resolved. Within an open phase, every task whose dependencies are integrated may run concurrently with the other tasks in the same wave.
+
+## Parallel Execution Contract
+
+### Scheduling rules
+
+1. The coordinator owns `develop`, dependency decisions, task dispatch, integration, and phase-gate verification.
+2. A worker owns exactly one task at a time and edits only the files listed under that task's **Files** section. Same-task test helpers may be added to `cellar-test-support` only after the coordinator reserves that file for the worker.
+3. Every task runs in its own Git worktree and `codex/<task-id>-<slug>` branch, created from the latest integrated commit for its dependency set. Parallel workers never share a checkout.
+4. A task is ready only when every `depends_on` task is integrated into `develop`. Tasks in a wave may start together unless the coordinator reports an ownership exception.
+5. Each worker follows the task's red-green-refactor steps, runs its targeted verification, commits once, and returns the commit hash plus test output. Workers do not merge or push `develop`.
+6. The coordinator reviews and integrates ready commits in ascending task-ID order, reruns each task's targeted tests after integration, then runs the wave gate.
+7. If a worker needs an unlisted shared file, it pauses and requests ownership. The coordinator either assigns the file exclusively or moves the change into a serial integration task.
+8. A failed integration or test blocks only dependent tasks. Independent tasks may continue, but the next wave cannot close until all tasks in the current wave are green.
+
+### Worktree and integration template
+
+```powershell
+# Coordinator: create a task worktree from the dependency-complete develop commit.
+git worktree add "..\cellar-P2-T3" -b "codex/p2-t3-file-catalog" develop
+
+# Worker: commit only the task-owned files after targeted tests pass.
+git add <paths-listed-by-the-task>
+git commit -m "feat: add file catalog"
+
+# Coordinator: integrate only after review, then verify in the develop checkout.
+git cherry-pick <task-commit>
+<task-targeted-test-command>
+```
+
+Delete task worktrees only after their commits are integrated and the wave gate passes.
+
+### Global dependency DAG
+
+```text
+P1: T1 -> {T2, T3} -> {T4, T5, T6} -> T7 -> T8 -> Gate 1
+P2: {T1, T2} -> {T3, T4} -> {T5, T6} -> T7 -> T8 -> Gate 2
+P3: {T1, T2} -> T3 -> T4 -> T5 -> T6 -> Gate 3
+P4: T1 -> {T2, T3} -> {T4, T5, T6} -> T7 -> Gate 4
+P5: T1 -> T2 -> T3 -> {T4, T5, T6} -> T7 -> Gate 5
+```
+
+The braces indicate tasks that may execute concurrently. The phase documents contain the precise dependency exceptions and ownership domains.
+
+### Parallel capacity
+
+| Phase | Maximum useful workers | Primary serial bottleneck |
+|---|---:|---|
+| Phase 1 | 3 | service composition and enrollment integration |
+| Phase 2 | 2 | operation journal and recovery mutations |
+| Phase 3 | 2 | shared reconciliation state machine |
+| Phase 4 | 3 | application scaffold and final route/accessibility integration |
+| Phase 5 | 3 | reproducible package before installer/update validation |
+
+Use fewer workers when the available concurrency includes the coordinator. With four total agent slots, dispatch at most three workers and keep one slot for coordination and integration.
 
 ## Locked File Map
 
