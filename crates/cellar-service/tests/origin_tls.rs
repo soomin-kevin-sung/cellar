@@ -5,6 +5,11 @@ use tempfile::TempDir;
 use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
 
+// Elevated acceptance tests:
+// Run from an elevated Administrator PowerShell (Administrators SID enabled) or a shell running
+// as NT SERVICE\Cellar:
+// cargo test -p cellar-service --test origin_tls -- --ignored --nocapture
+
 const CA_NAME: &str = "Cellar Local CA";
 const ORIGIN_NAME: &str = "cellar.local";
 
@@ -26,27 +31,6 @@ fn parse_pem_certificate(path: &std::path::Path) -> Vec<u8> {
 fn serial(der: &[u8]) -> Vec<u8> {
     let (_, certificate) = parse_x509_certificate(der).expect("valid X.509 certificate");
     certificate.raw_serial().to_vec()
-}
-
-#[cfg(windows)]
-fn skip_without_restricted_key_access(paths: &OriginTlsPaths) -> bool {
-    match fs::read(&paths.ca_key) {
-        Ok(_) => false,
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!(
-                "SKIP: this Windows token cannot reopen a key restricted to \
-                 SYSTEM, Administrators, and NT SERVICE\\Cellar; lifecycle is \
-                 covered by crate unit tests without weakening the production DACL"
-            );
-            true
-        }
-        Err(error) => panic!("unexpected private-key access error: {error}"),
-    }
-}
-
-#[cfg(not(windows))]
-fn skip_without_restricted_key_access(_paths: &OriginTlsPaths) -> bool {
-    false
 }
 
 #[test]
@@ -106,15 +90,13 @@ fn creates_a_ca_and_server_certificate_for_cellar_local() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
 fn reuses_material_before_the_renewal_window() {
     let temp = TempDir::new().unwrap();
     let paths = paths(&temp);
     let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
 
     let first = ensure_origin_tls(&paths, now).unwrap();
-    if skip_without_restricted_key_access(&paths) {
-        return;
-    }
     let second = ensure_origin_tls(&paths, now + Duration::days(300)).unwrap();
 
     assert_eq!(
@@ -128,15 +110,13 @@ fn reuses_material_before_the_renewal_window() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
 fn renews_only_the_leaf_at_thirty_days_remaining() {
     let temp = TempDir::new().unwrap();
     let paths = paths(&temp);
     let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
 
     let first = ensure_origin_tls(&paths, now).unwrap();
-    if skip_without_restricted_key_access(&paths) {
-        return;
-    }
     let renewed = ensure_origin_tls(&paths, now + Duration::days(335)).unwrap();
 
     assert_eq!(
@@ -150,6 +130,7 @@ fn renews_only_the_leaf_at_thirty_days_remaining() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
 fn mismatched_existing_material_is_replaced_as_one_generation() {
     let first_dir = TempDir::new().unwrap();
     let second_dir = TempDir::new().unwrap();
@@ -159,11 +140,6 @@ fn mismatched_existing_material_is_replaced_as_one_generation() {
 
     let first = ensure_origin_tls(&first_paths, now).unwrap();
     ensure_origin_tls(&second_paths, now).unwrap();
-    if skip_without_restricted_key_access(&first_paths)
-        || skip_without_restricted_key_access(&second_paths)
-    {
-        return;
-    }
     fs::copy(&second_paths.leaf_key, &first_paths.leaf_key).unwrap();
 
     let repaired = ensure_origin_tls(&first_paths, now).unwrap();
@@ -179,14 +155,12 @@ fn mismatched_existing_material_is_replaced_as_one_generation() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
 fn an_incomplete_bundle_is_replaced_as_one_generation() {
     let temp = TempDir::new().unwrap();
     let paths = paths(&temp);
     let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
     let first = ensure_origin_tls(&paths, now).unwrap();
-    if skip_without_restricted_key_access(&paths) {
-        return;
-    }
     fs::remove_file(&paths.leaf_cert).unwrap();
 
     let repaired = ensure_origin_tls(&paths, now).unwrap();
@@ -225,6 +199,7 @@ fn debug_output_does_not_contain_private_key_pem() {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "requires elevated token or Cellar service identity"]
 fn failed_renewal_keeps_the_last_complete_bundle() {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -234,9 +209,6 @@ fn failed_renewal_keeps_the_last_complete_bundle() {
     let paths = paths(&temp);
     let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
     ensure_origin_tls(&paths, now).unwrap();
-    if skip_without_restricted_key_access(&paths) {
-        return;
-    }
     let before = [
         fs::read(&paths.ca_cert).unwrap(),
         fs::read(&paths.ca_key).unwrap(),
@@ -258,4 +230,29 @@ fn failed_renewal_keeps_the_last_complete_bundle() {
         fs::read(&paths.leaf_key).unwrap(),
     ];
     assert_eq!(after, before);
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
+fn corrupt_pem_and_key_bytes_regenerate_the_complete_bundle() {
+    for corrupt_index in 0..4 {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let first = ensure_origin_tls(&paths, now).unwrap();
+        let files = [
+            &paths.ca_cert,
+            &paths.ca_key,
+            &paths.leaf_cert,
+            &paths.leaf_key,
+        ];
+        fs::write(files[corrupt_index], b"corrupt PEM and key bytes").unwrap();
+
+        let repaired = ensure_origin_tls(&paths, now).unwrap();
+
+        assert_ne!(
+            serial(first.ca_certificate().as_ref()),
+            serial(repaired.ca_certificate().as_ref())
+        );
+    }
 }

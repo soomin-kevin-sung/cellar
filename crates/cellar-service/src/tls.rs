@@ -87,6 +87,9 @@ pub enum TlsError {
     Recovery(String),
     #[error("could not preserve the previous origin TLS bundle after a write failure: {0}")]
     Rollback(String),
+    #[cfg(test)]
+    #[error("injected crash after {0}")]
+    InjectedCrash(&'static str),
 }
 
 struct Bundle {
@@ -405,11 +408,49 @@ struct StagedFile {
     file: File,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceFault {
+    None,
+    #[cfg(test)]
+    PrivateKeyAcl,
+    #[cfg(test)]
+    CrashAfterPreparedMarker,
+    #[cfg(test)]
+    CrashAfterReplacement(usize),
+    #[cfg(test)]
+    Cleanup,
+}
+
+#[cfg(test)]
+type TestPersistenceFault = PersistenceFault;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransactionState {
+    Prepared,
+    Committed,
+}
+
 fn persist_bundle(
     paths: &OriginTlsPaths,
     directory: &Path,
     bundle: &Bundle,
     protect_private_keys: bool,
+) -> Result<(), TlsError> {
+    persist_bundle_impl(
+        paths,
+        directory,
+        bundle,
+        protect_private_keys,
+        PersistenceFault::None,
+    )
+}
+
+fn persist_bundle_impl(
+    paths: &OriginTlsPaths,
+    directory: &Path,
+    bundle: &Bundle,
+    protect_private_keys: bool,
+    fault: PersistenceFault,
 ) -> Result<(), TlsError> {
     let files = [
         TransactionFile {
@@ -438,35 +479,65 @@ fn persist_bundle(
     let marker = directory.join(TRANSACTION_MARKER);
 
     let mut staged_files = Vec::with_capacity(files.len());
-    for ((entry, stage), backup) in files.iter().zip(&stages).zip(&backups) {
-        remove_if_exists(stage)?;
+    for stage in &stages {
+        best_effort_remove(stage);
+    }
+    for backup in &backups {
         remove_if_exists(backup)?;
-        staged_files.push(write_staged_file(
+    }
+    for (entry, stage) in files.iter().zip(&stages) {
+        match write_staged_file(
             stage,
             entry.contents,
             entry.private && protect_private_keys,
-        )?);
+            fault,
+        ) {
+            Ok(staged) => staged_files.push(staged),
+            Err(error) => {
+                drop(staged_files);
+                cleanup_stages(&stages, &marker);
+                return Err(error);
+            }
+        }
     }
 
     let original_mask = files.iter().enumerate().fold(0_u8, |mask, (index, entry)| {
         mask | (u8::from(entry.target.exists()) << index)
     });
-    write_marker(&marker, original_mask)?;
+    if let Err(error) = publish_marker(&marker, original_mask, TransactionState::Prepared) {
+        drop(staged_files);
+        cleanup_stages(&stages, &marker);
+        return Err(error);
+    }
+    #[cfg(test)]
+    if fault == PersistenceFault::CrashAfterPreparedMarker {
+        return Err(TlsError::InjectedCrash("durable prepared marker"));
+    }
 
     let commit_result = (|| {
         for ((entry, staged), backup) in files.iter().zip(&staged_files).zip(&backups) {
             if entry.target.exists() {
-                fs::rename(entry.target, backup)
+                durable_rename_path(entry.target, backup, false)
                     .map_err(|source| io_error("back up", entry.target, source))?;
             }
             rename_staged_file(staged, entry.target)?;
+            #[cfg(test)]
+            if let PersistenceFault::CrashAfterReplacement(index) = fault
+                && files
+                    .get(index)
+                    .is_some_and(|file| file.target == entry.target)
+            {
+                return Err(TlsError::InjectedCrash("target replacement boundary"));
+            }
         }
-        sync_directory(directory)?;
-        fs::remove_file(&marker).map_err(|source| io_error("commit", &marker, source))?;
-        sync_directory(directory)
+        publish_marker(&marker, original_mask, TransactionState::Committed)
     })();
 
     if let Err(commit_error) = commit_result {
+        #[cfg(test)]
+        if matches!(commit_error, TlsError::InjectedCrash(_)) {
+            return Err(commit_error);
+        }
         if let Err(rollback_error) =
             rollback_files(&files, &stages, &backups, original_mask, &marker, directory)
         {
@@ -477,13 +548,33 @@ fn persist_bundle(
         return Err(commit_error);
     }
 
-    for backup in &backups {
-        remove_if_exists(backup)?;
+    #[cfg(test)]
+    if fault == PersistenceFault::Cleanup {
+        return Ok(());
     }
+    cleanup_after_commit(&stages, &backups, &marker);
     Ok(())
 }
 
-fn write_staged_file(path: &Path, contents: &[u8], private: bool) -> Result<StagedFile, TlsError> {
+#[cfg(test)]
+fn persist_bundle_for_test(
+    paths: &OriginTlsPaths,
+    directory: &Path,
+    bundle: &Bundle,
+    protect_private_keys: bool,
+    fault: TestPersistenceFault,
+) -> Result<(), TlsError> {
+    persist_bundle_impl(paths, directory, bundle, protect_private_keys, fault)
+}
+
+fn write_staged_file(
+    path: &Path,
+    contents: &[u8],
+    private: bool,
+    fault: PersistenceFault,
+) -> Result<StagedFile, TlsError> {
+    #[cfg(not(test))]
+    let _ = fault;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(windows)]
@@ -504,18 +595,24 @@ fn write_staged_file(path: &Path, contents: &[u8], private: bool) -> Result<Stag
     let mut file = options
         .open(path)
         .map_err(|source| io_error("create temporary", path, source))?;
+    if private {
+        #[cfg(test)]
+        if fault == PersistenceFault::PrivateKeyAcl {
+            return Err(TlsError::PrivateKeyAcl(AclError::Descriptor(
+                std::io::Error::other("injected private-key ACL failure"),
+            )));
+        }
+        #[cfg(windows)]
+        restrict_private_key_access(path, PRIVATE_KEY_SERVICE_NAME)?;
+        #[cfg(not(windows))]
+        set_owner_only_permissions(path)?;
+    }
     file.write_all(contents)
         .map_err(|source| io_error("write temporary", path, source))?;
     file.flush()
         .map_err(|source| io_error("flush temporary", path, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync temporary", path, source))?;
-    if private {
-        #[cfg(windows)]
-        restrict_private_key_access(path, PRIVATE_KEY_SERVICE_NAME)?;
-        #[cfg(not(windows))]
-        set_owner_only_permissions(path)?;
-    }
     Ok(StagedFile {
         #[cfg(not(windows))]
         path: path.to_path_buf(),
@@ -568,12 +665,34 @@ fn rename_staged_file(staged: &StagedFile, target: &Path) -> Result<(), TlsError
     if renamed == 0 {
         return Err(io_error("replace", target, std::io::Error::last_os_error()));
     }
-    Ok(())
+    staged
+        .file
+        .sync_all()
+        .map_err(|source| io_error("sync replaced", target, source))
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
 fn rename_staged_file(staged: &StagedFile, target: &Path) -> Result<(), TlsError> {
-    fs::rename(&staged.path, target).map_err(|source| io_error("replace", target, source))
+    fs::rename(&staged.path, target).map_err(|source| io_error("replace", target, source))?;
+    staged
+        .file
+        .sync_all()
+        .map_err(|source| io_error("sync replaced", target, source))?;
+    sync_directory(target.parent().ok_or_else(|| TlsError::MissingParent {
+        path: target.to_path_buf(),
+    })?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn rename_staged_file(_staged: &StagedFile, target: &Path) -> Result<(), TlsError> {
+    Err(io_error(
+        "replace",
+        target,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable rename is unsupported on this platform",
+        ),
+    ))
 }
 
 #[cfg(unix)]
@@ -589,7 +708,7 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), TlsError> {
     Err(TlsError::PrivateKeyAcl(AclError::UnsupportedPlatform))
 }
 
-fn write_marker(path: &Path, original_mask: u8) -> Result<(), TlsError> {
+fn publish_marker(path: &Path, original_mask: u8, state: TransactionState) -> Result<(), TlsError> {
     let marker_stage = sibling_path(path, "stage");
     remove_if_exists(&marker_stage)?;
     let mut file = OpenOptions::new()
@@ -597,15 +716,19 @@ fn write_marker(path: &Path, original_mask: u8) -> Result<(), TlsError> {
         .create_new(true)
         .open(&marker_stage)
         .map_err(|source| io_error("create transaction marker", &marker_stage, source))?;
-    write!(file, "{original_mask:02x}")
+    let state = match state {
+        TransactionState::Prepared => "prepared",
+        TransactionState::Committed => "committed",
+    };
+    write!(file, "{state}:{original_mask:02x}")
         .map_err(|source| io_error("write transaction marker", &marker_stage, source))?;
     file.flush()
         .map_err(|source| io_error("flush transaction marker", &marker_stage, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync transaction marker", &marker_stage, source))?;
     drop(file);
-    fs::rename(&marker_stage, path)
-        .map_err(|source| io_error("publish transaction marker", path, source))
+    durable_rename_path(&marker_stage, path, true)
+        .map_err(|source| io_error("durably publish transaction marker", path, source))
 }
 
 fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), TlsError> {
@@ -624,22 +747,40 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
         File::open(&marker)
             .and_then(|mut file| file.read_to_string(&mut text))
             .map_err(|source| io_error("read transaction marker", &marker, source))?;
-        let original_mask = u8::from_str_radix(text.trim(), 16)
+        let (state, mask) = text
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| TlsError::Recovery("invalid transaction marker format".to_owned()))?;
+        let state = match state {
+            "prepared" => TransactionState::Prepared,
+            "committed" => TransactionState::Committed,
+            _ => {
+                return Err(TlsError::Recovery(
+                    "invalid transaction marker state".to_owned(),
+                ));
+            }
+        };
+        let original_mask = u8::from_str_radix(mask, 16)
             .map_err(|error| TlsError::Recovery(format!("invalid transaction marker: {error}")))?;
         let files = targets.map(|target| TransactionFile {
             target,
             contents: &[],
             private: false,
         });
-        rollback_files(&files, &stages, &backups, original_mask, &marker, directory)
-            .map_err(|error| TlsError::Recovery(error.to_string()))?;
+        if state == TransactionState::Committed && targets.iter().all(|target| target.is_file()) {
+            cleanup_after_commit(&stages, &backups, &marker);
+        } else {
+            rollback_files(&files, &stages, &backups, original_mask, &marker, directory)
+                .map_err(|error| TlsError::Recovery(error.to_string()))?;
+        }
     } else {
         for stage in &stages {
-            remove_if_exists(stage)?;
+            best_effort_remove(stage);
         }
         for backup in &backups {
-            remove_if_exists(backup)?;
+            best_effort_remove(backup);
         }
+        best_effort_remove(&sibling_path(&marker, "consumed"));
     }
     Ok(())
 }
@@ -650,22 +791,24 @@ fn rollback_files(
     backups: &[PathBuf; 4],
     original_mask: u8,
     marker: &Path,
-    directory: &Path,
+    _directory: &Path,
 ) -> Result<(), TlsError> {
     for (index, (entry, backup)) in files.iter().zip(backups).enumerate().rev() {
         if backup.exists() {
             remove_if_exists(entry.target)?;
-            fs::rename(backup, entry.target)
+            durable_rename_path(backup, entry.target, false)
                 .map_err(|source| io_error("restore", entry.target, source))?;
         } else if original_mask & (1 << index) == 0 {
-            remove_if_exists(entry.target)?;
+            durable_discard_path(entry.target)?;
         }
     }
     for stage in stages {
         remove_if_exists(stage)?;
     }
-    remove_if_exists(marker)?;
-    sync_directory(directory)
+    durable_remove_marker(marker)?;
+    #[cfg(unix)]
+    sync_directory(_directory)?;
+    Ok(())
 }
 
 fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
@@ -683,16 +826,147 @@ fn remove_if_exists(path: &Path) -> Result<(), TlsError> {
     }
 }
 
+fn cleanup_stages(stages: &[PathBuf; 4], marker: &Path) {
+    for stage in stages {
+        best_effort_remove(stage);
+    }
+    best_effort_remove(&sibling_path(marker, "stage"));
+}
+
+fn cleanup_after_commit(stages: &[PathBuf; 4], backups: &[PathBuf; 4], marker: &Path) {
+    let mut cleanup_complete = true;
+    for stage in stages {
+        cleanup_complete &= remove_if_exists(stage).is_ok();
+    }
+    for backup in backups {
+        cleanup_complete &= remove_if_exists(backup).is_ok();
+    }
+    let marker_stage = sibling_path(marker, "stage");
+    cleanup_complete &= remove_if_exists(&marker_stage).is_ok();
+    if cleanup_complete {
+        let _ = durable_remove_marker(marker);
+    }
+}
+
+fn best_effort_remove(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+#[cfg(windows)]
+fn durable_discard_path(path: &Path) -> Result<(), TlsError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let discarded = sibling_path(path, "discarded");
+    best_effort_remove(&discarded);
+    durable_rename_path(path, &discarded, true)
+        .map_err(|source| io_error("durably discard interrupted target", path, source))?;
+    best_effort_remove(&discarded);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn durable_discard_path(path: &Path) -> Result<(), TlsError> {
+    remove_if_exists(path)?;
+    sync_directory(path.parent().ok_or_else(|| TlsError::MissingParent {
+        path: path.to_path_buf(),
+    })?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn durable_discard_path(path: &Path) -> Result<(), TlsError> {
+    Err(io_error(
+        "durably discard interrupted target",
+        path,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable removal is unsupported on this platform",
+        ),
+    ))
+}
+
+#[cfg(windows)]
+fn durable_rename_path(source: &Path, target: &Path, replace: bool) -> std::io::Result<()> {
+    use std::{iter, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let target: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect();
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), flags) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn durable_rename_path(source: &Path, target: &Path, _replace: bool) -> std::io::Result<()> {
+    fs::rename(source, target)?;
+    let directory = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
+    })?;
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn durable_rename_path(_source: &Path, _target: &Path, _replace: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable rename is unsupported on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn durable_remove_marker(marker: &Path) -> Result<(), TlsError> {
+    if !marker.exists() {
+        return Ok(());
+    }
+    let consumed = sibling_path(marker, "consumed");
+    best_effort_remove(&consumed);
+    durable_rename_path(marker, &consumed, true)
+        .map_err(|source| io_error("durably consume transaction marker", marker, source))?;
+    best_effort_remove(&consumed);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn durable_remove_marker(marker: &Path) -> Result<(), TlsError> {
+    remove_if_exists(marker)?;
+    sync_directory(marker.parent().ok_or_else(|| TlsError::MissingParent {
+        path: marker.to_path_buf(),
+    })?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn durable_remove_marker(marker: &Path) -> Result<(), TlsError> {
+    Err(io_error(
+        "durably consume transaction marker",
+        marker,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "durable marker removal is unsupported on this platform",
+        ),
+    ))
+}
+
 #[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<(), TlsError> {
     File::open(directory)
         .and_then(|file| file.sync_all())
         .map_err(|source| io_error("sync directory", directory, source))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<(), TlsError> {
-    Ok(())
 }
 
 fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> TlsError {
@@ -770,6 +1044,166 @@ mod tests {
         let (_, ca) = parse_x509_certificate(repaired.ca_certificate().as_ref()).unwrap();
         let (_, leaf) = parse_x509_certificate(repaired.certificate_chain()[0].as_ref()).unwrap();
         leaf.verify_signature(Some(ca.public_key())).unwrap();
+    }
+
+    #[test]
+    fn corrupt_certificate_and_key_files_regenerate_the_complete_bundle() {
+        for corrupt_index in 0..4 {
+            let temp = TempDir::new().unwrap();
+            let paths = paths(&temp);
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let first = ensure_origin_tls_for_test(&paths, now).unwrap();
+            let files = [
+                &paths.ca_cert,
+                &paths.ca_key,
+                &paths.leaf_cert,
+                &paths.leaf_key,
+            ];
+            fs::write(files[corrupt_index], b"definitely not PEM or DER").unwrap();
+
+            let repaired = ensure_origin_tls_for_test(&paths, now).unwrap();
+
+            assert_ne!(
+                serial(first.ca_certificate()),
+                serial(repaired.ca_certificate()),
+                "corrupt file index {corrupt_index} must replace the complete generation"
+            );
+            let (_, ca) = parse_x509_certificate(repaired.ca_certificate().as_ref()).unwrap();
+            let (_, leaf) =
+                parse_x509_certificate(repaired.certificate_chain()[0].as_ref()).unwrap();
+            leaf.verify_signature(Some(ca.public_key())).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acl_failure_leaves_no_staged_file_that_could_contain_a_key() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let bundle =
+            generate_bundle(OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()).unwrap();
+
+        let error = persist_bundle_for_test(
+            &paths,
+            temp.path(),
+            &bundle,
+            true,
+            TestPersistenceFault::PrivateKeyAcl,
+        )
+        .unwrap_err();
+
+        let error_text = format!("{error:?}");
+        assert!(matches!(error, TlsError::PrivateKeyAcl(_)));
+        assert!(!error_text.contains("PRIVATE KEY"));
+        assert!(
+            !error_text.contains(
+                &bundle.leaf_key_der[..16]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        );
+        for target in [
+            &paths.ca_cert,
+            &paths.ca_key,
+            &paths.leaf_cert,
+            &paths.leaf_key,
+        ] {
+            assert!(!target.exists());
+            assert!(!sibling_path(target, "stage").exists());
+        }
+    }
+
+    #[test]
+    fn prepared_transaction_recovers_at_marker_and_every_replacement_boundary() {
+        let faults = [
+            TestPersistenceFault::CrashAfterPreparedMarker,
+            TestPersistenceFault::CrashAfterReplacement(0),
+            TestPersistenceFault::CrashAfterReplacement(1),
+            TestPersistenceFault::CrashAfterReplacement(2),
+            TestPersistenceFault::CrashAfterReplacement(3),
+        ];
+        for fault in faults {
+            let temp = TempDir::new().unwrap();
+            let paths = paths(&temp);
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let original = generate_bundle(now).unwrap();
+            persist_bundle(&paths, temp.path(), &original, false).unwrap();
+            let before = [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ];
+            let replacement = generate_bundle(now + Duration::days(1)).unwrap();
+
+            let error = persist_bundle_for_test(&paths, temp.path(), &replacement, false, fault)
+                .unwrap_err();
+            assert!(matches!(error, TlsError::InjectedCrash(_)));
+            assert!(
+                fs::read_to_string(temp.path().join(TRANSACTION_MARKER))
+                    .unwrap()
+                    .starts_with("prepared:")
+            );
+
+            recover_transaction(&paths, temp.path()).unwrap();
+            let after = [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ];
+            assert_eq!(after, before, "recovery failed for {fault:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_backup_keeps_committed_marker_until_cleanup_can_finish() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 1;
+
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let original = generate_bundle(now).unwrap();
+        persist_bundle(&paths, temp.path(), &original, false).unwrap();
+        let replacement = generate_bundle(now + Duration::days(1)).unwrap();
+
+        persist_bundle_for_test(
+            &paths,
+            temp.path(),
+            &replacement,
+            false,
+            TestPersistenceFault::Cleanup,
+        )
+        .unwrap();
+
+        let backup = sibling_path(&paths.ca_cert, "backup");
+        assert!(backup.exists());
+        let locked_backup = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&backup)
+            .unwrap();
+
+        recover_transaction(&paths, temp.path()).unwrap();
+        assert!(
+            temp.path().join(TRANSACTION_MARKER).exists(),
+            "committed marker must remain while any backup cannot be removed"
+        );
+        assert!(backup.exists());
+
+        drop(locked_backup);
+        recover_transaction(&paths, temp.path()).unwrap();
+        assert_eq!(fs::read(&paths.ca_cert).unwrap(), replacement.ca_cert_pem);
+        assert!(!backup.exists());
+        assert!(!temp.path().join(TRANSACTION_MARKER).exists());
+
+        let next = generate_bundle(now + Duration::days(2)).unwrap();
+        persist_bundle(&paths, temp.path(), &next, false).unwrap();
+        assert_eq!(fs::read(&paths.ca_cert).unwrap(), next.ca_cert_pem);
     }
 
     #[test]
