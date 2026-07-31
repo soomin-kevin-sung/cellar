@@ -7,3 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
+cellar-auth = { path = "../cellar-auth" }
+serde.workspace = true
+
+[dev-dependencies]
+cellar-config = { path = "../cellar-config" }
+tempfile = "=3.27.0"
+tokio.workspace = true
