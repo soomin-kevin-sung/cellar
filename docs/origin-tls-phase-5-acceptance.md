@@ -115,20 +115,25 @@ backfills the marker without generating another CA.
 ## Real power-loss matrix
 
 Use a Phase 5 fault-build of the service that pauses at the named journal boundary. The pause hook
-must only block; it must not skip flushes, renames, or ACL operations. Start one bundle renewal, wait
-until the stated on-disk evidence appears, and use the hypervisor's **Power Off** action (not guest
-shutdown). Restore the baseline snapshot before each row.
+must only block; it must not skip flushes, renames, or ACL operations. Exercise bundle renewal for
+the four-file rows and explicit CA rotation for the five-file rows. Wait until the stated on-disk
+evidence appears, then use the hypervisor's **Power Off** action (not guest shutdown). Restore the
+baseline snapshot before each row.
 
 | Boundary | Evidence immediately before power-off | Expected result after reboot and service start |
 | --- | --- | --- |
-| Prepared marker | marker is `prepared:<mask>`; all four `.cellar-stage` files exist | original four files restored byte-for-byte; stages, backups, and marker removed |
-| CA cert target-to-backup | prepared marker; CA cert backup exists; CA cert target absent | original bundle restored; same CA hash |
-| CA key target-to-backup | prepared marker; CA cert replaced; CA key backup exists | original bundle restored; same CA hash; key DACL remains protected |
-| Leaf cert target-to-backup | prepared marker; first two targets replaced; leaf cert backup exists | original bundle restored; same CA and leaf hashes |
-| Leaf key target-to-backup | prepared marker; first three targets replaced; leaf key backup exists | original bundle restored; same CA and leaf hashes; key DACL remains protected |
-| Each staged-to-target rename | prepared marker; corresponding backup and replacement target exist | original bundle restored at every one of the four rename boundaries |
-| Committed marker replacement | marker is `committed:<mask>`; all four new targets exist | new complete bundle retained; backups, stages, and marker removed |
-| Each cleanup step | committed marker remains while at least one backup/stage exists | new complete bundle retained; cleanup finishes on this or the next start |
+| Renewal prepared marker | marker is `prepared:<mask>:4`; all four PEM `.cellar-stage` files exist | original four files restored byte-for-byte; stages, backups, and marker removed |
+| Renewal CA cert target-to-backup | `prepared:<mask>:4`; CA cert backup exists; CA cert target absent | original bundle restored; same CA hash |
+| Renewal CA key target-to-backup | `prepared:<mask>:4`; CA cert replaced; CA key backup exists | original bundle restored; same CA hash; key DACL remains protected |
+| Renewal leaf cert target-to-backup | `prepared:<mask>:4`; first two targets replaced; leaf cert backup exists | original bundle restored; same CA and leaf hashes |
+| Renewal leaf key target-to-backup | `prepared:<mask>:4`; first three targets replaced; leaf key backup exists | original bundle restored; same CA and leaf hashes; key DACL remains protected |
+| Each renewal staged-to-target rename | `prepared:<mask>:4`; corresponding backup and replacement target exist | original bundle restored at every one of the four rename boundaries |
+| Renewal committed marker replacement | marker is `committed:<mask>:4`; all four new PEM targets exist | new complete bundle retained; backups, stages, and marker removed |
+| Each renewal cleanup step | `committed:<mask>:4` remains while at least one backup/stage exists | new complete bundle retained; cleanup finishes on this or the next start |
+| CA rotation prepared marker and pending stage | marker is `prepared:<mask>:5`; four PEM stages and the protected pending-record `.cellar-stage` sibling exist | original four PEM files retained byte-for-byte; pending record, all stages and backups, and marker removed |
+| CA rotation pending-record staged-to-target rename | marker is `prepared:<mask>:5`; all four replacement PEM targets and the pending-record target exist | all five files roll back atomically; original CA remains active and no pending rotation is reported |
+| CA rotation committed marker replacement | marker is `committed:<mask>:5`; all four new PEM targets and the protected pending-record target exist | new complete bundle and its matching pending record are retained; backups, stages, and marker removed |
+| Each CA rotation cleanup step | `committed:<mask>:5` remains while at least one backup/stage exists | new complete bundle and pending record are retained; cleanup finishes on this or the next start |
 | Establishment marker publish | complete four-file bundle exists; protected establishment marker stage is durable | same bundle retained; establishment marker publication finishes without generating another CA |
 
 After every reboot run:
