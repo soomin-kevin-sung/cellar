@@ -6,6 +6,10 @@
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
 *.key
 *.pfx
+*.p12
 .env
+.env.*
+!.env.example
