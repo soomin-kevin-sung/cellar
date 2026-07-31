@@ -209,9 +209,7 @@ fn medium_integrity_process_cannot_rotate_the_origin_ca() {
     let paths = paths(&temp);
     let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
 
-    let error = rotate_origin_ca(&paths, now)
-        .err()
-        .expect("medium token must be denied");
+    let error = rotate_origin_ca(&paths, now).expect_err("medium token must be denied");
 
     assert!(matches!(error, TlsError::AdministratorRequired));
     assert!(!paths.ca_cert.exists());

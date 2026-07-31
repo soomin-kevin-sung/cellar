@@ -30,6 +30,7 @@ rotation is rejected without creating a CA:
 ```powershell
 whoami /groups
 cargo test -p cellar-service --test origin_tls medium_integrity_process_cannot_rotate_the_origin_ca -- --exact --nocapture
+cargo test -p cellar-service --lib tls::tests::deleting_all_established_files_fails_closed_until_explicit_rotation -- --exact --nocapture
 ```
 
 In elevated PowerShell, confirm the Administrators SID is enabled and run the production ACL,
@@ -44,7 +45,15 @@ cargo test -p cellar-service --lib tls::tests::protected_cross_process_lock_seri
 
 Expected: ordinary rotation returns `AdministratorRequired`; elevated tests pass; the CA and leaf
 key DACLs are protected and contain only SYSTEM, Administrators, and `NT SERVICE\Cellar`; concurrent
-processes observe one CA serial and leave no transaction marker.
+processes observe one CA serial and leave no transaction marker. Initial establishment also creates
+a protected `.cellar-origin-tls.established` marker. Record its content and SHA-256 hash. Deleting all
+four PEM files while that marker remains must produce `EstablishedMaterialMissing` without creating
+any new PEM file; only the elevated explicit rotation path may recover, and it must preserve the
+existing establishment-marker hash as audit evidence.
+If first-time rotation commits its bundle but marker publication fails, the API must return the
+explicit `RotationCommitted` error with committed material and the cloudflared-update-required
+signal. Treat that as a changed trust anchor, update cloudflared, and verify the next startup
+backfills the marker without generating another CA.
 
 ## Real power-loss matrix
 
@@ -63,6 +72,7 @@ shutdown). Restore the baseline snapshot before each row.
 | Each staged-to-target rename | prepared marker; corresponding backup and replacement target exist | original bundle restored at every one of the four rename boundaries |
 | Committed marker replacement | marker is `committed:<mask>`; all four new targets exist | new complete bundle retained; backups, stages, and marker removed |
 | Each cleanup step | committed marker remains while at least one backup/stage exists | new complete bundle retained; cleanup finishes on this or the next start |
+| Establishment marker publish | complete four-file bundle exists; protected establishment marker stage is durable | same bundle retained; establishment marker publication finishes without generating another CA |
 
 After every reboot run:
 

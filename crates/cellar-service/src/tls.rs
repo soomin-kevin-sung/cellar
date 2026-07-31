@@ -30,6 +30,8 @@ const LEAF_LIFETIME: Duration = Duration::days(365);
 const RENEWAL_WINDOW: Duration = Duration::days(30);
 const TRANSACTION_MARKER: &str = ".cellar-origin-tls.transaction";
 const OPERATION_LOCK: &str = ".cellar-origin-tls.lock";
+const ESTABLISHMENT_MARKER: &str = ".cellar-origin-tls.established";
+const ESTABLISHMENT_MARKER_CONTENT: &[u8] = b"cellar-origin-tls-established:v1\n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OriginTlsPaths {
@@ -61,6 +63,16 @@ pub enum TlsWarning {
 
 pub struct OriginCaRotation {
     material: TlsMaterial,
+}
+
+impl std::fmt::Debug for OriginCaRotation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OriginCaRotation")
+            .field("material", &self.material)
+            .field("cloudflared_ca_pool_and_route_update_required", &true)
+            .finish()
+    }
 }
 
 impl OriginCaRotation {
@@ -131,6 +143,17 @@ pub enum TlsError {
     Rollback(String),
     #[error("the established origin TLS bundle is incomplete, unreadable, or invalid")]
     EstablishedBundleInvalid,
+    #[error("origin TLS was previously established but all certificate and key files are missing")]
+    EstablishedMaterialMissing,
+    #[error("the origin TLS establishment marker is invalid")]
+    EstablishmentStateInvalid,
+    #[error(
+        "origin CA rotation committed and cloudflared must be updated, but establishment-state publication failed: {marker_error}"
+    )]
+    RotationCommitted {
+        rotation: Box<OriginCaRotation>,
+        marker_error: String,
+    },
     #[cfg(test)]
     #[error("injected crash after {0}")]
     InjectedCrash(&'static str),
@@ -178,6 +201,17 @@ pub fn rotate_origin_ca(
     rotate_origin_ca_impl(paths, now, true)
 }
 
+impl TlsError {
+    /// Returns the committed rotation when trust changed even though publishing
+    /// establishment state failed. Callers must still update cloudflared.
+    pub fn committed_rotation(&self) -> Option<&OriginCaRotation> {
+        match self {
+            Self::RotationCommitted { rotation, .. } => Some(rotation),
+            _ => None,
+        }
+    }
+}
+
 fn ensure_origin_tls_impl(
     paths: &OriginTlsPaths,
     now: OffsetDateTime,
@@ -188,13 +222,15 @@ fn ensure_origin_tls_impl(
         .map_err(|source| io_error("create directory", directory, source))?;
     let _lock = acquire_operation_lock(directory, protect_private_keys)?;
     recover_transaction(paths, directory)?;
+    let established = establishment_is_recorded(directory, protect_private_keys)?;
 
-    match load_existing(paths, now)? {
+    match load_existing(paths, now, established)? {
         ExistingState::Valid(existing) => {
             if existing.leaf_not_after - now > RENEWAL_WINDOW {
                 if protect_private_keys {
                     secure_existing_keys(paths)?;
                 }
+                ensure_establishment_marker(directory, established, protect_private_keys)?;
                 let warning = (existing.ca_not_after < now + LEAF_LIFETIME)
                     .then_some(TlsWarning::CaRotationRequired);
                 return Ok(existing.bundle.into_material(warning));
@@ -203,8 +239,10 @@ fn ensure_origin_tls_impl(
             if existing.ca_not_after >= now + LEAF_LIFETIME {
                 let renewed = renew_leaf(*existing, now)?;
                 persist_bundle(paths, directory, &renewed, protect_private_keys)?;
+                ensure_establishment_marker(directory, established, protect_private_keys)?;
                 return Ok(renewed.into_material(None));
             }
+            ensure_establishment_marker(directory, established, protect_private_keys)?;
             return Ok(existing
                 .bundle
                 .into_material(Some(TlsWarning::CaRotationRequired)));
@@ -214,6 +252,7 @@ fn ensure_origin_tls_impl(
 
     let generated = generate_bundle(now)?;
     persist_bundle(paths, directory, &generated, protect_private_keys)?;
+    ensure_establishment_marker(directory, established, protect_private_keys)?;
     Ok(generated.into_material(None))
 }
 
@@ -227,11 +266,19 @@ fn rotate_origin_ca_impl(
         .map_err(|source| io_error("create directory", directory, source))?;
     let _lock = acquire_operation_lock(directory, protect_private_keys)?;
     recover_transaction(paths, directory)?;
+    let established = establishment_is_recorded(directory, protect_private_keys)?;
     let generated = generate_bundle(now)?;
     persist_bundle(paths, directory, &generated, protect_private_keys)?;
-    Ok(OriginCaRotation {
+    let rotation = OriginCaRotation {
         material: generated.into_material(None),
-    })
+    };
+    if let Err(error) = ensure_establishment_marker(directory, established, protect_private_keys) {
+        return Err(TlsError::RotationCommitted {
+            rotation: Box::new(rotation),
+            marker_error: error.to_string(),
+        });
+    }
+    Ok(rotation)
 }
 
 #[cfg(test)]
@@ -340,21 +387,8 @@ fn acquire_operation_lock(directory: &Path, protect: bool) -> Result<OperationLo
 fn secure_existing_keys(paths: &OriginTlsPaths) -> Result<(), TlsError> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
-        };
-
         for path in [&paths.ca_key, &paths.leaf_key] {
-            let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .access_mode(READ_CONTROL | WRITE_DAC)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-            let file = options
-                .open(path)
-                .map_err(|source| io_error("open private key for ACL", path, source))?;
-            restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME)?;
+            secure_existing_protected_file(path)?;
         }
     }
     #[cfg(not(windows))]
@@ -364,7 +398,72 @@ fn secure_existing_keys(paths: &OriginTlsPaths) -> Result<(), TlsError> {
     Ok(())
 }
 
-fn load_existing(paths: &OriginTlsPaths, now: OffsetDateTime) -> Result<ExistingState, TlsError> {
+#[cfg(windows)]
+fn secure_existing_protected_file(path: &Path) -> Result<(), TlsError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    let file = options
+        .open(path)
+        .map_err(|source| io_error("open protected TLS state for ACL", path, source))?;
+    restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME)?;
+    Ok(())
+}
+
+fn establishment_is_recorded(directory: &Path, protect: bool) -> Result<bool, TlsError> {
+    let marker = directory.join(ESTABLISHMENT_MARKER);
+    if !transaction_path_exists(&marker)? {
+        return Ok(false);
+    }
+    if !transaction_path_is_file(&marker)? {
+        return Err(TlsError::EstablishmentStateInvalid);
+    }
+    let contents = fs::read(&marker)
+        .map_err(|source| io_error("read TLS establishment marker", &marker, source))?;
+    if contents != ESTABLISHMENT_MARKER_CONTENT {
+        return Err(TlsError::EstablishmentStateInvalid);
+    }
+    if protect {
+        #[cfg(windows)]
+        secure_existing_protected_file(&marker)?;
+        #[cfg(not(windows))]
+        set_owner_only_permissions(&marker)?;
+    }
+    Ok(true)
+}
+
+fn ensure_establishment_marker(
+    directory: &Path,
+    established: bool,
+    protect: bool,
+) -> Result<(), TlsError> {
+    if established {
+        return Ok(());
+    }
+    let marker = directory.join(ESTABLISHMENT_MARKER);
+    let stage = sibling_path(&marker, "stage");
+    remove_if_exists(&stage)?;
+    let staged = write_staged_file(
+        &stage,
+        ESTABLISHMENT_MARKER_CONTENT,
+        protect,
+        PersistenceFault::None,
+    )?;
+    rename_staged_file(&staged, &marker)
+}
+
+fn load_existing(
+    paths: &OriginTlsPaths,
+    now: OffsetDateTime,
+    established: bool,
+) -> Result<ExistingState, TlsError> {
     let present = [
         file_is_present(&paths.ca_cert)?,
         file_is_present(&paths.ca_key)?,
@@ -372,6 +471,9 @@ fn load_existing(paths: &OriginTlsPaths, now: OffsetDateTime) -> Result<Existing
         file_is_present(&paths.leaf_key)?,
     ];
     if present.iter().all(|exists| !exists) {
+        if established {
+            return Err(TlsError::EstablishedMaterialMissing);
+        }
         return Ok(ExistingState::Uninitialized);
     }
     load_and_validate(paths, now)
@@ -1291,6 +1393,8 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
 
         let first = ensure_origin_tls_for_test(&paths, now).unwrap();
+        let marker = temp.path().join(ESTABLISHMENT_MARKER);
+        let marker_before = fs::read(&marker).unwrap();
         let reused = ensure_origin_tls_for_test(&paths, now + Duration::days(300)).unwrap();
         assert_eq!(
             serial(first.ca_certificate()),
@@ -1310,6 +1414,7 @@ mod tests {
             serial(&first.certificate_chain()[0]),
             serial(&renewed.certificate_chain()[0])
         );
+        assert_eq!(fs::read(marker).unwrap(), marker_before);
     }
 
     #[test]
@@ -1436,6 +1541,126 @@ mod tests {
                 fs::read(&paths.leaf_key).unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn deleting_all_established_files_fails_closed_until_explicit_rotation() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let first = ensure_origin_tls_for_test(&paths, now).unwrap();
+        let marker = temp.path().join(".cellar-origin-tls.established");
+        assert!(marker.is_file());
+        let marker_before = fs::read(&marker).unwrap();
+        for path in [
+            &paths.ca_cert,
+            &paths.ca_key,
+            &paths.leaf_cert,
+            &paths.leaf_key,
+        ] {
+            fs::remove_file(path).unwrap();
+        }
+
+        let error = ensure_origin_tls_for_test(&paths, now + Duration::days(1)).unwrap_err();
+
+        assert!(matches!(error, TlsError::EstablishedMaterialMissing));
+        assert!(
+            [
+                &paths.ca_cert,
+                &paths.ca_key,
+                &paths.leaf_cert,
+                &paths.leaf_key,
+            ]
+            .iter()
+            .all(|path| !path.exists())
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+
+        let rotated = rotate_origin_ca_impl(&paths, now + Duration::days(1), false).unwrap();
+        assert_ne!(
+            serial(first.ca_certificate()),
+            serial(rotated.material().ca_certificate())
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+        load_and_validate(&paths, now + Duration::days(1)).unwrap();
+    }
+
+    #[test]
+    fn corrupt_establishment_marker_fails_closed_without_touching_bundle() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        ensure_origin_tls_for_test(&paths, now).unwrap();
+        let marker = temp.path().join(ESTABLISHMENT_MARKER);
+        fs::write(&marker, b"corrupt establishment state").unwrap();
+        let before = [
+            fs::read(&paths.ca_cert).unwrap(),
+            fs::read(&paths.ca_key).unwrap(),
+            fs::read(&paths.leaf_cert).unwrap(),
+            fs::read(&paths.leaf_key).unwrap(),
+        ];
+
+        let error = ensure_origin_tls_for_test(&paths, now).unwrap_err();
+
+        assert!(matches!(error, TlsError::EstablishmentStateInvalid));
+        assert_eq!(
+            before,
+            [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn complete_bundle_from_pre_marker_crash_is_recorded_without_ca_replacement() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let bundle = generate_bundle(now).unwrap();
+        let ca_serial = serial(&CertificateDer::from(bundle.ca_cert_der.clone()));
+        persist_bundle(&paths, temp.path(), &bundle, false).unwrap();
+        assert!(!temp.path().join(ESTABLISHMENT_MARKER).exists());
+
+        let recovered = ensure_origin_tls_for_test(&paths, now).unwrap();
+
+        assert_eq!(serial(recovered.ca_certificate()), ca_serial);
+        assert_eq!(
+            fs::read(temp.path().join(ESTABLISHMENT_MARKER)).unwrap(),
+            ESTABLISHMENT_MARKER_CONTENT
+        );
+    }
+
+    #[test]
+    fn marker_publication_failure_reports_committed_rotation_and_restart_backfills() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let marker = temp.path().join(ESTABLISHMENT_MARKER);
+        let marker_stage = sibling_path(&marker, "stage");
+        fs::create_dir(&marker_stage).unwrap();
+
+        let error = rotate_origin_ca_impl(&paths, now, false).unwrap_err();
+        let committed = error
+            .committed_rotation()
+            .expect("rotation result must explicitly report committed trust");
+        assert!(committed.cloudflared_ca_pool_and_route_update_required());
+        let committed_ca_serial = serial(committed.material().ca_certificate());
+        assert_eq!(
+            committed_ca_serial,
+            serial(&CertificateDer::from(
+                certificate_der_from_pem(&fs::read(&paths.ca_cert).unwrap()).unwrap()
+            ))
+        );
+        assert!(!marker.exists());
+
+        fs::remove_dir(marker_stage).unwrap();
+        let recovered = ensure_origin_tls_for_test(&paths, now).unwrap();
+
+        assert_eq!(serial(recovered.ca_certificate()), committed_ca_serial);
+        assert_eq!(fs::read(marker).unwrap(), ESTABLISHMENT_MARKER_CONTENT);
     }
 
     #[test]
