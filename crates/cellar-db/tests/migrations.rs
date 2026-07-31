@@ -1,6 +1,6 @@
-use std::{cmp::Ordering, path::PathBuf, sync::Arc};
+use std::{cmp::Ordering, path::PathBuf};
 
-use cellar_db::{DbError, FilenameComparator, migrate, open_pool};
+use cellar_db::{DbError, FilenameCollation, migrate, open_pool};
 use sqlx::{Executor, Row, SqlitePool};
 use tempfile::TempDir;
 
@@ -20,20 +20,20 @@ impl TestDb {
     }
 
     async fn open(&self) -> SqlitePool {
-        open_pool(&self.path, test_comparator())
+        open_pool(&self.path, test_collation())
             .await
             .expect("open database pool")
     }
 }
 
 #[cfg(windows)]
-fn test_comparator() -> FilenameComparator {
-    Arc::new(compare_string_ordinal_ignore_case)
+fn test_collation() -> FilenameCollation {
+    FilenameCollation::windows_ordinal_ci_v1(compare_string_ordinal_ignore_case)
 }
 
 #[cfg(not(windows))]
-fn test_comparator() -> FilenameComparator {
-    Arc::new(str::cmp)
+fn test_collation() -> FilenameCollation {
+    FilenameCollation::windows_ordinal_ci_v1(str::cmp)
 }
 
 #[cfg(windows)]
@@ -178,6 +178,85 @@ async fn migrations_reject_an_unknown_schema_version_without_leaking_sql() {
         .expect_err("future schema must be rejected");
     assert!(matches!(error, DbError::SchemaVersion));
     assert_eq!(error.to_string(), "database schema version is unsupported");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn open_and_migrate_reject_a_collation_metadata_mismatch() {
+    let (db, pool) = migrated_db().await;
+    sqlx::query(
+        "UPDATE cellar_schema_metadata
+         SET value = '2'
+         WHERE key = 'filename_collation_version'",
+    )
+    .execute(&pool)
+    .await
+    .expect("replace collation metadata");
+
+    let migration_error = migrate(&pool)
+        .await
+        .expect_err("migration must reject mismatched collation metadata");
+    assert!(matches!(migration_error, DbError::SchemaVersion));
+    pool.close().await;
+
+    let open_error = open_pool(&db.path, test_collation())
+        .await
+        .expect_err("open must reject mismatched collation metadata");
+    assert!(matches!(open_error, DbError::SchemaVersion));
+}
+
+#[tokio::test]
+async fn a_failed_second_migration_rolls_back_earlier_index_creation() {
+    let db = TestDb::new();
+    let pool = db.open().await;
+    sqlx::raw_sql(include_str!("../../../migrations/0001_initial.sql"))
+        .execute(&pool)
+        .await
+        .expect("install version-one schema");
+    sqlx::query(
+        "CREATE TABLE cellar_schema_migration (
+           version INTEGER PRIMARY KEY NOT NULL,
+           name TEXT NOT NULL,
+           fingerprint TEXT NOT NULL
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create migration history");
+    sqlx::query(
+        "INSERT INTO cellar_schema_migration (version, name, fingerprint)
+         VALUES (1, 'initial', 'cellar-0001-initial-v3')",
+    )
+    .execute(&pool)
+    .await
+    .expect("record version one");
+    insert_project(&pool, "p1").await;
+    insert_file(&pool, "dir", "p1", None, "dir", "live")
+        .await
+        .expect("insert parent");
+    insert_file(&pool, "child-a", "p1", Some("dir"), "duplicate", "live")
+        .await
+        .expect("insert first duplicate");
+    insert_file(&pool, "child-b", "p1", Some("dir"), "duplicate", "live")
+        .await
+        .expect("insert second duplicate before indexes exist");
+
+    assert!(matches!(migrate(&pool).await, Err(DbError::Migration(_))));
+
+    let root_index_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'uq_file_root_name'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("inspect rolled-back index");
+    let version_two_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cellar_schema_migration WHERE version = 2")
+            .fetch_one(&pool)
+            .await
+            .expect("inspect migration history");
+    assert_eq!(root_index_count, 0);
+    assert_eq!(version_two_count, 0);
     pool.close().await;
 }
 
@@ -369,7 +448,13 @@ async fn live_root_and_child_names_are_unique_but_inactive_names_are_reusable() 
 async fn filename_uniqueness_uses_windows_ordinal_ignore_case() {
     let (_db, pool) = migrated_db().await;
     insert_project(&pool, "p1").await;
-    insert_file(&pool, "a", "p1", None, "Résumé.TXT", "live")
+    let sqlite_nocase_equal: i64 =
+        sqlx::query_scalar("SELECT 'RÉSUMÉ.TXT' = 'résumé.txt' COLLATE NOCASE")
+            .fetch_one(&pool)
+            .await
+            .expect("compare with SQLite NOCASE");
+    assert_eq!(sqlite_nocase_equal, 0);
+    insert_file(&pool, "a", "p1", None, "RÉSUMÉ.TXT", "live")
         .await
         .expect("insert first spelling");
 
@@ -379,6 +464,67 @@ async fn filename_uniqueness_uses_windows_ordinal_ignore_case() {
             .is_err()
     );
     pool.close().await;
+}
+
+#[tokio::test]
+async fn malformed_utf8_text_uses_deterministic_raw_byte_ordering() {
+    let db = TestDb::new();
+    let pool = db.open().await;
+
+    let forward: i64 = sqlx::query_scalar(
+        "SELECT CAST(x'80' AS TEXT) COLLATE WINDOWS_ORDINAL_CI_V1
+                < CAST(x'81' AS TEXT)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("compare malformed UTF-8 in byte order");
+    let reverse: i64 = sqlx::query_scalar(
+        "SELECT CAST(x'81' AS TEXT) COLLATE WINDOWS_ORDINAL_CI_V1
+                < CAST(x'80' AS TEXT)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("compare malformed UTF-8 in reverse byte order");
+    assert_eq!((forward, reverse), (1, 0));
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn panicking_comparator_never_unwinds_across_sqlite() {
+    const CHILD_ENV: &str = "CELLAR_DB_PANIC_COLLATION_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("locate migration test executable"),
+        )
+        .arg("--exact")
+        .arg("panicking_comparator_never_unwinds_across_sqlite")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .status()
+        .expect("run panicking comparator subprocess");
+        assert!(status.success(), "collation subprocess aborted: {status}");
+        return;
+    }
+
+    let db = TestDb::new();
+    let previous_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let collation =
+        FilenameCollation::windows_ordinal_ci_v1(|_, _| panic!("intentional comparator panic"));
+    let pool = open_pool(&db.path, collation)
+        .await
+        .expect("open pool with panicking comparator");
+    let forward: i64 = sqlx::query_scalar("SELECT 'alpha' COLLATE WINDOWS_ORDINAL_CI_V1 < 'bravo'")
+        .fetch_one(&pool)
+        .await
+        .expect("panic falls back to byte ordering");
+    let reverse: i64 = sqlx::query_scalar("SELECT 'bravo' COLLATE WINDOWS_ORDINAL_CI_V1 < 'alpha'")
+        .fetch_one(&pool)
+        .await
+        .expect("panic fallback is deterministic");
+    assert_eq!((forward, reverse), (1, 0));
+    pool.close().await;
+    std::panic::set_hook(previous_panic_hook);
 }
 
 #[tokio::test]
@@ -497,6 +643,9 @@ async fn pending_chunks_are_all_null_or_all_present_and_in_bounds() {
         "VALUES ('zero-length', 'p1', 'zero-length', 10, 0, 0, 0, zeroblob(32), 'uploading', 't')",
         "VALUES ('out-of-bounds', 'p1', 'out-of-bounds', 10, 8, 8, 3, zeroblob(32), 'uploading', 't')",
         "VALUES ('short-digest', 'p1', 'short-digest', 10, 0, 0, 1, x'00', 'uploading', 't')",
+        "VALUES ('overflow', 'p1', 'overflow', 9223372036854775807,
+                 9223372036854775807, 9223372036854775807, 1, zeroblob(32),
+                 'uploading', 't')",
     ];
     for values in invalid {
         let statement = format!(
@@ -583,5 +732,27 @@ async fn schema_contains_all_descriptive_columns() {
         let expected: Vec<&str> = column_list.split(',').collect();
         assert_eq!(actual, expected, "columns for {table}");
     }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn filename_indexes_explicitly_pin_collation_version_one() {
+    let (_db, pool) = migrated_db().await;
+    let index_sql: Vec<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'index'
+           AND name IN ('uq_file_root_name', 'uq_file_child_name',
+                        'uq_upload_root_destination', 'uq_upload_child_destination')
+         ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read filename index DDL");
+    assert_eq!(index_sql.len(), 4);
+    assert!(
+        index_sql
+            .iter()
+            .all(|sql| sql.contains("COLLATE WINDOWS_ORDINAL_CI_V1"))
+    );
     pool.close().await;
 }

@@ -9,11 +9,20 @@ CREATE TABLE project (
   deleted_at TEXT
 );
 
+CREATE TABLE cellar_schema_metadata (
+  key TEXT PRIMARY KEY NOT NULL,
+  value TEXT NOT NULL
+);
+
+INSERT INTO cellar_schema_metadata (key, value) VALUES
+  ('filename_collation_name', 'WINDOWS_ORDINAL_CI_V1'),
+  ('filename_collation_version', '1');
+
 CREATE TABLE file_entry (
   id TEXT PRIMARY KEY NOT NULL,
   project_id TEXT NOT NULL,
   parent_id TEXT,
-  exact_name TEXT NOT NULL COLLATE WINDOWS_ORDINAL_CI,
+  exact_name TEXT NOT NULL COLLATE WINDOWS_ORDINAL_CI_V1,
   kind TEXT NOT NULL CHECK (kind IN ('file', 'directory')),
   platform_kind TEXT NOT NULL,
   volume_serial BLOB CHECK (
@@ -53,7 +62,7 @@ CREATE TABLE upload_session (
   id TEXT PRIMARY KEY NOT NULL,
   project_id TEXT NOT NULL,
   destination_parent_id TEXT,
-  destination_name TEXT NOT NULL COLLATE WINDOWS_ORDINAL_CI,
+  destination_name TEXT NOT NULL COLLATE WINDOWS_ORDINAL_CI_V1,
   expected_size INTEGER NOT NULL CHECK (expected_size >= 0),
   committed_offset INTEGER NOT NULL CHECK (committed_offset >= 0),
   expected_hash BLOB,
@@ -75,7 +84,7 @@ CREATE TABLE upload_session (
      AND pending_digest IS NOT NULL
      AND pending_offset = committed_offset
      AND pending_length > 0
-     AND pending_offset + pending_length <= expected_size
+     AND pending_length <= expected_size - pending_offset
      AND length(pending_digest) = 32)
   ),
   FOREIGN KEY (project_id) REFERENCES project(id),

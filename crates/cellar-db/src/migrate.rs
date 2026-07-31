@@ -1,6 +1,9 @@
 use sqlx::{Executor, Sqlite, SqlitePool, Transaction};
 
-use crate::DbError;
+use crate::{
+    DbError,
+    pool::{COLLATION_METADATA_NAME_KEY, COLLATION_METADATA_VERSION_KEY, metadata_matches},
+};
 
 struct Migration {
     version: i64,
@@ -13,13 +16,13 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         name: "initial",
-        fingerprint: "cellar-0001-initial-v2",
+        fingerprint: "cellar-0001-initial-v3",
         sql: include_str!("../../../migrations/0001_initial.sql"),
     },
     Migration {
         version: 2,
         name: "indexes",
-        fingerprint: "cellar-0002-indexes-v1",
+        fingerprint: "cellar-0002-indexes-v2",
         sql: include_str!("../../../migrations/0002_indexes.sql"),
     },
 ];
@@ -91,6 +94,19 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
         .execute(&mut **transaction)
         .await
         .map_err(DbError::Migration)?;
+    }
+
+    let metadata: Vec<(String, String)> = sqlx::query_as(
+        "SELECT key, value FROM cellar_schema_metadata
+         WHERE key IN (?, ?) ORDER BY key",
+    )
+    .bind(COLLATION_METADATA_NAME_KEY)
+    .bind(COLLATION_METADATA_VERSION_KEY)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if !metadata_matches(&metadata) {
+        return Err(DbError::SchemaVersion);
     }
 
     Ok(())

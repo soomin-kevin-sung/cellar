@@ -4,7 +4,7 @@ mod pool;
 use thiserror::Error;
 
 pub use migrate::migrate;
-pub use pool::{FilenameComparator, open_pool};
+pub use pool::{FilenameCollation, open_pool};
 
 /// Stable, client-safe database failure categories.
 ///

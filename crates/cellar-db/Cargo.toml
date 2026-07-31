@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+libsqlite3-sys = "=0.30.1"
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
 thiserror.workspace = true
 
