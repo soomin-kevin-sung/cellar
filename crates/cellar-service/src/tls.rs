@@ -6,7 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cellar_windows::acl::{AclError, PRIVATE_KEY_SERVICE_NAME, restrict_private_key_access};
+use cellar_windows::acl::{
+    AclError, PRIVATE_KEY_SERVICE_NAME, is_elevated_administrator, restrict_private_key_handle,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
@@ -18,6 +20,7 @@ use x509_parser::{
     certificate::X509Certificate, extensions::GeneralName, parse_x509_certificate,
     pem::parse_x509_pem,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 const CA_COMMON_NAME: &str = "Cellar Local CA";
 const ORIGIN_DNS_NAME: &str = "cellar.local";
@@ -26,6 +29,7 @@ const CA_LIFETIME: Duration = Duration::days(5 * 365);
 const LEAF_LIFETIME: Duration = Duration::days(365);
 const RENEWAL_WINDOW: Duration = Duration::days(30);
 const TRANSACTION_MARKER: &str = ".cellar-origin-tls.transaction";
+const OPERATION_LOCK: &str = ".cellar-origin-tls.lock";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OriginTlsPaths {
@@ -37,8 +41,38 @@ pub struct OriginTlsPaths {
 
 pub struct TlsMaterial {
     certificate_chain: Vec<CertificateDer<'static>>,
-    private_key: PrivateKeyDer<'static>,
+    private_key: SecretPrivateKey,
     ca_certificate: CertificateDer<'static>,
+    warnings: Vec<TlsWarning>,
+}
+
+struct SecretPrivateKey(PrivateKeyDer<'static>);
+
+impl Drop for SecretPrivateKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TlsWarning {
+    CaRotationRequired,
+}
+
+pub struct OriginCaRotation {
+    material: TlsMaterial,
+}
+
+impl OriginCaRotation {
+    pub fn material(&self) -> &TlsMaterial {
+        &self.material
+    }
+
+    /// The caller must update cloudflared's `caPool` and route fragment before
+    /// treating the new trust anchor as deployed.
+    pub fn cloudflared_ca_pool_and_route_update_required(&self) -> bool {
+        true
+    }
 }
 
 impl std::fmt::Debug for TlsMaterial {
@@ -58,11 +92,15 @@ impl TlsMaterial {
     }
 
     pub fn private_key(&self) -> &PrivateKeyDer<'static> {
-        &self.private_key
+        &self.private_key.0
     }
 
     pub fn ca_certificate(&self) -> &CertificateDer<'static> {
         &self.ca_certificate
+    }
+
+    pub fn warnings(&self) -> &[TlsWarning] {
+        &self.warnings
     }
 }
 
@@ -83,10 +121,16 @@ pub enum TlsError {
     Generation(#[from] rcgen::Error),
     #[error("could not secure origin TLS private key: {0}")]
     PrivateKeyAcl(#[from] AclError),
+    #[error("origin CA rotation requires an elevated Windows Administrator token")]
+    AdministratorRequired,
+    #[error("could not verify Administrator authorization for origin CA rotation: {0}")]
+    AdministratorCheck(AclError),
     #[error("could not recover the previous origin TLS transaction: {0}")]
     Recovery(String),
     #[error("could not preserve the previous origin TLS bundle after a write failure: {0}")]
     Rollback(String),
+    #[error("the established origin TLS bundle is incomplete, unreadable, or invalid")]
+    EstablishedBundleInvalid,
     #[cfg(test)]
     #[error("injected crash after {0}")]
     InjectedCrash(&'static str),
@@ -94,24 +138,24 @@ pub enum TlsError {
 
 struct Bundle {
     ca_cert_pem: Vec<u8>,
-    ca_key_pem: Vec<u8>,
+    ca_key_pem: Zeroizing<Vec<u8>>,
     leaf_cert_pem: Vec<u8>,
-    leaf_key_pem: Vec<u8>,
+    leaf_key_pem: Zeroizing<Vec<u8>>,
     ca_cert_der: Vec<u8>,
     leaf_cert_der: Vec<u8>,
-    leaf_key_der: Vec<u8>,
+    leaf_key_der: Zeroizing<Vec<u8>>,
 }
 
 struct ExistingBundle {
     bundle: Bundle,
-    ca_key: KeyPair,
+    ca_key: Zeroizing<KeyPair>,
     leaf_not_after: OffsetDateTime,
     ca_not_after: OffsetDateTime,
 }
 
 enum ExistingState {
     Valid(Box<ExistingBundle>),
-    AbsentOrInvalid,
+    Uninitialized,
 }
 
 pub fn ensure_origin_tls(
@@ -119,6 +163,19 @@ pub fn ensure_origin_tls(
     now: OffsetDateTime,
 ) -> Result<TlsMaterial, TlsError> {
     ensure_origin_tls_impl(paths, now, true)
+}
+
+/// Replaces the origin trust anchor. This operation is intentionally separate
+/// from normal startup and must only be exposed through an administrator-only
+/// control path.
+pub fn rotate_origin_ca(
+    paths: &OriginTlsPaths,
+    now: OffsetDateTime,
+) -> Result<OriginCaRotation, TlsError> {
+    if !is_elevated_administrator().map_err(TlsError::AdministratorCheck)? {
+        return Err(TlsError::AdministratorRequired);
+    }
+    rotate_origin_ca_impl(paths, now, true)
 }
 
 fn ensure_origin_tls_impl(
@@ -129,29 +186,52 @@ fn ensure_origin_tls_impl(
     let directory = common_directory(paths)?;
     fs::create_dir_all(directory)
         .map_err(|source| io_error("create directory", directory, source))?;
+    let _lock = acquire_operation_lock(directory, protect_private_keys)?;
     recover_transaction(paths, directory)?;
 
-    match load_existing(paths, now) {
+    match load_existing(paths, now)? {
         ExistingState::Valid(existing) => {
             if existing.leaf_not_after - now > RENEWAL_WINDOW {
                 if protect_private_keys {
                     secure_existing_keys(paths)?;
                 }
-                return Ok(existing.bundle.into_material());
+                let warning = (existing.ca_not_after < now + LEAF_LIFETIME)
+                    .then_some(TlsWarning::CaRotationRequired);
+                return Ok(existing.bundle.into_material(warning));
             }
 
             if existing.ca_not_after >= now + LEAF_LIFETIME {
                 let renewed = renew_leaf(*existing, now)?;
                 persist_bundle(paths, directory, &renewed, protect_private_keys)?;
-                return Ok(renewed.into_material());
+                return Ok(renewed.into_material(None));
             }
+            return Ok(existing
+                .bundle
+                .into_material(Some(TlsWarning::CaRotationRequired)));
         }
-        ExistingState::AbsentOrInvalid => {}
+        ExistingState::Uninitialized => {}
     }
 
     let generated = generate_bundle(now)?;
     persist_bundle(paths, directory, &generated, protect_private_keys)?;
-    Ok(generated.into_material())
+    Ok(generated.into_material(None))
+}
+
+fn rotate_origin_ca_impl(
+    paths: &OriginTlsPaths,
+    now: OffsetDateTime,
+    protect_private_keys: bool,
+) -> Result<OriginCaRotation, TlsError> {
+    let directory = common_directory(paths)?;
+    fs::create_dir_all(directory)
+        .map_err(|source| io_error("create directory", directory, source))?;
+    let _lock = acquire_operation_lock(directory, protect_private_keys)?;
+    recover_transaction(paths, directory)?;
+    let generated = generate_bundle(now)?;
+    persist_bundle(paths, directory, &generated, protect_private_keys)?;
+    Ok(OriginCaRotation {
+        material: generated.into_material(None),
+    })
 }
 
 #[cfg(test)]
@@ -183,11 +263,99 @@ fn common_directory(paths: &OriginTlsPaths) -> Result<&Path, TlsError> {
     Ok(parent)
 }
 
+struct OperationLock(File);
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn acquire_operation_lock(directory: &Path, protect: bool) -> Result<OperationLock, TlsError> {
+    let path = directory.join(OPERATION_LOCK);
+
+    #[cfg(windows)]
+    let file = if protect {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE},
+            Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC},
+        };
+
+        loop {
+            let mut create = OpenOptions::new();
+            create
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+            match create.open(&path) {
+                Ok(file) => break file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let mut existing = OpenOptions::new();
+                    existing
+                        .read(true)
+                        .access_mode(GENERIC_READ | READ_CONTROL | WRITE_DAC)
+                        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+                    match existing.open(&path) {
+                        Ok(file) => break file,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(source) => return Err(io_error("open operation lock", &path, source)),
+                    }
+                }
+                Err(source) => return Err(io_error("create operation lock", &path, source)),
+            }
+        }
+    } else {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| io_error("open operation lock", &path, source))?
+    };
+
+    #[cfg(not(windows))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| io_error("open operation lock", &path, source))?;
+
+    if protect {
+        #[cfg(windows)]
+        restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME)?;
+        #[cfg(not(windows))]
+        set_owner_only_permissions(&path)?;
+    }
+    file.lock()
+        .map_err(|source| io_error("acquire operation lock", &path, source))?;
+    Ok(OperationLock(file))
+}
+
 fn secure_existing_keys(paths: &OriginTlsPaths) -> Result<(), TlsError> {
     #[cfg(windows)]
     {
-        restrict_private_key_access(&paths.ca_key, PRIVATE_KEY_SERVICE_NAME)?;
-        restrict_private_key_access(&paths.leaf_key, PRIVATE_KEY_SERVICE_NAME)?;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+        };
+
+        for path in [&paths.ca_key, &paths.leaf_key] {
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .access_mode(READ_CONTROL | WRITE_DAC)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            let file = options
+                .open(path)
+                .map_err(|source| io_error("open private key for ACL", path, source))?;
+            restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME)?;
+        }
     }
     #[cfg(not(windows))]
     {
@@ -196,24 +364,40 @@ fn secure_existing_keys(paths: &OriginTlsPaths) -> Result<(), TlsError> {
     Ok(())
 }
 
-fn load_existing(paths: &OriginTlsPaths, now: OffsetDateTime) -> ExistingState {
-    match load_and_validate(paths, now) {
-        Ok(bundle) => ExistingState::Valid(Box::new(bundle)),
-        Err(()) => ExistingState::AbsentOrInvalid,
+fn load_existing(paths: &OriginTlsPaths, now: OffsetDateTime) -> Result<ExistingState, TlsError> {
+    let present = [
+        file_is_present(&paths.ca_cert)?,
+        file_is_present(&paths.ca_key)?,
+        file_is_present(&paths.leaf_cert)?,
+        file_is_present(&paths.leaf_key)?,
+    ];
+    if present.iter().all(|exists| !exists) {
+        return Ok(ExistingState::Uninitialized);
+    }
+    load_and_validate(paths, now)
+        .map(|bundle| ExistingState::Valid(Box::new(bundle)))
+        .map_err(|()| TlsError::EstablishedBundleInvalid)
+}
+
+fn file_is_present(path: &Path) -> Result<bool, TlsError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(TlsError::EstablishedBundleInvalid),
     }
 }
 
 fn load_and_validate(paths: &OriginTlsPaths, now: OffsetDateTime) -> Result<ExistingBundle, ()> {
     let ca_cert_pem = fs::read(&paths.ca_cert).map_err(|_| ())?;
-    let ca_key_pem = fs::read(&paths.ca_key).map_err(|_| ())?;
+    let ca_key_pem = Zeroizing::new(fs::read(&paths.ca_key).map_err(|_| ())?);
     let leaf_cert_pem = fs::read(&paths.leaf_cert).map_err(|_| ())?;
-    let leaf_key_pem = fs::read(&paths.leaf_key).map_err(|_| ())?;
+    let leaf_key_pem = Zeroizing::new(fs::read(&paths.leaf_key).map_err(|_| ())?);
     let ca_cert_der = certificate_der_from_pem(&ca_cert_pem)?;
     let leaf_cert_der = certificate_der_from_pem(&leaf_cert_pem)?;
     let ca_key_text = std::str::from_utf8(&ca_key_pem).map_err(|_| ())?;
     let leaf_key_text = std::str::from_utf8(&leaf_key_pem).map_err(|_| ())?;
-    let ca_key = KeyPair::from_pem(ca_key_text).map_err(|_| ())?;
-    let leaf_key = KeyPair::from_pem(leaf_key_text).map_err(|_| ())?;
+    let ca_key = Zeroizing::new(KeyPair::from_pem(ca_key_text).map_err(|_| ())?);
+    let leaf_key = Zeroizing::new(KeyPair::from_pem(leaf_key_text).map_err(|_| ())?);
 
     let (ca_remainder, ca) = parse_x509_certificate(&ca_cert_der).map_err(|_| ())?;
     let (leaf_remainder, leaf) = parse_x509_certificate(&leaf_cert_der).map_err(|_| ())?;
@@ -227,7 +411,7 @@ fn load_and_validate(paths: &OriginTlsPaths, now: OffsetDateTime) -> Result<Exis
         .map_err(|_| ())?;
     let ca_not_after =
         OffsetDateTime::from_unix_timestamp(ca.validity().not_after.timestamp()).map_err(|_| ())?;
-    let leaf_key_der = leaf_key.serialize_der();
+    let leaf_key_der = Zeroizing::new(leaf_key.serialize_der());
     Ok(ExistingBundle {
         bundle: Bundle {
             ca_cert_pem,
@@ -323,38 +507,38 @@ fn certificate_lifetime(certificate: &X509Certificate<'_>) -> i64 {
 }
 
 fn generate_bundle(now: OffsetDateTime) -> Result<Bundle, TlsError> {
-    let ca_key = KeyPair::generate()?;
-    let leaf_key = KeyPair::generate()?;
+    let ca_key = Zeroizing::new(KeyPair::generate()?);
+    let leaf_key = Zeroizing::new(KeyPair::generate()?);
     let ca_params = ca_parameters(now);
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    let issuer = Issuer::from_params(&ca_params, &ca_key);
-    let leaf_cert = leaf_parameters(now).signed_by(&leaf_key, &issuer)?;
+    let ca_cert = ca_params.self_signed(&*ca_key)?;
+    let issuer = Issuer::from_params(&ca_params, &*ca_key);
+    let leaf_cert = leaf_parameters(now).signed_by(&*leaf_key, &issuer)?;
 
     Ok(Bundle {
         ca_cert_pem: ca_cert.pem().into_bytes(),
-        ca_key_pem: ca_key.serialize_pem().into_bytes(),
+        ca_key_pem: Zeroizing::new(ca_key.serialize_pem().into_bytes()),
         leaf_cert_pem: leaf_cert.pem().into_bytes(),
-        leaf_key_pem: leaf_key.serialize_pem().into_bytes(),
+        leaf_key_pem: Zeroizing::new(leaf_key.serialize_pem().into_bytes()),
         ca_cert_der: ca_cert.der().to_vec(),
         leaf_cert_der: leaf_cert.der().to_vec(),
-        leaf_key_der: leaf_key.serialize_der(),
+        leaf_key_der: Zeroizing::new(leaf_key.serialize_der()),
     })
 }
 
 fn renew_leaf(existing: ExistingBundle, now: OffsetDateTime) -> Result<Bundle, TlsError> {
-    let leaf_key = KeyPair::generate()?;
+    let leaf_key = Zeroizing::new(KeyPair::generate()?);
     let ca_pem = std::str::from_utf8(&existing.bundle.ca_cert_pem)
         .map_err(|_| TlsError::Recovery("validated CA PEM was not UTF-8".to_owned()))?;
-    let issuer = Issuer::from_ca_cert_pem(ca_pem, &existing.ca_key)?;
-    let leaf_cert = leaf_parameters(now).signed_by(&leaf_key, &issuer)?;
+    let issuer = Issuer::from_ca_cert_pem(ca_pem, &*existing.ca_key)?;
+    let leaf_cert = leaf_parameters(now).signed_by(&*leaf_key, &issuer)?;
     Ok(Bundle {
         ca_cert_pem: existing.bundle.ca_cert_pem,
         ca_key_pem: existing.bundle.ca_key_pem,
         leaf_cert_pem: leaf_cert.pem().into_bytes(),
-        leaf_key_pem: leaf_key.serialize_pem().into_bytes(),
+        leaf_key_pem: Zeroizing::new(leaf_key.serialize_pem().into_bytes()),
         ca_cert_der: existing.bundle.ca_cert_der,
         leaf_cert_der: leaf_cert.der().to_vec(),
-        leaf_key_der: leaf_key.serialize_der(),
+        leaf_key_der: Zeroizing::new(leaf_key.serialize_der()),
     })
 }
 
@@ -385,13 +569,17 @@ fn leaf_parameters(now: OffsetDateTime) -> CertificateParams {
 }
 
 impl Bundle {
-    fn into_material(self) -> TlsMaterial {
+    fn into_material(mut self, warning: Option<TlsWarning>) -> TlsMaterial {
         let ca_certificate = CertificateDer::from(self.ca_cert_der);
         let leaf_certificate = CertificateDer::from(self.leaf_cert_der);
+        let leaf_key_der = std::mem::take(&mut *self.leaf_key_der);
         TlsMaterial {
             certificate_chain: vec![leaf_certificate, ca_certificate.clone()],
-            private_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.leaf_key_der)),
+            private_key: SecretPrivateKey(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                leaf_key_der,
+            ))),
             ca_certificate,
+            warnings: warning.into_iter().collect(),
         }
     }
 }
@@ -416,7 +604,13 @@ enum PersistenceFault {
     #[cfg(test)]
     CrashAfterPreparedMarker,
     #[cfg(test)]
+    CrashAfterBackup(usize),
+    #[cfg(test)]
     CrashAfterReplacement(usize),
+    #[cfg(test)]
+    MarkerReplacement(TransactionState),
+    #[cfg(test)]
+    RollbackStep(usize),
     #[cfg(test)]
     Cleanup,
 }
@@ -501,10 +695,19 @@ fn persist_bundle_impl(
         }
     }
 
-    let original_mask = files.iter().enumerate().fold(0_u8, |mask, (index, entry)| {
-        mask | (u8::from(entry.target.exists()) << index)
-    });
-    if let Err(error) = publish_marker(&marker, original_mask, TransactionState::Prepared) {
+    let mut original_mask = 0_u8;
+    for (index, entry) in files.iter().enumerate() {
+        match transaction_path_exists(entry.target) {
+            Ok(true) => original_mask |= 1 << index,
+            Ok(false) => {}
+            Err(error) => {
+                drop(staged_files);
+                cleanup_stages(&stages, &marker);
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = publish_marker(&marker, original_mask, TransactionState::Prepared, fault) {
         drop(staged_files);
         cleanup_stages(&stages, &marker);
         return Err(error);
@@ -515,22 +718,34 @@ fn persist_bundle_impl(
     }
 
     let commit_result = (|| {
-        for ((entry, staged), backup) in files.iter().zip(&staged_files).zip(&backups) {
-            if entry.target.exists() {
+        for (index, ((entry, staged), backup)) in
+            files.iter().zip(&staged_files).zip(&backups).enumerate()
+        {
+            #[cfg(not(test))]
+            let _ = index;
+            if transaction_path_exists(entry.target)? {
                 durable_rename_path(entry.target, backup, false)
                     .map_err(|source| io_error("back up", entry.target, source))?;
+                #[cfg(test)]
+                if fault == PersistenceFault::CrashAfterBackup(index) {
+                    return Err(TlsError::InjectedCrash("target-to-backup boundary"));
+                }
             }
             rename_staged_file(staged, entry.target)?;
             #[cfg(test)]
-            if let PersistenceFault::CrashAfterReplacement(index) = fault
-                && files
-                    .get(index)
-                    .is_some_and(|file| file.target == entry.target)
-            {
+            if fault == PersistenceFault::CrashAfterReplacement(index) {
                 return Err(TlsError::InjectedCrash("target replacement boundary"));
             }
+            #[cfg(test)]
+            if matches!(fault, PersistenceFault::RollbackStep(_)) && index == 2 {
+                return Err(io_error(
+                    "injected commit failure",
+                    entry.target,
+                    std::io::Error::other("injected commit failure before rollback"),
+                ));
+            }
         }
-        publish_marker(&marker, original_mask, TransactionState::Committed)
+        publish_marker(&marker, original_mask, TransactionState::Committed, fault)
     })();
 
     if let Err(commit_error) = commit_result {
@@ -538,9 +753,15 @@ fn persist_bundle_impl(
         if matches!(commit_error, TlsError::InjectedCrash(_)) {
             return Err(commit_error);
         }
-        if let Err(rollback_error) =
-            rollback_files(&files, &stages, &backups, original_mask, &marker, directory)
-        {
+        if let Err(rollback_error) = rollback_files_impl(
+            &files,
+            &stages,
+            &backups,
+            original_mask,
+            &marker,
+            directory,
+            fault,
+        ) {
             return Err(TlsError::Rollback(format!(
                 "{rollback_error}; original write error: {commit_error}"
             )));
@@ -603,7 +824,7 @@ fn write_staged_file(
             )));
         }
         #[cfg(windows)]
-        restrict_private_key_access(path, PRIVATE_KEY_SERVICE_NAME)?;
+        restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME)?;
         #[cfg(not(windows))]
         set_owner_only_permissions(path)?;
     }
@@ -708,7 +929,14 @@ fn set_owner_only_permissions(_path: &Path) -> Result<(), TlsError> {
     Err(TlsError::PrivateKeyAcl(AclError::UnsupportedPlatform))
 }
 
-fn publish_marker(path: &Path, original_mask: u8, state: TransactionState) -> Result<(), TlsError> {
+fn publish_marker(
+    path: &Path,
+    original_mask: u8,
+    state: TransactionState,
+    fault: PersistenceFault,
+) -> Result<(), TlsError> {
+    #[cfg(not(test))]
+    let _ = fault;
     let marker_stage = sibling_path(path, "stage");
     remove_if_exists(&marker_stage)?;
     let mut file = OpenOptions::new()
@@ -716,17 +944,25 @@ fn publish_marker(path: &Path, original_mask: u8, state: TransactionState) -> Re
         .create_new(true)
         .open(&marker_stage)
         .map_err(|source| io_error("create transaction marker", &marker_stage, source))?;
-    let state = match state {
+    let state_text = match state {
         TransactionState::Prepared => "prepared",
         TransactionState::Committed => "committed",
     };
-    write!(file, "{state}:{original_mask:02x}")
+    write!(file, "{state_text}:{original_mask:02x}")
         .map_err(|source| io_error("write transaction marker", &marker_stage, source))?;
     file.flush()
         .map_err(|source| io_error("flush transaction marker", &marker_stage, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync transaction marker", &marker_stage, source))?;
     drop(file);
+    #[cfg(test)]
+    if fault == PersistenceFault::MarkerReplacement(state) {
+        return Err(io_error(
+            "replace transaction marker",
+            path,
+            std::io::Error::other("injected marker replacement failure"),
+        ));
+    }
     durable_rename_path(&marker_stage, path, true)
         .map_err(|source| io_error("durably publish transaction marker", path, source))
 }
@@ -742,7 +978,7 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
     let backups: [PathBuf; 4] = array::from_fn(|index| sibling_path(targets[index], "backup"));
     let marker = directory.join(TRANSACTION_MARKER);
 
-    if marker.exists() {
+    if transaction_path_exists(&marker)? {
         let mut text = String::new();
         File::open(&marker)
             .and_then(|mut file| file.read_to_string(&mut text))
@@ -767,7 +1003,11 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
             contents: &[],
             private: false,
         });
-        if state == TransactionState::Committed && targets.iter().all(|target| target.is_file()) {
+        let mut all_targets_are_files = true;
+        for target in targets {
+            all_targets_are_files &= transaction_path_is_file(target)?;
+        }
+        if state == TransactionState::Committed && all_targets_are_files {
             cleanup_after_commit(&stages, &backups, &marker);
         } else {
             rollback_files(&files, &stages, &backups, original_mask, &marker, directory)
@@ -780,6 +1020,7 @@ fn recover_transaction(paths: &OriginTlsPaths, directory: &Path) -> Result<(), T
         for backup in &backups {
             best_effort_remove(backup);
         }
+        best_effort_remove(&sibling_path(&marker, "stage"));
         best_effort_remove(&sibling_path(&marker, "consumed"));
     }
     Ok(())
@@ -793,8 +1034,38 @@ fn rollback_files(
     marker: &Path,
     _directory: &Path,
 ) -> Result<(), TlsError> {
+    rollback_files_impl(
+        files,
+        stages,
+        backups,
+        original_mask,
+        marker,
+        _directory,
+        PersistenceFault::None,
+    )
+}
+
+fn rollback_files_impl(
+    files: &[TransactionFile<'_>; 4],
+    stages: &[PathBuf; 4],
+    backups: &[PathBuf; 4],
+    original_mask: u8,
+    marker: &Path,
+    _directory: &Path,
+    fault: PersistenceFault,
+) -> Result<(), TlsError> {
+    #[cfg(not(test))]
+    let _ = fault;
     for (index, (entry, backup)) in files.iter().zip(backups).enumerate().rev() {
-        if backup.exists() {
+        #[cfg(test)]
+        if fault == PersistenceFault::RollbackStep(index) {
+            return Err(io_error(
+                "injected rollback step",
+                entry.target,
+                std::io::Error::other("injected rollback-step failure"),
+            ));
+        }
+        if transaction_path_exists(backup)? {
             remove_if_exists(entry.target)?;
             durable_rename_path(backup, entry.target, false)
                 .map_err(|source| io_error("restore", entry.target, source))?;
@@ -805,6 +1076,7 @@ fn rollback_files(
     for stage in stages {
         remove_if_exists(stage)?;
     }
+    remove_if_exists(&sibling_path(marker, "stage"))?;
     durable_remove_marker(marker)?;
     #[cfg(unix)]
     sync_directory(_directory)?;
@@ -823,6 +1095,22 @@ fn remove_if_exists(path: &Path) -> Result<(), TlsError> {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error("remove temporary", path, source)),
+    }
+}
+
+fn transaction_path_exists(path: &Path) -> Result<bool, TlsError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("inspect transaction path", path, source)),
+    }
+}
+
+fn transaction_path_is_file(path: &Path) -> Result<bool, TlsError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("inspect transaction target", path, source)),
     }
 }
 
@@ -854,7 +1142,7 @@ fn best_effort_remove(path: &Path) {
 
 #[cfg(windows)]
 fn durable_discard_path(path: &Path) -> Result<(), TlsError> {
-    if !path.exists() {
+    if !transaction_path_exists(path)? {
         return Ok(());
     }
     let discarded = sibling_path(path, "discarded");
@@ -931,7 +1219,7 @@ fn durable_rename_path(_source: &Path, _target: &Path, _replace: bool) -> std::i
 
 #[cfg(windows)]
 fn durable_remove_marker(marker: &Path) -> Result<(), TlsError> {
-    if !marker.exists() {
+    if !transaction_path_exists(marker)? {
         return Ok(());
     }
     let consumed = sibling_path(marker, "consumed");
@@ -1025,7 +1313,48 @@ mod tests {
     }
 
     #[test]
-    fn invalid_partial_bundle_is_replaced_completely() {
+    fn near_ca_expiry_keeps_valid_material_and_warns_until_explicit_rotation() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let first = ensure_origin_tls_for_test(&paths, now).unwrap();
+        for day in [335, 670, 1005, 1340] {
+            ensure_origin_tls_for_test(&paths, now + Duration::days(day)).unwrap();
+        }
+        let before = [
+            fs::read(&paths.ca_cert).unwrap(),
+            fs::read(&paths.ca_key).unwrap(),
+            fs::read(&paths.leaf_cert).unwrap(),
+            fs::read(&paths.leaf_key).unwrap(),
+        ];
+
+        let warning = ensure_origin_tls_for_test(&paths, now + Duration::days(1675)).unwrap();
+
+        assert_eq!(warning.warnings(), &[TlsWarning::CaRotationRequired]);
+        assert_eq!(
+            serial(first.ca_certificate()),
+            serial(warning.ca_certificate())
+        );
+        assert_eq!(
+            before,
+            [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ]
+        );
+
+        let rotated = rotate_origin_ca_impl(&paths, now + Duration::days(1675), false).unwrap();
+        assert!(rotated.cloudflared_ca_pool_and_route_update_required());
+        assert_ne!(
+            serial(first.ca_certificate()),
+            serial(rotated.material().ca_certificate())
+        );
+    }
+
+    #[test]
+    fn invalid_established_bundle_fails_closed_without_replacing_ca() {
         let first_dir = TempDir::new().unwrap();
         let second_dir = TempDir::new().unwrap();
         let first_paths = paths(&first_dir);
@@ -1035,19 +1364,20 @@ mod tests {
         ensure_origin_tls_for_test(&second_paths, now).unwrap();
         fs::copy(&second_paths.leaf_key, &first_paths.leaf_key).unwrap();
 
-        let repaired = ensure_origin_tls_for_test(&first_paths, now).unwrap();
+        let ca_before = fs::read(&first_paths.ca_cert).unwrap();
+        let error = ensure_origin_tls_for_test(&first_paths, now).unwrap_err();
 
-        assert_ne!(
+        assert!(matches!(error, TlsError::EstablishedBundleInvalid));
+        assert_eq!(
             serial(first.ca_certificate()),
-            serial(repaired.ca_certificate())
+            serial(&CertificateDer::from(
+                certificate_der_from_pem(&ca_before).unwrap()
+            ))
         );
-        let (_, ca) = parse_x509_certificate(repaired.ca_certificate().as_ref()).unwrap();
-        let (_, leaf) = parse_x509_certificate(repaired.certificate_chain()[0].as_ref()).unwrap();
-        leaf.verify_signature(Some(ca.public_key())).unwrap();
     }
 
     #[test]
-    fn corrupt_certificate_and_key_files_regenerate_the_complete_bundle() {
+    fn corrupt_certificate_and_key_files_fail_closed() {
         for corrupt_index in 0..4 {
             let temp = TempDir::new().unwrap();
             let paths = paths(&temp);
@@ -1061,18 +1391,200 @@ mod tests {
             ];
             fs::write(files[corrupt_index], b"definitely not PEM or DER").unwrap();
 
-            let repaired = ensure_origin_tls_for_test(&paths, now).unwrap();
+            let error = ensure_origin_tls_for_test(&paths, now).unwrap_err();
 
-            assert_ne!(
-                serial(first.ca_certificate()),
-                serial(repaired.ca_certificate()),
-                "corrupt file index {corrupt_index} must replace the complete generation"
-            );
-            let (_, ca) = parse_x509_certificate(repaired.ca_certificate().as_ref()).unwrap();
-            let (_, leaf) =
-                parse_x509_certificate(repaired.certificate_chain()[0].as_ref()).unwrap();
-            leaf.verify_signature(Some(ca.public_key())).unwrap();
+            assert!(matches!(error, TlsError::EstablishedBundleInvalid));
+            if corrupt_index != 0 {
+                assert_eq!(
+                    serial(first.ca_certificate()),
+                    serial(&CertificateDer::from(
+                        certificate_der_from_pem(&fs::read(&paths.ca_cert).unwrap()).unwrap()
+                    ))
+                );
+            }
         }
+    }
+
+    #[test]
+    fn expired_established_bundle_fails_closed_without_rotation() {
+        let temp = TempDir::new().unwrap();
+        let paths = paths(&temp);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let first = ensure_origin_tls_for_test(&paths, now).unwrap();
+        let before = [
+            fs::read(&paths.ca_cert).unwrap(),
+            fs::read(&paths.ca_key).unwrap(),
+            fs::read(&paths.leaf_cert).unwrap(),
+            fs::read(&paths.leaf_key).unwrap(),
+        ];
+
+        let error = ensure_origin_tls_for_test(&paths, now + Duration::days(366)).unwrap_err();
+
+        assert!(matches!(error, TlsError::EstablishedBundleInvalid));
+        assert_eq!(
+            serial(first.ca_certificate()),
+            serial(&CertificateDer::from(
+                certificate_der_from_pem(&fs::read(&paths.ca_cert).unwrap()).unwrap()
+            ))
+        );
+        assert_eq!(
+            before,
+            [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn concurrent_initialization_publishes_one_consistent_generation() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = TempDir::new().unwrap();
+        let paths = Arc::new(paths(&temp));
+        let barrier = Arc::new(Barrier::new(8));
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let workers = (0..8)
+            .map(|_| {
+                let paths = Arc::clone(&paths);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let material = ensure_origin_tls_for_test(&paths, now).unwrap();
+                    (
+                        serial(material.ca_certificate()),
+                        serial(&material.certificate_chain()[0]),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(results.iter().all(|result| result == &results[0]));
+        assert!(!temp.path().join(TRANSACTION_MARKER).exists());
+        load_and_validate(&paths, now).unwrap();
+    }
+
+    #[test]
+    fn cross_process_initialization_publishes_one_consistent_generation() {
+        run_cross_process_initialization_test(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires elevated Administrator or NT SERVICE\\Cellar identity"]
+    fn protected_cross_process_lock_serializes_production_initialization() {
+        run_cross_process_initialization_test(true);
+    }
+
+    fn run_cross_process_initialization_test(protect: bool) {
+        use std::process::Command;
+        use std::time::Instant;
+
+        let temp = TempDir::new().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let start_path = temp.path().join("workers.start");
+        let workers = (0..6)
+            .map(|index| {
+                let result_path = temp.path().join(format!("worker-{index}.serial"));
+                let ready_path = temp.path().join(format!("worker-{index}.ready"));
+                let mut command = Command::new(&executable);
+                command
+                    .arg("--exact")
+                    .arg("tls::tests::origin_tls_process_worker")
+                    .arg("--nocapture")
+                    .env("CELLAR_TLS_PROCESS_TEST_DIR", temp.path())
+                    .env("CELLAR_TLS_PROCESS_TEST_RESULT", &result_path)
+                    .env("CELLAR_TLS_PROCESS_TEST_READY", &ready_path)
+                    .env("CELLAR_TLS_PROCESS_TEST_START", &start_path)
+                    .env("CELLAR_TLS_PROCESS_TEST_PROTECT", protect.to_string());
+                (command.spawn().unwrap(), result_path, ready_path)
+            })
+            .collect::<Vec<_>>();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(15);
+        while !workers.iter().all(|(_, _, ready)| ready.exists()) {
+            if Instant::now() >= deadline {
+                fs::write(&start_path, b"release").unwrap();
+                panic!("child processes did not reach the cross-process start gate");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        fs::write(&start_path, b"release").unwrap();
+
+        let mut serials = Vec::new();
+        for (mut worker, result_path, _) in workers {
+            assert!(worker.wait().unwrap().success());
+            serials.push(fs::read(result_path).unwrap());
+        }
+        assert!(serials.iter().all(|serial| serial == &serials[0]));
+        let paths = OriginTlsPaths {
+            ca_cert: temp.path().join("ca.pem"),
+            ca_key: temp.path().join("ca-key.pem"),
+            leaf_cert: temp.path().join("origin.pem"),
+            leaf_key: temp.path().join("origin-key.pem"),
+        };
+        load_and_validate(
+            &paths,
+            OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        )
+        .unwrap();
+        assert!(!temp.path().join(TRANSACTION_MARKER).exists());
+    }
+
+    #[test]
+    fn origin_tls_process_worker() {
+        let Ok(directory) = std::env::var("CELLAR_TLS_PROCESS_TEST_DIR") else {
+            return;
+        };
+        let result_path = std::env::var("CELLAR_TLS_PROCESS_TEST_RESULT").unwrap();
+        let ready_path = std::env::var("CELLAR_TLS_PROCESS_TEST_READY").unwrap();
+        let start_path = std::env::var("CELLAR_TLS_PROCESS_TEST_START").unwrap();
+        let protect = std::env::var("CELLAR_TLS_PROCESS_TEST_PROTECT").unwrap() == "true";
+        let directory = PathBuf::from(directory);
+        let paths = OriginTlsPaths {
+            ca_cert: directory.join("ca.pem"),
+            ca_key: directory.join("ca-key.pem"),
+            leaf_cert: directory.join("origin.pem"),
+            leaf_key: directory.join("origin-key.pem"),
+        };
+        fs::write(ready_path, b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !Path::new(&start_path).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the cross-process start gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let material = ensure_origin_tls_impl(
+            &paths,
+            OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+            protect,
+        )
+        .unwrap();
+        fs::write(result_path, serial(material.ca_certificate())).unwrap();
+    }
+
+    #[test]
+    fn tls_material_has_secret_drop_and_redacted_debug() {
+        let bundle =
+            generate_bundle(OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap()).unwrap();
+        let secret_prefix = bundle.leaf_key_der[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let material = bundle.into_material(None);
+
+        assert!(std::mem::needs_drop::<TlsMaterial>());
+        let debug = format!("{material:?}");
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains(&secret_prefix));
     }
 
     #[cfg(windows)]
@@ -1118,6 +1630,10 @@ mod tests {
     fn prepared_transaction_recovers_at_marker_and_every_replacement_boundary() {
         let faults = [
             TestPersistenceFault::CrashAfterPreparedMarker,
+            TestPersistenceFault::CrashAfterBackup(0),
+            TestPersistenceFault::CrashAfterBackup(1),
+            TestPersistenceFault::CrashAfterBackup(2),
+            TestPersistenceFault::CrashAfterBackup(3),
             TestPersistenceFault::CrashAfterReplacement(0),
             TestPersistenceFault::CrashAfterReplacement(1),
             TestPersistenceFault::CrashAfterReplacement(2),
@@ -1154,6 +1670,44 @@ mod tests {
                 fs::read(&paths.leaf_key).unwrap(),
             ];
             assert_eq!(after, before, "recovery failed for {fault:?}");
+        }
+    }
+
+    #[test]
+    fn marker_replacement_and_rollback_step_failures_remain_recoverable() {
+        let faults = [
+            TestPersistenceFault::MarkerReplacement(TransactionState::Prepared),
+            TestPersistenceFault::MarkerReplacement(TransactionState::Committed),
+            TestPersistenceFault::RollbackStep(0),
+            TestPersistenceFault::RollbackStep(2),
+        ];
+        for fault in faults {
+            let temp = TempDir::new().unwrap();
+            let paths = paths(&temp);
+            let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+            let original = generate_bundle(now).unwrap();
+            persist_bundle(&paths, temp.path(), &original, false).unwrap();
+            let before = [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ];
+            let replacement = generate_bundle(now + Duration::days(1)).unwrap();
+
+            assert!(
+                persist_bundle_for_test(&paths, temp.path(), &replacement, false, fault).is_err()
+            );
+            recover_transaction(&paths, temp.path()).unwrap();
+            let after = [
+                fs::read(&paths.ca_cert).unwrap(),
+                fs::read(&paths.ca_key).unwrap(),
+                fs::read(&paths.leaf_cert).unwrap(),
+                fs::read(&paths.leaf_key).unwrap(),
+            ];
+            assert_eq!(after, before, "recovery failed for {fault:?}");
+            assert!(!temp.path().join(TRANSACTION_MARKER).exists());
+            assert!(!sibling_path(&temp.path().join(TRANSACTION_MARKER), "stage").exists());
         }
     }
 

@@ -1,5 +1,7 @@
+#[cfg(not(windows))]
+use cellar_windows::acl::restrict_private_key_access;
 use cellar_windows::acl::{
-    PRIVATE_KEY_SERVICE_NAME, build_private_key_security_descriptor, restrict_private_key_access,
+    PRIVATE_KEY_SERVICE_NAME, build_private_key_security_descriptor, restrict_private_key_handle,
     service_sid_string,
 };
 
@@ -21,17 +23,25 @@ fn applying_a_private_key_acl_is_explicitly_unsupported_off_windows() {
 
 #[cfg(windows)]
 mod windows {
-    use std::{collections::BTreeMap, ffi::OsStr, iter, os::windows::ffi::OsStrExt, ptr};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsStr,
+        fs::OpenOptions,
+        iter,
+        os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+        ptr,
+    };
 
     use super::*;
     use windows_sys::Win32::{
-        Foundation::{ERROR_SUCCESS, LocalFree},
+        Foundation::{ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, LocalFree},
         Security::{
             ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
             Authorization::{ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
             DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetSecurityDescriptorControl,
             INHERITED_ACE, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
         },
+        Storage::FileSystem::READ_CONTROL,
     };
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -105,11 +115,19 @@ mod windows {
     }
 
     #[test]
-    fn applied_dacl_has_no_broad_or_inherited_access() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        restrict_private_key_access(temp.path(), PRIVATE_KEY_SERVICE_NAME).unwrap();
+    fn handle_applied_dacl_has_no_broad_or_inherited_access() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let key_path = temp.path().join("key.pem");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC)
+            .open(&key_path)
+            .unwrap();
+        restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME).unwrap();
 
-        let path = wide(temp.path().as_os_str());
+        let path = wide(key_path.as_os_str());
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let status = unsafe {

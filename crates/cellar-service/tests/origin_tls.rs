@@ -1,6 +1,8 @@
 use std::fs;
 
-use cellar_service::tls::{OriginTlsPaths, ensure_origin_tls};
+use cellar_service::tls::{
+    OriginTlsPaths, TlsError, TlsWarning, ensure_origin_tls, rotate_origin_ca,
+};
 use tempfile::TempDir;
 use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
@@ -9,6 +11,10 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x5
 // Run from an elevated Administrator PowerShell (Administrators SID enabled) or a shell running
 // as NT SERVICE\Cellar:
 // cargo test -p cellar-service --test origin_tls -- --ignored --nocapture
+//
+// Phase 5 acceptance (not a local simulation): run elevated Windows VM power-loss tests at each
+// journal boundary and verify recovery after reboot under both Administrator and NT SERVICE\Cellar.
+// Also verify the real cloudflared caPool/route-fragment rollout during explicit CA rotation.
 
 const CA_NAME: &str = "Cellar Local CA";
 const ORIGIN_NAME: &str = "cellar.local";
@@ -131,7 +137,7 @@ fn renews_only_the_leaf_at_thirty_days_remaining() {
 
 #[test]
 #[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
-fn mismatched_existing_material_is_replaced_as_one_generation() {
+fn mismatched_existing_material_fails_closed_without_replacing_the_ca() {
     let first_dir = TempDir::new().unwrap();
     let second_dir = TempDir::new().unwrap();
     let first_paths = paths(&first_dir);
@@ -142,41 +148,36 @@ fn mismatched_existing_material_is_replaced_as_one_generation() {
     ensure_origin_tls(&second_paths, now).unwrap();
     fs::copy(&second_paths.leaf_key, &first_paths.leaf_key).unwrap();
 
-    let repaired = ensure_origin_tls(&first_paths, now).unwrap();
+    let ca_before = fs::read(&first_paths.ca_cert).unwrap();
+    let error = ensure_origin_tls(&first_paths, now).unwrap_err();
 
-    assert_ne!(
+    assert!(matches!(error, TlsError::EstablishedBundleInvalid));
+    assert_eq!(fs::read(&first_paths.ca_cert).unwrap(), ca_before);
+    assert_eq!(
         serial(first.ca_certificate().as_ref()),
-        serial(repaired.ca_certificate().as_ref()),
-        "repair must not mix a new leaf with the old CA"
+        serial(&parse_pem_certificate(&first_paths.ca_cert))
     );
-    let (_, ca) = parse_x509_certificate(repaired.ca_certificate().as_ref()).unwrap();
-    let (_, leaf) = parse_x509_certificate(repaired.certificate_chain()[0].as_ref()).unwrap();
-    leaf.verify_signature(Some(ca.public_key())).unwrap();
 }
 
 #[test]
 #[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
-fn an_incomplete_bundle_is_replaced_as_one_generation() {
+fn an_incomplete_established_bundle_fails_closed() {
     let temp = TempDir::new().unwrap();
     let paths = paths(&temp);
     let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
     let first = ensure_origin_tls(&paths, now).unwrap();
     fs::remove_file(&paths.leaf_cert).unwrap();
 
-    let repaired = ensure_origin_tls(&paths, now).unwrap();
+    let ca_before = fs::read(&paths.ca_cert).unwrap();
+    let error = ensure_origin_tls(&paths, now).unwrap_err();
 
-    assert_ne!(
+    assert!(matches!(error, TlsError::EstablishedBundleInvalid));
+    assert_eq!(fs::read(&paths.ca_cert).unwrap(), ca_before);
+    assert_eq!(
         serial(first.ca_certificate().as_ref()),
-        serial(repaired.ca_certificate().as_ref())
+        serial(&parse_pem_certificate(&paths.ca_cert))
     );
-    for path in [
-        &paths.ca_cert,
-        &paths.ca_key,
-        &paths.leaf_cert,
-        &paths.leaf_key,
-    ] {
-        assert!(path.is_file());
-    }
+    assert!(!paths.leaf_cert.exists());
 }
 
 #[test]
@@ -195,6 +196,25 @@ fn debug_output_does_not_contain_private_key_pem() {
     assert!(!debug.contains("PRIVATE KEY"));
     assert!(!debug.contains(&private_prefix));
     assert!(debug.contains("[redacted]"));
+}
+
+#[cfg(windows)]
+#[test]
+fn medium_integrity_process_cannot_rotate_the_origin_ca() {
+    assert!(
+        !cellar_windows::acl::is_elevated_administrator().unwrap(),
+        "run the elevated rotation acceptance test separately from this medium-token denial test"
+    );
+    let temp = TempDir::new().unwrap();
+    let paths = paths(&temp);
+    let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+
+    let error = rotate_origin_ca(&paths, now)
+        .err()
+        .expect("medium token must be denied");
+
+    assert!(matches!(error, TlsError::AdministratorRequired));
+    assert!(!paths.ca_cert.exists());
 }
 
 #[cfg(windows)]
@@ -234,7 +254,7 @@ fn failed_renewal_keeps_the_last_complete_bundle() {
 
 #[test]
 #[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
-fn corrupt_pem_and_key_bytes_regenerate_the_complete_bundle() {
+fn corrupt_pem_and_key_bytes_fail_closed_without_rotating_the_ca() {
     for corrupt_index in 0..4 {
         let temp = TempDir::new().unwrap();
         let paths = paths(&temp);
@@ -248,11 +268,69 @@ fn corrupt_pem_and_key_bytes_regenerate_the_complete_bundle() {
         ];
         fs::write(files[corrupt_index], b"corrupt PEM and key bytes").unwrap();
 
-        let repaired = ensure_origin_tls(&paths, now).unwrap();
+        let ca_before = fs::read(&paths.ca_cert).unwrap();
+        let error = ensure_origin_tls(&paths, now).unwrap_err();
 
-        assert_ne!(
-            serial(first.ca_certificate().as_ref()),
-            serial(repaired.ca_certificate().as_ref())
-        );
+        assert!(matches!(error, TlsError::EstablishedBundleInvalid));
+        if corrupt_index != 0 {
+            assert_eq!(fs::read(&paths.ca_cert).unwrap(), ca_before);
+            assert_eq!(
+                serial(first.ca_certificate().as_ref()),
+                serial(&parse_pem_certificate(&paths.ca_cert))
+            );
+        }
     }
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "requires elevated token or Cellar service identity")]
+fn near_ca_expiry_preserves_the_trust_anchor_and_reports_rotation_required() {
+    let temp = TempDir::new().unwrap();
+    let paths = paths(&temp);
+    let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    let first = ensure_origin_tls(&paths, now).unwrap();
+    for day in [335, 670, 1005, 1340] {
+        ensure_origin_tls(&paths, now + Duration::days(day)).unwrap();
+    }
+    let before = [
+        fs::read(&paths.ca_cert).unwrap(),
+        fs::read(&paths.ca_key).unwrap(),
+        fs::read(&paths.leaf_cert).unwrap(),
+        fs::read(&paths.leaf_key).unwrap(),
+    ];
+
+    let material = ensure_origin_tls(&paths, now + Duration::days(1675)).unwrap();
+
+    assert_eq!(material.warnings(), &[TlsWarning::CaRotationRequired]);
+    assert_eq!(
+        serial(first.ca_certificate()),
+        serial(material.ca_certificate())
+    );
+    assert_eq!(
+        before,
+        [
+            fs::read(&paths.ca_cert).unwrap(),
+            fs::read(&paths.ca_key).unwrap(),
+            fs::read(&paths.leaf_cert).unwrap(),
+            fs::read(&paths.leaf_key).unwrap(),
+        ]
+    );
+}
+
+#[test]
+#[cfg(windows)]
+#[ignore = "requires an elevated Administrator token"]
+fn explicit_admin_rotation_changes_ca_and_signals_cloudflared_update() {
+    let temp = TempDir::new().unwrap();
+    let paths = paths(&temp);
+    let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    let first = ensure_origin_tls(&paths, now).unwrap();
+
+    let rotated = rotate_origin_ca(&paths, now + Duration::days(1)).unwrap();
+
+    assert_ne!(
+        serial(first.ca_certificate()),
+        serial(rotated.material().ca_certificate())
+    );
+    assert!(rotated.cloudflared_ca_pool_and_route_update_required());
 }
