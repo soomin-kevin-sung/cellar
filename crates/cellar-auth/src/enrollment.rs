@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cellar_config::{BootstrapClaim, PersistedConfig, load_config, save_config};
+use fs2::FileExt;
 
 use crate::AccessClaims;
 
@@ -224,7 +225,7 @@ impl fmt::Debug for FileEnrollmentStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FileEnrollmentStore")
-            .field("path", &self.path)
+            .field("path", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -243,6 +244,7 @@ impl EnrollmentStore for FileEnrollmentStore {
             .mutation_lock
             .lock()
             .map_err(|_| EnrollmentStoreError::new())?;
+        let _file_lock = acquire_file_lock(&self.path)?;
         let mut persisted = self.read_persisted()?;
         if owner_subject.is_empty()
             || persisted.config.owner_subject.is_some()
@@ -256,6 +258,28 @@ impl EnrollmentStore for FileEnrollmentStore {
         save_config(&self.path, &persisted).map_err(|_| EnrollmentStoreError::new())?;
         Ok(CompareAndSet::Saved)
     }
+}
+
+fn acquire_file_lock(config_path: &Path) -> Result<File, EnrollmentStoreError> {
+    let lock_path = enrollment_lock_path(config_path);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|_| EnrollmentStoreError::new())?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|_| EnrollmentStoreError::new())?;
+    Ok(lock_file)
+}
+
+fn enrollment_lock_path(config_path: &Path) -> PathBuf {
+    let canonical_path = canonical_lock_key(config_path);
+    let mut path = canonical_path.as_os_str().to_owned();
+    path.push(".enrollment.lock");
+    PathBuf::from(path)
 }
 
 fn snapshot(persisted: &PersistedConfig) -> Result<EnrollmentSnapshot, EnrollmentStoreError> {

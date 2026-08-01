@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Request, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -36,6 +36,7 @@ pub const fn csrf_status(error: &CsrfError) -> StatusCode {
     match error {
         CsrfError::Unauthenticated => StatusCode::UNAUTHORIZED,
         CsrfError::Forbidden => StatusCode::FORBIDDEN,
+        CsrfError::Capacity => StatusCode::SERVICE_UNAVAILABLE,
         CsrfError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
@@ -331,7 +332,8 @@ async fn claim_handler<S: EnrollmentStore + 'static>(
 async fn session_handler<S: EnrollmentStore + 'static>(
     State(state): State<SessionState<S>>,
     Extension(claims): Extension<AccessClaims>,
-) -> Result<Json<SessionResponse>, ApiError> {
+    method: Method,
+) -> Result<impl IntoResponse, ApiError> {
     let authorization = state
         .enrollment
         .authorize(RouteAccess::OwnerOnly, &claims)
@@ -339,9 +341,23 @@ async fn session_handler<S: EnrollmentStore + 'static>(
     let owner_subject = authorization
         .owner_subject()
         .ok_or_else(|| ApiError::from_enrollment(EnrollmentError::Forbidden))?;
-    get_session("GET", &state.csrf, &claims, owner_subject, (state.clock)())
-        .map(Json)
-        .map_err(ApiError::from_session)
+    get_session(
+        method.as_str(),
+        &state.csrf,
+        &claims,
+        owner_subject,
+        (state.clock)(),
+    )
+    .map(|response| {
+        (
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::PRAGMA, "no-cache"),
+            ],
+            Json(response),
+        )
+    })
+    .map_err(ApiError::from_session)
 }
 
 async fn not_found() -> StatusCode {

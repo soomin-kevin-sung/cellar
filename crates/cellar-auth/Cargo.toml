@@ -10,6 +10,7 @@ license.workspace = true
 async-trait = "=0.1.91"
 base64 = "=0.22.1"
 cellar-config = { path = "../cellar-config" }
+fs2 = "=0.4.3"
 getrandom = "=0.3.4"
 jsonwebtoken = { version = "=10.3.0", default-features = false, features = ["rust_crypto"] }
 serde = { version = "=1.0.229", features = ["derive"] }

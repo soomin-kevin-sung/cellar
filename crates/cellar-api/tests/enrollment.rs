@@ -14,8 +14,10 @@ use cellar_config::{BootstrapClaim, CellarConfig, PersistedConfig, load_config, 
 use http_body_util::BodyExt;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::Duration;
 use tower::ServiceExt;
 
 const NOW: i64 = 10_000;
@@ -498,4 +500,127 @@ async fn http_claim_rejects_duplicate_origin_and_unenrolled_non_claim_routes() {
         app.oneshot(request).await.unwrap().status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[test]
+fn independent_processes_have_exactly_one_durable_claim_winner() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let start = directory.path().join("start");
+    save_config(
+        &path,
+        &PersistedConfig {
+            config: CellarConfig {
+                external_origin: "https://cellar.example".parse().unwrap(),
+                team_domain: "https://team.cloudflareaccess.com".parse().unwrap(),
+                aud_tags: (0..2_000).map(|index| format!("aud-{index}")).collect(),
+                bootstrap_owner_email: Some(EMAIL.into()),
+                owner_subject: None,
+                storage_root: PathBuf::from(r"C:\cellar-storage"),
+                origin_port: 8443,
+                health_port: 8081,
+            },
+            bootstrap_claim: Some(BootstrapClaim::new(&CODE, NOW + 60)),
+        },
+    )
+    .unwrap();
+
+    let child = |subject: &str| {
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "enrollment_child_process_helper",
+                "--nocapture",
+            ])
+            .env("CELLAR_TEST_CONFIG", &path)
+            .env("CELLAR_TEST_START", &start)
+            .env("CELLAR_TEST_SUBJECT", subject)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let first = child("process-owner-one");
+    let second = child("process-owner-two");
+    std::fs::write(&start, b"go").unwrap();
+    let statuses = [
+        first.wait_with_output().unwrap().status,
+        second.wait_with_output().unwrap().status,
+    ];
+    assert_eq!(statuses.iter().filter(|status| status.success()).count(), 1);
+
+    let winner = load_config(&path).unwrap().config.owner_subject.unwrap();
+    assert!(matches!(
+        winner.as_str(),
+        "process-owner-one" | "process-owner-two"
+    ));
+}
+
+#[test]
+#[ignore = "spawned by independent_processes_have_exactly_one_durable_claim_winner"]
+fn enrollment_child_process_helper() {
+    let Ok(path) = std::env::var("CELLAR_TEST_CONFIG") else {
+        return;
+    };
+    let start = PathBuf::from(std::env::var("CELLAR_TEST_START").unwrap());
+    while !start.exists() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let mut child_claims = claims();
+    child_claims.sub = std::env::var("CELLAR_TEST_SUBJECT").unwrap();
+    let service = EnrollmentService::new(Arc::new(FileEnrollmentStore::new(path)));
+    match service.claim(&child_claims, request(EMAIL, ORIGIN, &CODE), NOW) {
+        Ok(EnrollmentMode::Enrolled) => {}
+        Err(EnrollmentError::NotFound | EnrollmentError::Conflict) => std::process::exit(10),
+        Err(error) => panic!("unexpected child enrollment error: {error}"),
+        Ok(EnrollmentMode::Unenrolled) => panic!("claim did not enroll"),
+    }
+}
+
+#[test]
+fn sidecar_lock_acquisition_failure_does_not_consume_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    save_config(
+        &path,
+        &PersistedConfig {
+            config: CellarConfig {
+                external_origin: "https://cellar.example".parse().unwrap(),
+                team_domain: "https://team.cloudflareaccess.com".parse().unwrap(),
+                aud_tags: vec!["aud".into()],
+                bootstrap_owner_email: Some(EMAIL.into()),
+                owner_subject: None,
+                storage_root: PathBuf::from(r"C:\cellar-storage"),
+                origin_port: 8443,
+                health_port: 8081,
+            },
+            bootstrap_claim: Some(BootstrapClaim::new(&CODE, NOW + 60)),
+        },
+    )
+    .unwrap();
+    let lock_path = directory.path().join("config.toml.enrollment.lock");
+    std::fs::create_dir(&lock_path).unwrap();
+    let service = EnrollmentService::new(Arc::new(FileEnrollmentStore::new(&path)));
+    assert_eq!(
+        service
+            .claim(&claims(), request(EMAIL, ORIGIN, &CODE), NOW)
+            .unwrap_err(),
+        EnrollmentError::Unavailable
+    );
+    std::fs::remove_dir(lock_path).unwrap();
+    assert_eq!(
+        service
+            .claim(&claims(), request(EMAIL, ORIGIN, &CODE), NOW)
+            .unwrap(),
+        EnrollmentMode::Enrolled
+    );
+}
+
+#[test]
+fn file_store_debug_redacts_the_config_path() {
+    let store = FileEnrollmentStore::new(r"C:\secret-owner-folder\config.toml");
+    let debug = format!("{store:?}");
+    assert!(!debug.contains("secret-owner-folder"));
+    assert!(debug.contains("<redacted>"));
 }

@@ -10,11 +10,13 @@ use crate::AccessClaims;
 
 const TOKEN_BYTES: usize = 32;
 const MAX_SESSION_SECONDS: i64 = 8 * 60 * 60;
+const DEFAULT_ACTIVE_SESSION_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum CsrfError {
     Unauthenticated,
     Forbidden,
+    Capacity,
     Unavailable,
 }
 
@@ -24,6 +26,7 @@ impl CsrfError {
         match self {
             Self::Unauthenticated => "csrf_unauthenticated",
             Self::Forbidden => "csrf_forbidden",
+            Self::Capacity => "csrf_capacity_exhausted",
             Self::Unavailable => "csrf_unavailable",
         }
     }
@@ -57,7 +60,8 @@ struct SessionRecord {
 }
 
 pub struct CsrfManager {
-    current: Mutex<Option<SessionRecord>>,
+    records: Mutex<Vec<SessionRecord>>,
+    capacity: usize,
 }
 
 impl Default for CsrfManager {
@@ -78,7 +82,16 @@ impl CsrfManager {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            current: Mutex::new(None),
+            records: Mutex::new(Vec::new()),
+            capacity: DEFAULT_ACTIVE_SESSION_CAPACITY,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_capacity(capacity: usize) -> Self {
+        Self {
+            records: Mutex::new(Vec::new()),
+            capacity,
         }
     }
 
@@ -89,12 +102,16 @@ impl CsrfManager {
         now_unix_seconds: i64,
     ) -> Result<String, CsrfError> {
         let binding = authenticate(claims, owner_subject, now_unix_seconds)?;
+        let mut records = self.records.lock().map_err(|_| CsrfError::Unavailable)?;
+        records.retain(|record| record_is_active(record, now_unix_seconds));
+        if records.len() >= self.capacity {
+            return Err(CsrfError::Capacity);
+        }
         let mut token = [0_u8; TOKEN_BYTES];
         getrandom::fill(&mut token).map_err(|_| CsrfError::Unavailable)?;
         let token_hash = Sha256::digest(token).into();
         let encoded = URL_SAFE_NO_PAD.encode(token);
-        let mut current = self.current.lock().map_err(|_| CsrfError::Unavailable)?;
-        *current = Some(SessionRecord {
+        records.push(SessionRecord {
             binding,
             token_hash,
             issued_at: now_unix_seconds,
@@ -134,16 +151,23 @@ impl CsrfManager {
             .map_err(|_| CsrfError::Forbidden)?;
         let token: [u8; TOKEN_BYTES] = decoded.try_into().map_err(|_| CsrfError::Forbidden)?;
         let candidate_hash: [u8; 32] = Sha256::digest(token).into();
-        let current = self.current.lock().map_err(|_| CsrfError::Unavailable)?;
-        let record = current.as_ref().ok_or(CsrfError::Forbidden)?;
-        if record.binding != binding
-            || now_unix_seconds >= record.issued_at.saturating_add(MAX_SESSION_SECONDS)
-            || !bool::from(record.token_hash.ct_eq(&candidate_hash))
-        {
+        let mut records = self.records.lock().map_err(|_| CsrfError::Unavailable)?;
+        records.retain(|record| record_is_active(record, now_unix_seconds));
+        let mut valid = false;
+        for record in records.iter() {
+            let hash_matches = bool::from(record.token_hash.ct_eq(&candidate_hash));
+            valid |= hash_matches && record.binding == binding;
+        }
+        if !valid {
             return Err(CsrfError::Forbidden);
         }
         Ok(())
     }
+}
+
+fn record_is_active(record: &SessionRecord, now_unix_seconds: i64) -> bool {
+    now_unix_seconds < record.binding.exp
+        && now_unix_seconds < record.issued_at.saturating_add(MAX_SESSION_SECONDS)
 }
 
 fn authenticate(
