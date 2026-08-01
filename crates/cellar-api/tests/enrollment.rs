@@ -1,15 +1,22 @@
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use cellar_api::routes::session::{
-    ClaimRouteError, claim_owner, claim_status, require_json_content_type,
+    ClaimRouteError, claim_owner, claim_status, require_json_content_type, session_router,
 };
 use cellar_auth::{
     AccessClaims, ClaimRequest, CompareAndSet, EnrollmentError, EnrollmentMode, EnrollmentService,
     EnrollmentSnapshot, EnrollmentStore, EnrollmentStoreError, FileEnrollmentStore, RouteAccess,
+    route_access,
 };
 use cellar_config::{BootstrapClaim, CellarConfig, PersistedConfig, load_config, save_config};
+use http_body_util::BodyExt;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use tower::ServiceExt;
 
 const NOW: i64 = 10_000;
 const ORIGIN: &str = "https://cellar.example";
@@ -106,6 +113,18 @@ fn enrollment_errors_have_stable_http_mappings() {
         claim_status(&EnrollmentError::Unavailable),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    assert_eq!(
+        ClaimRouteError::UnsupportedMediaType.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    assert_eq!(
+        ClaimRouteError::Enrollment(EnrollmentError::Conflict).status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        format!("{:?}", ClaimRouteError::Forbidden),
+        "claim_forbidden"
+    );
 }
 
 #[test]
@@ -126,14 +145,27 @@ fn claim_accepts_exactly_one_json_content_type() {
 fn unenrolled_route_policy_exposes_only_claim() {
     let service = EnrollmentService::new(Arc::new(MemoryStore::unenrolled()));
     assert_eq!(
-        service.route_access("/owner/claim", &claims()).unwrap(),
-        RouteAccess::OwnerClaim
+        route_access(EnrollmentMode::Unenrolled, "/owner/claim"),
+        RouteAccess::ClaimOnly
     );
     assert_eq!(
-        service
-            .route_access("/api/v1/files", &claims())
-            .unwrap_err(),
-        EnrollmentError::Unavailable
+        route_access(EnrollmentMode::Unenrolled, "/api/v1/files"),
+        RouteAccess::Deny
+    );
+    service
+        .authorize(RouteAccess::ClaimOnly, &claims())
+        .unwrap();
+}
+
+#[test]
+fn pure_route_policy_has_exact_enrollment_mapping() {
+    assert_eq!(
+        route_access(EnrollmentMode::Enrolled, "/owner/claim"),
+        RouteAccess::NotFound
+    );
+    assert_eq!(
+        route_access(EnrollmentMode::Enrolled, "/api/v1/files"),
+        RouteAccess::OwnerOnly
     );
 }
 
@@ -147,13 +179,17 @@ fn successful_claim_enrolls_exact_subject_and_disables_claim() {
         EnrollmentMode::Enrolled
     );
     assert_eq!(
-        service.route_access("/owner/claim", &claims()).unwrap_err(),
+        service
+            .authorize(
+                route_access(service.mode().unwrap(), "/owner/claim"),
+                &claims(),
+            )
+            .unwrap_err(),
         EnrollmentError::NotFound
     );
-    assert_eq!(
-        service.route_access("/api/v1/files", &claims()).unwrap(),
-        RouteAccess::Authenticated
-    );
+    service
+        .authorize(RouteAccess::OwnerOnly, &claims())
+        .unwrap();
 }
 
 #[test]
@@ -245,7 +281,9 @@ fn enrolled_routes_require_the_immutable_subject() {
     let mut other = claims();
     other.sub = "someone-else".into();
     assert_eq!(
-        service.route_access("/api/v1/files", &other).unwrap_err(),
+        service
+            .authorize(RouteAccess::OwnerOnly, &other)
+            .unwrap_err(),
         EnrollmentError::Forbidden
     );
 }
@@ -361,4 +399,103 @@ fn independent_file_adapters_still_allow_exactly_one_claim_winner() {
         .map(|handle| handle.join().unwrap())
         .collect();
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+}
+
+fn http_request(method: &str, uri: &str, body: Body, authenticated: bool) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(body)
+        .unwrap();
+    if authenticated {
+        request.extensions_mut().insert(claims());
+    }
+    request
+}
+
+#[tokio::test]
+async fn http_claim_requires_auth_and_is_the_csrf_exemption_then_disappears() {
+    let service = EnrollmentService::new(Arc::new(MemoryStore::unenrolled()));
+    let app = session_router(service, Arc::new(cellar_auth::CsrfManager::new()), || NOW);
+    let code = URL_SAFE_NO_PAD.encode(CODE);
+    let body = || Body::from(format!(r#"{{"email":"{EMAIL}","claim_code":"{code}"}}"#));
+
+    let mut missing_auth = http_request("POST", "/owner/claim", body(), false);
+    missing_auth
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    missing_auth
+        .headers_mut()
+        .insert(header::ORIGIN, ORIGIN.parse().unwrap());
+    let response = app.clone().oneshot(missing_auth).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+    let error: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        error,
+        serde_json::json!({"error": "missing_authentication"})
+    );
+
+    let mut claim = http_request("POST", "/owner/claim", body(), true);
+    claim
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    claim
+        .headers_mut()
+        .insert(header::ORIGIN, ORIGIN.parse().unwrap());
+    assert_eq!(
+        app.clone().oneshot(claim).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let mut reused = http_request("POST", "/owner/claim", body(), true);
+    reused
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    reused
+        .headers_mut()
+        .insert(header::ORIGIN, ORIGIN.parse().unwrap());
+    let response = app.oneshot(reused).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(error, serde_json::json!({"error": "claim_not_found"}));
+}
+
+#[tokio::test]
+async fn http_claim_rejects_duplicate_origin_and_unenrolled_non_claim_routes() {
+    let service = EnrollmentService::new(Arc::new(MemoryStore::unenrolled()));
+    let app = session_router(service, Arc::new(cellar_auth::CsrfManager::new()), || NOW);
+    let code = URL_SAFE_NO_PAD.encode(CODE);
+    let mut claim = http_request(
+        "POST",
+        "/owner/claim",
+        Body::from(format!(r#"{{"email":"{EMAIL}","claim_code":"{code}"}}"#)),
+        true,
+    );
+    claim
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    claim
+        .headers_mut()
+        .append(header::ORIGIN, ORIGIN.parse().unwrap());
+    claim
+        .headers_mut()
+        .append(header::ORIGIN, ORIGIN.parse().unwrap());
+    assert_eq!(
+        app.clone().oneshot(claim).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let request = http_request("GET", "/api/v1/files", Body::empty(), true);
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }

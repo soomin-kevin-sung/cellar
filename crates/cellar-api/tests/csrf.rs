@@ -1,8 +1,19 @@
-use axum::http::StatusCode;
-use cellar_api::routes::session::{SessionRouteError, csrf_status, get_session};
-use cellar_auth::{AccessClaims, CsrfError, CsrfManager, MutationHeaders};
+use axum::Router;
+use axum::body::Body;
+use axum::http::{HeaderName, Request, StatusCode, header};
+use axum::routing::any;
+use cellar_api::routes::session::{
+    SessionRouteError, csrf_status, get_session, session_router_with_routes,
+};
+use cellar_auth::{
+    AccessClaims, CompareAndSet, CsrfError, CsrfManager, EnrollmentService, EnrollmentSnapshot,
+    EnrollmentStore, EnrollmentStoreError, MutationHeaders,
+};
+use http_body_util::BodyExt;
+use serde_json::Value;
 use std::sync::{Arc, Barrier};
 use std::thread;
+use tower::ServiceExt;
 
 const NOW: i64 = 50_000;
 const ORIGIN: &str = "https://cellar.example";
@@ -39,6 +50,15 @@ fn csrf_errors_have_stable_http_mappings() {
     assert_eq!(
         csrf_status(&CsrfError::Unavailable),
         StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        SessionRouteError::Csrf(CsrfError::Unauthenticated).status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(SessionRouteError::NotFound.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        format!("{:?}", SessionRouteError::Csrf(CsrfError::Forbidden)),
+        "csrf_forbidden"
     );
 }
 
@@ -291,4 +311,250 @@ fn session_route_issues_only_for_authenticated_get() {
         get_session("GET", &manager, &other, SUBJECT, NOW).unwrap_err(),
         SessionRouteError::Csrf(CsrfError::Unauthenticated)
     );
+}
+
+struct EnrolledStore;
+
+impl EnrollmentStore for EnrolledStore {
+    fn load(&self) -> Result<EnrollmentSnapshot, EnrollmentStoreError> {
+        Ok(EnrollmentSnapshot::enrolled(ORIGIN, SUBJECT))
+    }
+
+    fn compare_and_set_owner(
+        &self,
+        _: &EnrollmentSnapshot,
+        _: &str,
+    ) -> Result<CompareAndSet, EnrollmentStoreError> {
+        Ok(CompareAndSet::Changed)
+    }
+}
+
+fn http_request(
+    method: &str,
+    uri: &str,
+    authenticated_claims: Option<AccessClaims>,
+) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    if let Some(claims) = authenticated_claims {
+        request.extensions_mut().insert(claims);
+    }
+    request
+}
+
+async fn issued_token(app: &axum::Router, claims: AccessClaims) -> String {
+    let response = app
+        .clone()
+        .oneshot(http_request("GET", "/api/v1/session", Some(claims)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice::<Value>(&body).unwrap()["csrf_token"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn enrolled_app() -> axum::Router {
+    let protected = Router::new().route("/api/v1/files", any(|| async { StatusCode::NO_CONTENT }));
+    session_router_with_routes(
+        EnrollmentService::new(Arc::new(EnrolledStore)),
+        Arc::new(CsrfManager::new()),
+        || NOW + 10,
+        protected,
+    )
+}
+
+fn add_mutation_headers(request: &mut Request<Body>, token: &str) {
+    request
+        .headers_mut()
+        .insert(header::ORIGIN, ORIGIN.parse().unwrap());
+    request.headers_mut().insert(
+        HeaderName::from_static("x-cellar-csrf"),
+        token.parse().unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn http_session_and_mutations_fail_closed_without_auth_or_csrf() {
+    let app = enrolled_app();
+    for (method, uri) in [("GET", "/api/v1/session"), ("POST", "/api/v1/files")] {
+        let response = app
+            .clone()
+            .oneshot(http_request(method, uri, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({"error": "missing_authentication"})
+        );
+    }
+    let response = app
+        .oneshot(http_request("POST", "/api/v1/files", Some(claims())))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn http_mutation_rejects_duplicate_wrong_and_cross_site_headers() {
+    let app = enrolled_app();
+    let token = issued_token(&app, claims()).await;
+
+    for duplicate_origin in [true, false] {
+        let mut duplicate = http_request("POST", "/api/v1/files", Some(claims()));
+        duplicate
+            .headers_mut()
+            .append(header::ORIGIN, ORIGIN.parse().unwrap());
+        if duplicate_origin {
+            duplicate
+                .headers_mut()
+                .append(header::ORIGIN, ORIGIN.parse().unwrap());
+        }
+        duplicate.headers_mut().append(
+            HeaderName::from_static("x-cellar-csrf"),
+            token.parse().unwrap(),
+        );
+        if !duplicate_origin {
+            duplicate.headers_mut().append(
+                HeaderName::from_static("x-cellar-csrf"),
+                token.parse().unwrap(),
+            );
+        }
+        assert_eq!(
+            app.clone().oneshot(duplicate).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    for (origin, candidate, fetch_site) in [
+        (ORIGIN, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", None),
+        ("https://evil.example", token.as_str(), Some("cross-site")),
+    ] {
+        let mut request = http_request("DELETE", "/api/v1/files", Some(claims()));
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, origin.parse().unwrap());
+        request.headers_mut().insert(
+            HeaderName::from_static("x-cellar-csrf"),
+            candidate.parse().unwrap(),
+        );
+        if let Some(value) = fetch_site {
+            request.headers_mut().insert(
+                HeaderName::from_static("sec-fetch-site"),
+                value.parse().unwrap(),
+            );
+        }
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_csrf_binding_rejects_both_iat_and_exp_changes() {
+    let app = enrolled_app();
+    let token = issued_token(&app, claims()).await;
+    let mut changed_iat = claims();
+    changed_iat.iat += 1;
+    let mut changed_exp = claims();
+    changed_exp.exp += 1;
+    for changed in [changed_iat, changed_exp] {
+        let mut request = http_request("PATCH", "/api/v1/files", Some(changed));
+        add_mutation_headers(&mut request, &token);
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_safe_methods_require_owner_but_not_csrf_and_emit_no_cors() {
+    let app = enrolled_app();
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let response = app
+            .clone()
+            .oneshot(http_request(method, "/api/v1/files", Some(claims())))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+    let mut other = claims();
+    other.sub = "other".into();
+    assert_eq!(
+        app.oneshot(http_request("GET", "/api/v1/files", Some(other)))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn http_valid_csrf_reaches_protected_mutation_handler() {
+    let app = enrolled_app();
+    let token = issued_token(&app, claims()).await;
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let mut request = http_request(method, "/api/v1/files", Some(claims()));
+        add_mutation_headers(&mut request, &token);
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_custom_unsafe_method_cannot_bypass_csrf() {
+    let app = enrolled_app();
+    let request = http_request("MKCOL", "/api/v1/files", Some(claims()));
+    assert_eq!(
+        app.oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn malformed_or_unknown_fetch_site_values_fail_closed() {
+    let manager = CsrfManager::new();
+    let token = manager.issue(&claims(), SUBJECT, NOW).unwrap();
+    for value in [b"".as_slice(), b"unknown", b"cross-site, same-origin"] {
+        assert_eq!(
+            manager
+                .validate_mutation(
+                    "POST",
+                    MutationHeaders {
+                        origins: vec![ORIGIN.as_bytes()],
+                        csrf_tokens: vec![token.as_bytes()],
+                        sec_fetch_site: vec![value],
+                    },
+                    &claims(),
+                    SUBJECT,
+                    ORIGIN,
+                    NOW,
+                )
+                .unwrap_err(),
+            CsrfError::Forbidden
+        );
+    }
 }

@@ -115,14 +115,15 @@ impl CsrfManager {
             return Ok(());
         }
         let binding = authenticate(claims, owner_subject, now_unix_seconds)?;
+        let fetch_site_is_valid = match headers.sec_fetch_site.as_slice() {
+            [] => true,
+            [value] => matches!(*value, b"same-origin" | b"same-site" | b"none"),
+            _ => false,
+        };
         if headers.origins.len() != 1
             || headers.origins[0] != canonical_origin.as_bytes()
             || headers.csrf_tokens.len() != 1
-            || headers.sec_fetch_site.len() > 1
-            || headers
-                .sec_fetch_site
-                .first()
-                .is_some_and(|value| *value == b"cross-site")
+            || !fetch_site_is_valid
         {
             return Err(CsrfError::Forbidden);
         }

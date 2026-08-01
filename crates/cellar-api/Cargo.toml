@@ -8,10 +8,14 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
+base64 = "=0.22.1"
 cellar-auth = { path = "../cellar-auth" }
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 cellar-config = { path = "../cellar-config" }
+http-body-util = "=0.1.4"
 tempfile = "=3.27.0"
 tokio.workspace = true
+tower = { version = "=0.5.3", features = ["util"] }

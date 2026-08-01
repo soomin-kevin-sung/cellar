@@ -17,8 +17,50 @@ pub enum EnrollmentMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RouteAccess {
-    OwnerClaim,
-    Authenticated,
+    ClaimOnly,
+    Deny,
+    NotFound,
+    OwnerOnly,
+}
+
+pub struct Authorization {
+    canonical_origin: String,
+    owner_subject: Option<String>,
+}
+
+impl Authorization {
+    #[must_use]
+    pub fn canonical_origin(&self) -> &str {
+        &self.canonical_origin
+    }
+
+    #[must_use]
+    pub fn owner_subject(&self) -> Option<&str> {
+        self.owner_subject.as_deref()
+    }
+}
+
+impl fmt::Debug for Authorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Authorization")
+            .field("canonical_origin", &self.canonical_origin)
+            .field(
+                "owner_subject",
+                &self.owner_subject.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[must_use]
+pub fn route_access(mode: EnrollmentMode, path: &str) -> RouteAccess {
+    match (mode, path) {
+        (EnrollmentMode::Unenrolled, "/owner/claim") => RouteAccess::ClaimOnly,
+        (EnrollmentMode::Unenrolled, _) => RouteAccess::Deny,
+        (EnrollmentMode::Enrolled, "/owner/claim") => RouteAccess::NotFound,
+        (EnrollmentMode::Enrolled, _) => RouteAccess::OwnerOnly,
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -308,29 +350,42 @@ impl<S: EnrollmentStore> EnrollmentService<S> {
         Self { store }
     }
 
-    pub fn route_access(
+    pub fn mode(&self) -> Result<EnrollmentMode, EnrollmentError> {
+        self.store
+            .load()
+            .map(|state| state.mode())
+            .map_err(|_| EnrollmentError::Unavailable)
+    }
+
+    pub fn authorize(
         &self,
-        path: &str,
+        access: RouteAccess,
         claims: &AccessClaims,
-    ) -> Result<RouteAccess, EnrollmentError> {
+    ) -> Result<Authorization, EnrollmentError> {
         valid_subject(claims)?;
         let state = self
             .store
             .load()
             .map_err(|_| EnrollmentError::Unavailable)?;
-        match state.mode() {
-            EnrollmentMode::Unenrolled if path == "/owner/claim" => {
+        match access {
+            RouteAccess::ClaimOnly => {
                 if claims.email.as_deref() == state.bootstrap_email.as_deref() {
-                    Ok(RouteAccess::OwnerClaim)
+                    Ok(Authorization {
+                        canonical_origin: state.canonical_origin,
+                        owner_subject: None,
+                    })
                 } else {
                     Err(EnrollmentError::Forbidden)
                 }
             }
-            EnrollmentMode::Unenrolled => Err(EnrollmentError::Unavailable),
-            EnrollmentMode::Enrolled if path == "/owner/claim" => Err(EnrollmentError::NotFound),
-            EnrollmentMode::Enrolled => {
+            RouteAccess::Deny => Err(EnrollmentError::Unavailable),
+            RouteAccess::NotFound => Err(EnrollmentError::NotFound),
+            RouteAccess::OwnerOnly => {
                 if state.owner_subject.as_deref() == Some(claims.sub.as_str()) {
-                    Ok(RouteAccess::Authenticated)
+                    Ok(Authorization {
+                        canonical_origin: state.canonical_origin,
+                        owner_subject: state.owner_subject,
+                    })
                 } else {
                     Err(EnrollmentError::Forbidden)
                 }
