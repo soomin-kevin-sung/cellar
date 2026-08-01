@@ -324,8 +324,8 @@ mod platform {
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
         FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW,
         GetFileInformationByHandle, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         GetVolumePathNameW, SetFileInformationByHandle, WRITE_DAC,
     };
@@ -368,7 +368,7 @@ mod platform {
                 fs::create_dir(root).map_err(map_io)?;
             }
             let file = OpenOptions::new()
-                .read(true)
+                .access_mode(FILE_LIST_DIRECTORY)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(root)
@@ -388,8 +388,7 @@ mod platform {
             let is_reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
             // Do not enumerate through a reparse root. Validation rejects it
             // using the attributes obtained from the non-following handle.
-            let empty =
-                is_directory && !is_reparse && fs::read_dir(root).map_err(map_io)?.next().is_none();
+            let empty = is_directory && !is_reparse && retained_directory_is_empty(&file)?;
             let coordinates = StorageCoordinates {
                 volume_serial: u64::from(information.dwVolumeSerialNumber),
                 root_file_id: (u128::from(information.nFileIndexHigh) << 32)
@@ -572,6 +571,128 @@ mod platform {
             length: u32,
             file_information_class: u32,
         ) -> i32;
+        fn NtQueryDirectoryFile(
+            file_handle: *mut core::ffi::c_void,
+            event: *mut core::ffi::c_void,
+            apc_routine: *mut core::ffi::c_void,
+            apc_context: *mut core::ffi::c_void,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut core::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+            return_single_entry: bool,
+            file_name: *mut core::ffi::c_void,
+            restart_scan: bool,
+        ) -> i32;
+    }
+
+    pub(super) fn retained_directory_is_empty(root: &File) -> Result<bool, AdapterError> {
+        const STATUS_SUCCESS: i32 = 0;
+        const STATUS_NO_MORE_FILES: i32 = 0x8000_0006_u32 as i32;
+        const FILE_NAMES_INFORMATION: u32 = 12;
+        const BUFFER_BYTES: usize = 64 * 1024;
+
+        // `u64` backing storage guarantees the alignment required for the
+        // variable-length FILE_NAMES_INFORMATION records returned by NTFS.
+        let mut storage = vec![0_u64; BUFFER_BYTES / size_of::<u64>()];
+        let mut restart_scan = true;
+        loop {
+            let mut status_block = IoStatusBlock {
+                status_or_pointer: 0,
+                information: 0,
+            };
+            // SAFETY: `root` retains the directory object opened with
+            // FILE_LIST_DIRECTORY. The aligned output buffer and status block
+            // remain live for this synchronous query; all optional pointers
+            // are null and no pathname is resolved.
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    root.as_raw_handle(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut status_block,
+                    storage.as_mut_ptr().cast(),
+                    BUFFER_BYTES as u32,
+                    FILE_NAMES_INFORMATION,
+                    false,
+                    ptr::null_mut(),
+                    restart_scan,
+                )
+            };
+            restart_scan = false;
+            if status == STATUS_NO_MORE_FILES {
+                return Ok(true);
+            }
+            if status != STATUS_SUCCESS {
+                return Err(AdapterError::io());
+            }
+            let returned = status_block.information;
+            if returned == 0 || returned > BUFFER_BYTES {
+                return Err(AdapterError::io());
+            }
+            // SAFETY: `returned` was range-checked against the initialized
+            // output allocation and is used only for byte-level validation.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), returned) };
+            if records_contain_non_dot_entry(bytes)? {
+                return Ok(false);
+            }
+        }
+    }
+
+    pub(super) fn records_contain_non_dot_entry(bytes: &[u8]) -> Result<bool, AdapterError> {
+        const HEADER_BYTES: usize = 3 * size_of::<u32>();
+        let mut record_offset = 0_usize;
+        let mut found_non_dot = false;
+        loop {
+            if !record_offset.is_multiple_of(size_of::<u32>()) {
+                return Err(AdapterError::io());
+            }
+            let header_end = record_offset
+                .checked_add(HEADER_BYTES)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(AdapterError::io)?;
+            let next_offset = read_u32(bytes, record_offset)? as usize;
+            let name_length = read_u32(bytes, record_offset + 2 * size_of::<u32>())? as usize;
+            if name_length == 0 || !name_length.is_multiple_of(size_of::<u16>()) {
+                return Err(AdapterError::io());
+            }
+            let name_end = header_end
+                .checked_add(name_length)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(AdapterError::io)?;
+            let name = &bytes[header_end..name_end];
+            if name != b".\0" && name != b".\0.\0" {
+                found_non_dot = true;
+            }
+            if next_offset == 0 {
+                return if name_end == bytes.len() {
+                    Ok(found_non_dot)
+                } else {
+                    Err(AdapterError::io())
+                };
+            }
+            if !next_offset.is_multiple_of(size_of::<u32>())
+                || next_offset < HEADER_BYTES + name_length
+            {
+                return Err(AdapterError::io());
+            }
+            record_offset = record_offset
+                .checked_add(next_offset)
+                .filter(|offset| *offset < bytes.len())
+                .ok_or_else(AdapterError::io)?;
+        }
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, AdapterError> {
+        let end = offset
+            .checked_add(size_of::<u32>())
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(AdapterError::io)?;
+        let mut value = [0_u8; size_of::<u32>()];
+        value.copy_from_slice(&bytes[offset..end]);
+        Ok(u32::from_ne_bytes(value))
     }
 
     fn map_ntstatus(status: i32) -> AdapterError {
@@ -784,9 +905,15 @@ mod windows_tests {
     use std::sync::Arc;
 
     use tempfile::tempdir;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    use super::platform::{TrustedRootHandle, WindowsPreflight};
+    use super::platform::{
+        TrustedRootHandle, WindowsPreflight, records_contain_non_dot_entry,
+        retained_directory_is_empty,
+    };
     use super::{PreflightAdapter, ProbeName};
 
     #[test]
@@ -840,5 +967,48 @@ mod windows_tests {
         WindowsPreflight.delete_owned(probe).unwrap();
         assert!(!retained.join(destination.as_str()).exists());
         assert!(!configured.join(destination.as_str()).exists());
+    }
+
+    #[test]
+    fn retained_root_emptiness_cannot_be_redirected_by_path_swap() {
+        let parent = tempdir().unwrap();
+        let configured = parent.path().join("configured");
+        let retained = parent.path().join("retained");
+        std::fs::create_dir(&configured).unwrap();
+        std::fs::write(configured.join("existing-data"), b"must be detected").unwrap();
+        let root = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&configured)
+            .unwrap();
+
+        std::fs::rename(&configured, &retained).unwrap();
+        std::fs::create_dir(&configured).unwrap();
+
+        assert!(!retained_directory_is_empty(&root).unwrap());
+        assert!(configured.read_dir().unwrap().next().is_none());
+        assert!(retained.join("existing-data").exists());
+    }
+
+    #[test]
+    fn names_records_accept_a_valid_four_byte_aligned_chain() {
+        let mut bytes = vec![0_u8; 34];
+        bytes[0..4].copy_from_slice(&20_u32.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&6_u32.to_ne_bytes());
+        bytes[12..18].copy_from_slice(b"a\0b\0c\0");
+        bytes[28..32].copy_from_slice(&2_u32.to_ne_bytes());
+        bytes[32..34].copy_from_slice(b"x\0");
+
+        assert!(records_contain_non_dot_entry(&bytes).unwrap());
+    }
+
+    #[test]
+    fn names_records_reject_trailing_bytes_after_the_terminal_record() {
+        let mut bytes = vec![0_u8; 15];
+        bytes[8..12].copy_from_slice(&2_u32.to_ne_bytes());
+        bytes[12..14].copy_from_slice(b".\0");
+
+        assert!(records_contain_non_dot_entry(&bytes).is_err());
     }
 }

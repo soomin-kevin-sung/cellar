@@ -277,10 +277,7 @@ impl JsonLogger {
             self.rotate()?;
         }
         let file = self.file.as_mut().ok_or(LogError::WriteFailed)?;
-        file.write_all(&line).map_err(|_| LogError::WriteFailed)?;
-        file.flush().map_err(|_| LogError::WriteFailed)?;
-        self.bytes = self.bytes.saturating_add(line_len);
-        Ok(())
+        write_counted(file, &line, &mut self.bytes)
     }
 
     fn rotate(&mut self) -> Result<(), LogError> {
@@ -305,6 +302,26 @@ impl JsonLogger {
         self.bytes = 0;
         Ok(())
     }
+}
+
+fn write_counted(
+    writer: &mut impl Write,
+    mut bytes: &[u8],
+    written_total: &mut u64,
+) -> Result<(), LogError> {
+    while !bytes.is_empty() {
+        match writer.write(bytes) {
+            Ok(0) => return Err(LogError::WriteFailed),
+            Ok(written) if written <= bytes.len() => {
+                *written_total = written_total.saturating_add(written as u64);
+                bytes = &bytes[written..];
+            }
+            Ok(_) => return Err(LogError::WriteFailed),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(LogError::WriteFailed),
+        }
+    }
+    writer.flush().map_err(|_| LogError::WriteFailed)
 }
 
 fn open_append(path: &Path) -> Result<File, LogError> {
@@ -491,3 +508,73 @@ impl fmt::Display for EventLogError {
 }
 
 impl std::error::Error for EventLogError {}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+
+    use super::*;
+
+    struct PartialThenFail {
+        first_write: usize,
+        writes: usize,
+    }
+
+    impl Write for PartialThenFail {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                Ok(self.first_write.min(buffer.len()))
+            } else {
+                Err(io::Error::other("injected write failure"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFail;
+
+    impl Write for FlushFail {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("injected flush failure"))
+        }
+    }
+
+    #[test]
+    fn partial_write_failure_counts_bytes_for_next_rotation() {
+        let mut writer = PartialThenFail {
+            first_write: 3,
+            writes: 0,
+        };
+        let mut bytes = 10_u64;
+
+        assert_eq!(
+            write_counted(&mut writer, b"12345678", &mut bytes).unwrap_err(),
+            LogError::WriteFailed
+        );
+
+        assert_eq!(bytes, 13);
+        assert!(bytes.saturating_add(4) > 16);
+    }
+
+    #[test]
+    fn flush_failure_counts_written_bytes_for_next_rotation() {
+        let mut writer = FlushFail;
+        let mut bytes = 10_u64;
+
+        assert_eq!(
+            write_counted(&mut writer, b"123456", &mut bytes).unwrap_err(),
+            LogError::WriteFailed
+        );
+
+        assert_eq!(bytes, 16);
+        assert!(bytes.saturating_add(1) > 16);
+    }
+}

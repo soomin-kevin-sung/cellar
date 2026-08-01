@@ -144,6 +144,18 @@ fn finish_status(
     }
 }
 
+fn run_guarded(
+    reporter: &impl StatusReporter,
+    status_failed: &AtomicBool,
+    runner: impl FnOnce() -> Result<(), ServiceError>,
+    cleanup: impl FnOnce(),
+) -> Result<(), ServiceError> {
+    let runner_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(runner))
+        .unwrap_or(Err(ServiceError::HostFailed));
+    cleanup();
+    finish_status(reporter, status_failed, runner_result)
+}
+
 #[cfg(not(windows))]
 pub fn run_service_host(
     _runner: impl FnOnce(Receiver<ServiceControl>) -> Result<(), ServiceError> + Send + 'static,
@@ -258,8 +270,7 @@ mod windows_host {
     };
 
     use super::{
-        PRESHUTDOWN_BUDGET, ScmStatus, ServiceControl, ServiceError, StatusReporter, finish_status,
-        record_status,
+        PRESHUTDOWN_BUDGET, ScmStatus, ServiceControl, ServiceError, StatusReporter, record_status,
     };
 
     type Runner = Box<dyn FnOnce(Receiver<ServiceControl>) -> Result<(), ServiceError> + Send>;
@@ -341,17 +352,23 @@ mod windows_host {
             .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
-        let result = RUNNER
+        let runner = RUNNER
             .get()
             .and_then(|slot| slot.lock().ok())
             .and_then(|mut runner| runner.take())
-            .ok_or(ServiceError::HostFailed)
-            .and_then(|runner| runner(receiver));
-        CONTROL
-            .get()
-            .and_then(|slot| slot.lock().ok())
-            .and_then(|mut sender| sender.take());
-        store_result(finish_status(&reporter, &STATUS_FAILED, result));
+            .ok_or(ServiceError::HostFailed);
+        let result = super::run_guarded(
+            &reporter,
+            &STATUS_FAILED,
+            move || runner.and_then(|runner| runner(receiver)),
+            || {
+                CONTROL
+                    .get()
+                    .and_then(|slot| slot.lock().ok())
+                    .and_then(|mut sender| sender.take());
+            },
+        );
+        store_result(result);
         STATUS.store(ptr::null_mut(), Ordering::Release);
     }
 
@@ -411,6 +428,9 @@ mod windows_host {
             ScmStatus::StartPending => (
                 SERVICE_START_PENDING,
                 0,
+                // Installed-SCM acceptance must verify startup completes
+                // within this static wait hint; no checkpoint timer is owned
+                // by this foundation layer.
                 PRESHUTDOWN_BUDGET.as_millis() as u32,
                 false,
             ),
@@ -460,7 +480,7 @@ mod windows_host {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
 
@@ -536,6 +556,30 @@ mod tests {
                 .unwrap_err()
                 .code(),
             "service_status_failed"
+        );
+    }
+
+    #[test]
+    fn runner_panic_cleans_up_and_attempts_failed_stopped_status() {
+        let reporter = FakeReporter {
+            fail_on: ScmStatus::StartPending,
+            seen: Mutex::new(Vec::new()),
+        };
+        let failed = AtomicBool::new(false);
+        let cleaned_up = AtomicBool::new(false);
+
+        let result = run_guarded(
+            &reporter,
+            &failed,
+            || -> Result<(), ServiceError> { panic!("runner panic") },
+            || cleaned_up.store(true, Ordering::Release),
+        );
+
+        assert_eq!(result.unwrap_err().code(), "service_host_failed");
+        assert!(cleaned_up.load(Ordering::Acquire));
+        assert_eq!(
+            *reporter.seen.lock().unwrap(),
+            [ScmStatus::Stopped { failed: true }]
         );
     }
 }
