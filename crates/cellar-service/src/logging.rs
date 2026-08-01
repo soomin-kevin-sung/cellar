@@ -45,13 +45,12 @@ impl SanitizedContext {
     }
 
     pub fn insert(&mut self, key: ContextKey, value: &str) -> Result<(), ContextError> {
-        if is_sensitive(value) {
+        let trimmed = value.trim();
+        let bounded = truncate_utf8(trimmed, MAX_CONTEXT_VALUE_BYTES);
+        if is_sensitive(trimmed) || !is_allowed_value(key, &bounded) {
             return Err(ContextError);
         }
-        self.0.insert(
-            key.as_str(),
-            truncate_utf8(value.trim(), MAX_CONTEXT_VALUE_BYTES),
-        );
+        self.0.insert(key.as_str(), bounded);
         Ok(())
     }
 
@@ -110,8 +109,28 @@ fn is_sensitive(value: &str) -> bool {
         || lower.contains("token")
         || lower.contains("password")
         || lower.contains("credential")
+        || lower.contains("secret")
+        || lower.contains("claim")
+        || lower.contains("request_body")
+        || lower.contains("request body")
+        || lower.contains("tunnel")
         || trimmed.chars().any(char::is_control)
         || looks_like_jwt(trimmed)
+}
+
+fn is_allowed_value(key: ContextKey, value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    match key {
+        ContextKey::Attempt => value.bytes().all(|byte| byte.is_ascii_digit()),
+        ContextKey::Component
+        | ContextKey::State
+        | ContextKey::ErrorCode
+        | ContextKey::Listener => value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')),
+    }
 }
 
 fn looks_like_jwt(value: &str) -> bool {

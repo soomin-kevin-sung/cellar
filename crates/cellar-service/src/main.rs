@@ -7,7 +7,6 @@ use cellar_service::logging::{
     FatalEvent, JsonLogger, LogEvent, LogLevel, RotationPolicy, SanitizedContext, WindowsEventLog,
 };
 use cellar_service::tls::OriginTlsPaths;
-#[cfg(not(windows))]
 use cellar_windows::service::ServiceControl;
 #[cfg(windows)]
 use cellar_windows::service::ServiceError;
@@ -26,6 +25,27 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 fn platform_main() -> Result<(), &'static str> {
+    dispatch_windows_entry(std::env::args_os().skip(1), run_service, run_console)
+}
+
+#[cfg(windows)]
+fn dispatch_windows_entry<I, S>(
+    arguments: I,
+    run_selected_service: impl FnOnce() -> Result<(), &'static str>,
+    run_selected_console: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    match cellar_windows::service::select_entry_mode(arguments).map_err(|error| error.code())? {
+        cellar_windows::service::EntryMode::Service => run_selected_service(),
+        cellar_windows::service::EntryMode::Console => run_selected_console(),
+    }
+}
+
+#[cfg(windows)]
+fn run_service() -> Result<(), &'static str> {
     cellar_windows::service::run_service_host(|receiver| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -39,7 +59,10 @@ fn platform_main() -> Result<(), &'static str> {
             }
         });
         runtime
-            .block_on(run_main(shutdown))
+            .block_on(run_main(
+                shutdown,
+                startup_callback_for_entry(cellar_windows::service::EntryMode::Service),
+            ))
             .map_err(|_| ServiceError::HostFailed)
     })
     .map_err(|error| error.code())
@@ -47,6 +70,14 @@ fn platform_main() -> Result<(), &'static str> {
 
 #[cfg(not(windows))]
 fn platform_main() -> Result<(), &'static str> {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if !arguments.is_empty() && !(arguments.len() == 1 && arguments[0] == "--console") {
+        return Err("service_mode_invalid");
+    }
+    run_console()
+}
+
+fn run_console() -> Result<(), &'static str> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -58,10 +89,16 @@ fn platform_main() -> Result<(), &'static str> {
             control.signal(ServiceControl::Stop);
         }
     });
-    runtime.block_on(run_main(shutdown))
+    runtime.block_on(run_main(
+        shutdown,
+        startup_callback_for_entry(cellar_windows::service::EntryMode::Console),
+    ))
 }
 
-async fn run_main(shutdown: Shutdown) -> Result<(), &'static str> {
+async fn run_main(
+    shutdown: Shutdown,
+    on_started: Option<cellar_service::app::StartedCallback>,
+) -> Result<(), &'static str> {
     let state_directory = program_data_directory()?.join("Cellar");
     let config_path = state_directory.join("config.toml");
     let mut logger = JsonLogger::new(&state_directory.join("logs"), RotationPolicy::default())
@@ -80,7 +117,7 @@ async fn run_main(shutdown: Shutdown) -> Result<(), &'static str> {
         database_path: state_directory.join("cellar.db"),
         tls_paths: tls_paths(&state_directory),
         startup_gates: None,
-        on_started: service_started_callback(),
+        on_started,
         shutdown,
     })
     .await;
@@ -112,16 +149,17 @@ fn tls_paths(state_directory: &Path) -> OriginTlsPaths {
     }
 }
 
-#[cfg(windows)]
-fn service_started_callback() -> Option<cellar_service::app::StartedCallback> {
-    Some(Box::new(|| {
-        cellar_windows::service::mark_service_running()
-            .map_err(|_| cellar_service::app::ListenerError::ServeFailed)
-    }))
-}
-
-#[cfg(not(windows))]
-fn service_started_callback() -> Option<cellar_service::app::StartedCallback> {
+fn startup_callback_for_entry(
+    mode: cellar_windows::service::EntryMode,
+) -> Option<cellar_service::app::StartedCallback> {
+    #[cfg(windows)]
+    if mode == cellar_windows::service::EntryMode::Service {
+        return Some(Box::new(|| {
+            cellar_windows::service::mark_service_running()
+                .map_err(|_| cellar_service::app::ListenerError::ServeFailed)
+        }));
+    }
+    let _ = mode;
     None
 }
 
@@ -162,4 +200,43 @@ fn program_data_directory() -> Result<PathBuf, &'static str> {
 #[cfg(not(windows))]
 fn program_data_directory() -> Result<PathBuf, &'static str> {
     Err("startup_platform_unsupported")
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::cell::Cell;
+
+    use super::{dispatch_windows_entry, startup_callback_for_entry};
+    use cellar_windows::service::EntryMode;
+
+    #[test]
+    fn windows_entry_wires_console_only_when_explicitly_selected() {
+        let service_calls = Cell::new(0);
+        let console_calls = Cell::new(0);
+        dispatch_windows_entry(
+            ["--console"],
+            || {
+                service_calls.set(service_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                console_calls.set(console_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(service_calls.get(), 0);
+        assert_eq!(console_calls.get(), 1);
+
+        assert_eq!(
+            dispatch_windows_entry(["--bad"], || Ok(()), || Ok(())).unwrap_err(),
+            "service_mode_invalid"
+        );
+    }
+
+    #[test]
+    fn console_entry_never_receives_an_scm_started_callback() {
+        assert!(startup_callback_for_entry(EntryMode::Console).is_none());
+        assert!(startup_callback_for_entry(EntryMode::Service).is_some());
+    }
 }

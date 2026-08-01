@@ -418,14 +418,54 @@ fn json_logs_have_the_fixed_schema_and_only_allow_sanitized_context() {
         "Bearer abc.def.ghi",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvd25lciJ9.signature",
         "session=cookie",
+        "claim_code=bootstrap-value",
+        "tunnel_secret=credential-value",
+        "request_body=private-content",
     ] {
         let mut context = SanitizedContext::new();
         let error = context.insert(ContextKey::State, secret).unwrap_err();
         assert_eq!(error.code(), "unsafe_log_context");
+        let rejected = LogEvent::at(
+            OffsetDateTime::UNIX_EPOCH,
+            LogLevel::Error,
+            "rejected_context",
+        )
+        .with_context(context);
+        let mut output = Vec::new();
+        write_json(&mut output, &rejected).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains(secret));
+        for forbidden_key in ["claim_code", "tunnel_secret", "credential", "request_body"] {
+            assert!(!output.contains(forbidden_key));
+        }
     }
     let mut context = SanitizedContext::new();
     context.insert(ContextKey::State, &"x".repeat(500)).unwrap();
     assert!(context.encoded_len() <= 256);
+}
+
+#[test]
+fn service_entry_arguments_are_explicit_and_fail_closed() {
+    use cellar_windows::service::{EntryMode, select_entry_mode};
+
+    assert_eq!(
+        select_entry_mode(Vec::<&str>::new()).unwrap(),
+        EntryMode::Service
+    );
+    assert_eq!(
+        select_entry_mode(["--service"]).unwrap(),
+        EntryMode::Service
+    );
+    assert_eq!(
+        select_entry_mode(["--console"]).unwrap(),
+        EntryMode::Console
+    );
+    for arguments in [vec!["--unknown"], vec!["--console", "--service"]] {
+        assert_eq!(
+            select_entry_mode(arguments).unwrap_err().code(),
+            "service_mode_invalid"
+        );
+    }
 }
 
 #[test]

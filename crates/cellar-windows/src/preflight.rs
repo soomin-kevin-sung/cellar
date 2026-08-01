@@ -116,6 +116,7 @@ pub trait PreflightAdapter {
         root: &Self::RootHandle,
         name: &ProbeName,
     ) -> Result<Self::Probe, AdapterError>;
+    fn secure(&self, probe: &mut Self::Probe) -> Result<(), AdapterError>;
     fn write_all(&self, probe: &mut Self::Probe, bytes: &[u8]) -> Result<(), AdapterError>;
     fn flush(&self, probe: &mut Self::Probe) -> Result<(), AdapterError>;
     fn rename_no_replace(
@@ -124,7 +125,7 @@ pub trait PreflightAdapter {
         probe: &mut Self::Probe,
         destination: &ProbeName,
     ) -> Result<(), AdapterError>;
-    fn delete(&self, root: &Self::RootHandle, name: &ProbeName) -> Result<(), AdapterError>;
+    fn delete_owned(&self, probe: Self::Probe) -> Result<(), AdapterError>;
     fn current_coordinates(
         &self,
         root: &Self::RootHandle,
@@ -169,6 +170,7 @@ pub enum PreflightError {
     EncryptedRootForbidden,
     OfflinePlaceholderForbidden,
     IoFailed,
+    CleanupFailed,
     IdentityMismatch,
     UnsupportedPlatform,
 }
@@ -185,6 +187,7 @@ impl PreflightError {
             Self::EncryptedRootForbidden => "encrypted_root_forbidden",
             Self::OfflinePlaceholderForbidden => "offline_placeholder_forbidden",
             Self::IoFailed => "preflight_io_failed",
+            Self::CleanupFailed => "probe_cleanup_failed",
             Self::IdentityMismatch => "identity_mismatch",
             Self::UnsupportedPlatform => "preflight_unsupported",
         }
@@ -213,13 +216,17 @@ pub fn preflight_with<A: PreflightAdapter>(
         .inspect(root)
         .map_err(|_| PreflightError::IoFailed)?;
     validate(inspection)?;
-    run_probe(adapter, &root_handle)?;
-    let current = adapter
-        .current_coordinates(&root_handle)
-        .map_err(|_| PreflightError::IoFailed)?;
+    let probe = run_probe(adapter, &root_handle)?;
+    let current = match adapter.current_coordinates(&root_handle) {
+        Ok(current) => current,
+        Err(_) => return fail_after_cleanup(adapter, probe, PreflightError::IoFailed),
+    };
     if current != inspection.coordinates {
-        return Err(PreflightError::IdentityMismatch);
+        return fail_after_cleanup(adapter, probe, PreflightError::IdentityMismatch);
     }
+    adapter
+        .delete_owned(probe)
+        .map_err(|_| PreflightError::CleanupFailed)?;
     Ok(StorageIdentity {
         coordinates: inspection.coordinates,
         trusted_root: root_handle,
@@ -252,7 +259,10 @@ fn validate(inspection: RootInspection) -> Result<(), PreflightError> {
     Ok(())
 }
 
-fn run_probe<A: PreflightAdapter>(adapter: &A, root: &A::RootHandle) -> Result<(), PreflightError> {
+fn run_probe<A: PreflightAdapter>(
+    adapter: &A,
+    root: &A::RootHandle,
+) -> Result<A::Probe, PreflightError> {
     for _ in 0..MAX_COLLISION_RETRIES {
         let source = ProbeName::random("source");
         let destination = ProbeName::random("renamed");
@@ -261,22 +271,21 @@ fn run_probe<A: PreflightAdapter>(adapter: &A, root: &A::RootHandle) -> Result<(
             Err(error) if error.is_collision() => continue,
             Err(_) => return Err(PreflightError::IoFailed),
         };
-        if adapter.write_all(&mut probe, PROBE_SENTINEL).is_err()
-            || adapter.flush(&mut probe).is_err()
-        {
-            cleanup(adapter, root, &source);
-            return Err(PreflightError::IoFailed);
+        if adapter.secure(&mut probe).is_err() {
+            return fail_after_cleanup(adapter, probe, PreflightError::IoFailed);
+        }
+        if adapter.write_all(&mut probe, PROBE_SENTINEL).is_err() {
+            return fail_after_cleanup(adapter, probe, PreflightError::IoFailed);
+        }
+        if adapter.flush(&mut probe).is_err() {
+            return fail_after_cleanup(adapter, probe, PreflightError::IoFailed);
         }
         match adapter.rename_no_replace(root, &mut probe, &destination) {
-            Ok(()) => {
-                if adapter.delete(root, &destination).is_err() {
-                    cleanup(adapter, root, &destination);
-                    return Err(PreflightError::IoFailed);
-                }
-                return Ok(());
-            }
+            Ok(()) => return Ok(probe),
             Err(error) => {
-                cleanup(adapter, root, &source);
+                if adapter.delete_owned(probe).is_err() {
+                    return Err(PreflightError::CleanupFailed);
+                }
                 if error.is_collision() {
                     continue;
                 }
@@ -287,8 +296,15 @@ fn run_probe<A: PreflightAdapter>(adapter: &A, root: &A::RootHandle) -> Result<(
     Err(PreflightError::IoFailed)
 }
 
-fn cleanup<A: PreflightAdapter>(adapter: &A, root: &A::RootHandle, name: &ProbeName) {
-    let _ = adapter.delete(root, name);
+fn fail_after_cleanup<A: PreflightAdapter, T>(
+    adapter: &A,
+    probe: A::Probe,
+    original: PreflightError,
+) -> Result<T, PreflightError> {
+    match adapter.delete_owned(probe) {
+        Ok(()) => Err(original),
+        Err(_) => Err(PreflightError::CleanupFailed),
+    }
 }
 
 #[cfg(windows)]
@@ -298,7 +314,7 @@ mod platform {
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
     use std::ptr;
     use std::sync::Arc;
@@ -306,10 +322,10 @@ mod platform {
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
-        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
         FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_RENAME_INFO, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, GetDriveTypeW,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW,
         GetFileInformationByHandle, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         GetVolumePathNameW, SetFileInformationByHandle, WRITE_DAC,
     };
@@ -329,7 +345,6 @@ mod platform {
     #[derive(Clone)]
     pub struct TrustedRootHandle {
         pub(super) file: Arc<File>,
-        pub(super) path: Arc<PathBuf>,
     }
 
     impl std::fmt::Debug for TrustedRootHandle {
@@ -402,7 +417,6 @@ mod platform {
                 inspection,
                 TrustedRootHandle {
                     file: Arc::new(file),
-                    path: Arc::new(root.to_path_buf()),
                 },
             ))
         }
@@ -412,20 +426,12 @@ mod platform {
             root: &Self::RootHandle,
             name: &ProbeName,
         ) -> Result<Self::Probe, AdapterError> {
-            let path = root.path.join(name.as_str());
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .access_mode(FILE_GENERIC_WRITE | DELETE | WRITE_DAC)
-                .share_mode(FILE_SHARE_DELETE)
-                .open(&path)
-                .map_err(map_io)?;
-            if restrict_private_key_handle(&file, PRIVATE_KEY_SERVICE_NAME).is_err() {
-                drop(file);
-                let _ = fs::remove_file(path);
-                return Err(AdapterError::io());
-            }
-            Ok(WindowsProbe { file })
+            create_relative_file(root.file.as_raw_handle(), name).map(|file| WindowsProbe { file })
+        }
+
+        fn secure(&self, probe: &mut Self::Probe) -> Result<(), AdapterError> {
+            restrict_private_key_handle(&probe.file, PRIVATE_KEY_SERVICE_NAME)
+                .map_err(|_| AdapterError::io())
         }
 
         fn write_all(&self, probe: &mut Self::Probe, bytes: &[u8]) -> Result<(), AdapterError> {
@@ -442,13 +448,7 @@ mod platform {
             probe: &mut Self::Probe,
             destination: &ProbeName,
         ) -> Result<(), AdapterError> {
-            let target = root.path.join(destination.as_str());
-            let absolute = root
-                .path
-                .canonicalize()
-                .map_err(map_io)?
-                .join(target.file_name().ok_or_else(AdapterError::io)?);
-            let name: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+            let name: Vec<u16> = destination.as_str().encode_utf16().collect();
             let name_offset = offset_of!(FILE_RENAME_INFO, FileName);
             let byte_len = name_offset + name.len() * size_of::<u16>();
             let mut storage = vec![0_u64; byte_len.div_ceil(size_of::<u64>())];
@@ -457,7 +457,7 @@ mod platform {
             // for the fixed header plus the exact UTF-16 name bytes copied.
             unsafe {
                 (*information).Anonymous.ReplaceIfExists = false;
-                (*information).RootDirectory = ptr::null_mut();
+                (*information).RootDirectory = root.file.as_raw_handle();
                 (*information).FileNameLength = (name.len() * size_of::<u16>()) as u32;
                 ptr::copy_nonoverlapping(
                     name.as_ptr(),
@@ -465,49 +465,57 @@ mod platform {
                     name.len(),
                 );
             }
-            // SAFETY: the probe handle stays live and `storage` contains the
-            // initialized FILE_RENAME_INFO for the full system call.
-            if unsafe {
-                SetFileInformationByHandle(
+            let mut status_block = IoStatusBlock {
+                status_or_pointer: 0,
+                information: 0,
+            };
+            // SAFETY: both handles stay live and `storage` contains the
+            // initialized FILE_RENAME_INFORMATION for the synchronous call.
+            let status = unsafe {
+                NtSetInformationFile(
                     probe.file.as_raw_handle(),
-                    FileRenameInfo,
-                    storage.as_ptr().cast(),
+                    &mut status_block,
+                    storage.as_mut_ptr().cast(),
                     byte_len as u32,
+                    10,
                 )
-            } == 0
-            {
-                return Err(map_io(std::io::Error::last_os_error()));
+            };
+            if status < 0 {
+                return Err(map_ntstatus(status));
             }
             Ok(())
         }
 
-        fn delete(&self, root: &Self::RootHandle, name: &ProbeName) -> Result<(), AdapterError> {
-            fs::remove_file(root.path.join(name.as_str())).map_err(map_io)
+        fn delete_owned(&self, probe: Self::Probe) -> Result<(), AdapterError> {
+            let information =
+                windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: the owned probe handle was opened with DELETE access and
+            // `information` matches FileDispositionInfo for this synchronous call.
+            let result = unsafe {
+                SetFileInformationByHandle(
+                    probe.file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&raw const information).cast(),
+                    size_of_val(&information) as u32,
+                )
+            };
+            drop(probe);
+            if result == 0 {
+                Err(AdapterError::io())
+            } else {
+                Ok(())
+            }
         }
 
         fn current_coordinates(
             &self,
             root: &Self::RootHandle,
         ) -> Result<StorageCoordinates, AdapterError> {
-            let mut retained_information = BY_HANDLE_FILE_INFORMATION::default();
+            let mut information = BY_HANDLE_FILE_INFORMATION::default();
             // SAFETY: the retained root `File` owns a live handle and the
             // output structure is writable for the call.
-            if unsafe {
-                GetFileInformationByHandle(root.file.as_raw_handle(), &mut retained_information)
-            } == 0
-            {
-                return Err(AdapterError::io());
-            }
-            let current = OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(root.path.as_path())
-                .map_err(map_io)?;
-            let mut information = BY_HANDLE_FILE_INFORMATION::default();
-            // SAFETY: `current` remains live and the output structure is
-            // writable for the duration of the call.
-            if unsafe { GetFileInformationByHandle(current.as_raw_handle(), &mut information) } == 0
+            if unsafe { GetFileInformationByHandle(root.file.as_raw_handle(), &mut information) }
+                == 0
             {
                 return Err(AdapterError::io());
             }
@@ -517,6 +525,125 @@ mod platform {
                     | u128::from(information.nFileIndexLow),
             })
         }
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: *mut core::ffi::c_void,
+        object_name: *mut UnicodeString,
+        attributes: u32,
+        security_descriptor: *mut core::ffi::c_void,
+        security_quality_of_service: *mut core::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status_or_pointer: usize,
+        information: usize,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut *mut core::ffi::c_void,
+            desired_access: u32,
+            object_attributes: *mut ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *mut i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *mut core::ffi::c_void,
+            ea_length: u32,
+        ) -> i32;
+        fn NtSetInformationFile(
+            file_handle: *mut core::ffi::c_void,
+            io_status_block: *mut IoStatusBlock,
+            file_information: *mut core::ffi::c_void,
+            length: u32,
+            file_information_class: u32,
+        ) -> i32;
+    }
+
+    fn map_ntstatus(status: i32) -> AdapterError {
+        const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+        if status == STATUS_OBJECT_NAME_COLLISION {
+            AdapterError::already_exists()
+        } else {
+            AdapterError::io()
+        }
+    }
+
+    fn create_relative_file(
+        root: *mut core::ffi::c_void,
+        name: &ProbeName,
+    ) -> Result<File, AdapterError> {
+        const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+        const FILE_CREATE: u32 = 2;
+        const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+        const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+        const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
+
+        let mut encoded: Vec<u16> = name.as_str().encode_utf16().collect();
+        let byte_length = encoded
+            .len()
+            .checked_mul(size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(AdapterError::io)?;
+        let mut object_name = UnicodeString {
+            length: byte_length,
+            maximum_length: byte_length,
+            buffer: encoded.as_mut_ptr(),
+        };
+        let mut attributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: root,
+            object_name: &mut object_name,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: ptr::null_mut(),
+            security_quality_of_service: ptr::null_mut(),
+        };
+        let mut status_block = IoStatusBlock {
+            status_or_pointer: 0,
+            information: 0,
+        };
+        let mut handle = ptr::null_mut();
+        // SAFETY: every pointer references a live, correctly laid-out Windows
+        // structure for this synchronous call. The object name is a private,
+        // separator-free name relative to the retained directory handle. On
+        // success, ownership of the returned handle is transferred once.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_GENERIC_WRITE | DELETE | WRITE_DAC,
+                &mut attributes,
+                &mut status_block,
+                ptr::null_mut(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_DELETE,
+                FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if status == STATUS_OBJECT_NAME_COLLISION {
+            return Err(AdapterError::already_exists());
+        }
+        if status < 0 || handle.is_null() {
+            return Err(AdapterError::io());
+        }
+        // SAFETY: NtCreateFile returned a successful uniquely owned handle.
+        Ok(unsafe { File::from_raw_handle(handle) })
     }
 
     fn filesystem(handle: *mut core::ffi::c_void) -> Result<Filesystem, AdapterError> {
@@ -672,7 +799,6 @@ mod windows_tests {
             .unwrap();
         let root = TrustedRootHandle {
             file: Arc::new(root_file),
-            path: Arc::new(directory.path().to_path_buf()),
         };
         let source = ProbeName("source.tmp".into());
         let destination = ProbeName("destination.tmp".into());
@@ -683,6 +809,36 @@ mod windows_tests {
             .unwrap();
         assert!(!directory.path().join(source.as_str()).exists());
         assert!(directory.path().join(destination.as_str()).exists());
-        WindowsPreflight.delete(&root, &destination).unwrap();
+        WindowsPreflight.delete_owned(probe).unwrap();
+    }
+
+    #[test]
+    fn retained_root_handle_cannot_be_redirected_by_path_swap() {
+        let parent = tempdir().unwrap();
+        let configured = parent.path().join("configured");
+        let retained = parent.path().join("retained");
+        std::fs::create_dir(&configured).unwrap();
+        let (_, root) = WindowsPreflight.inspect(&configured).unwrap();
+        std::fs::rename(&configured, &retained).unwrap();
+        std::fs::create_dir(&configured).unwrap();
+        let source = ProbeName("source.tmp".into());
+        let destination = ProbeName("destination.tmp".into());
+
+        let mut probe = WindowsPreflight.create_new(&root, &source).unwrap();
+        WindowsPreflight
+            .write_all(&mut probe, b"trusted-root")
+            .unwrap();
+        WindowsPreflight.flush(&mut probe).unwrap();
+
+        assert!(retained.join(source.as_str()).exists());
+        assert!(!configured.join(source.as_str()).exists());
+        WindowsPreflight
+            .rename_no_replace(&root, &mut probe, &destination)
+            .unwrap();
+        assert!(retained.join(destination.as_str()).exists());
+        assert!(!configured.join(destination.as_str()).exists());
+        WindowsPreflight.delete_owned(probe).unwrap();
+        assert!(!retained.join(destination.as_str()).exists());
+        assert!(!configured.join(destination.as_str()).exists());
     }
 }

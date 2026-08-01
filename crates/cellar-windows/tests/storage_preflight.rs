@@ -13,6 +13,7 @@ enum Failure {
     Create,
     Write,
     Flush,
+    Acl,
     Rename,
     Delete,
     Identity,
@@ -109,6 +110,12 @@ impl PreflightAdapter for FakeAdapter {
         Ok(())
     }
 
+    fn secure(&self, _probe: &mut Self::Probe) -> Result<(), AdapterError> {
+        let mut state = self.state.lock().unwrap();
+        state.events.push("secure");
+        Self::fail(&mut state, Failure::Acl)
+    }
+
     fn flush(&self, _probe: &mut Self::Probe) -> Result<(), AdapterError> {
         let mut state = self.state.lock().unwrap();
         state.events.push("flush");
@@ -138,11 +145,11 @@ impl PreflightAdapter for FakeAdapter {
         Ok(())
     }
 
-    fn delete(&self, _root: &Self::RootHandle, name: &ProbeName) -> Result<(), AdapterError> {
+    fn delete_owned(&self, probe: Self::Probe) -> Result<(), AdapterError> {
         let mut state = self.state.lock().unwrap();
         state.events.push("delete");
         Self::fail(&mut state, Failure::Delete)?;
-        state.entries.remove(name.as_str());
+        state.entries.remove(&probe.0);
         Ok(())
     }
 
@@ -228,11 +235,12 @@ fn probe_is_ordered_and_returns_the_inspected_identity() {
         [
             "inspect",
             "create",
+            "secure",
             "write",
             "flush",
             "rename_no_replace",
-            "delete",
-            "identity"
+            "identity",
+            "delete"
         ]
     );
     assert!(adapter.entries().is_empty());
@@ -243,8 +251,8 @@ fn every_injected_probe_failure_cleans_up_owned_entries() {
     for failure in [
         Failure::Write,
         Failure::Flush,
+        Failure::Acl,
         Failure::Rename,
-        Failure::Delete,
         Failure::Identity,
     ] {
         let adapter = FakeAdapter::allowed().fail_at(failure);
@@ -252,6 +260,54 @@ fn every_injected_probe_failure_cleans_up_owned_entries() {
         assert_eq!(error.code(), "preflight_io_failed");
         assert!(adapter.entries().is_empty(), "leak after {failure:?}");
     }
+}
+
+#[test]
+fn cleanup_failure_is_distinct_and_never_reports_success() {
+    for primary in [
+        Failure::Acl,
+        Failure::Write,
+        Failure::Flush,
+        Failure::Rename,
+        Failure::Identity,
+    ] {
+        let adapter = FakeAdapter::allowed()
+            .fail_at(primary)
+            .fail_at(Failure::Delete);
+        let error = preflight_with(&adapter, Path::new("opaque-root")).unwrap_err();
+        assert_eq!(error.code(), "probe_cleanup_failed");
+        assert_eq!(adapter.entries().len(), 1, "owned probe remains visible");
+    }
+}
+
+#[test]
+fn final_delete_failure_is_a_cleanup_failure() {
+    let adapter = FakeAdapter::allowed().fail_at(Failure::Delete);
+    let error = preflight_with(&adapter, Path::new("opaque-root")).unwrap_err();
+    assert_eq!(error.code(), "probe_cleanup_failed");
+    assert_eq!(adapter.entries().len(), 1);
+}
+
+#[test]
+fn rename_collision_cleanup_failure_stops_without_retrying() {
+    let adapter = FakeAdapter::allowed().fail_at(Failure::Delete);
+    adapter.state.lock().unwrap().rename_collisions = 1;
+
+    let error = preflight_with(&adapter, Path::new("opaque-root")).unwrap_err();
+
+    assert_eq!(error.code(), "probe_cleanup_failed");
+    assert_eq!(
+        adapter.events(),
+        [
+            "inspect",
+            "create",
+            "secure",
+            "write",
+            "flush",
+            "rename_no_replace",
+            "delete"
+        ]
+    );
 }
 
 #[test]

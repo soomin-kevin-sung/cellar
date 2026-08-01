@@ -1,4 +1,6 @@
+use std::ffi::OsStr;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -9,6 +11,30 @@ pub const PRESHUTDOWN_BUDGET: Duration = Duration::from_secs(180);
 pub enum ServiceControl {
     Stop,
     Preshutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryMode {
+    Service,
+    Console,
+}
+
+pub fn select_entry_mode<I, S>(arguments: I) -> Result<EntryMode, ServiceError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut arguments = arguments.into_iter();
+    let mode = match arguments.next() {
+        None => EntryMode::Service,
+        Some(argument) if argument.as_ref() == "--service" => EntryMode::Service,
+        Some(argument) if argument.as_ref() == "--console" => EntryMode::Console,
+        Some(_) => return Err(ServiceError::InvalidMode),
+    };
+    if arguments.next().is_some() {
+        return Err(ServiceError::InvalidMode);
+    }
+    Ok(mode)
 }
 
 pub const ACCEPT_STOP: u32 = 0x0000_0001;
@@ -49,6 +75,8 @@ pub enum ServiceError {
     ConfigurationFailed,
     DispatcherFailed,
     HostFailed,
+    InvalidMode,
+    StatusFailed,
 }
 
 impl ServiceError {
@@ -59,6 +87,8 @@ impl ServiceError {
             Self::ConfigurationFailed => "service_recovery_configuration_failed",
             Self::DispatcherFailed => "service_dispatcher_failed",
             Self::HostFailed => "service_host_failed",
+            Self::InvalidMode => "service_mode_invalid",
+            Self::StatusFailed => "service_status_failed",
         }
     }
 }
@@ -76,6 +106,43 @@ impl fmt::Display for ServiceError {
 }
 
 impl std::error::Error for ServiceError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScmStatus {
+    StartPending,
+    Running,
+    StopPending(ServiceControl),
+    Stopped { failed: bool },
+}
+
+trait StatusReporter {
+    fn report(&self, status: ScmStatus) -> Result<(), ServiceError>;
+}
+
+fn record_status(
+    reporter: &impl StatusReporter,
+    status_failed: &AtomicBool,
+    status: ScmStatus,
+) -> Result<(), ServiceError> {
+    reporter.report(status).map_err(|_| {
+        status_failed.store(true, AtomicOrdering::Release);
+        ServiceError::StatusFailed
+    })
+}
+
+fn finish_status(
+    reporter: &impl StatusReporter,
+    status_failed: &AtomicBool,
+    runner_result: Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let failed = runner_result.is_err() || status_failed.load(AtomicOrdering::Acquire);
+    let stopped_result = record_status(reporter, status_failed, ScmStatus::Stopped { failed });
+    if stopped_result.is_err() || status_failed.load(AtomicOrdering::Acquire) {
+        Err(ServiceError::StatusFailed)
+    } else {
+        runner_result
+    }
+}
 
 #[cfg(not(windows))]
 pub fn run_service_host(
@@ -177,7 +244,7 @@ pub fn configure_recovery_intent(service_handle: isize) -> Result<(), ServiceErr
 mod windows_host {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr;
-    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::sync::{Mutex, OnceLock};
 
@@ -190,7 +257,10 @@ mod windows_host {
         StartServiceCtrlDispatcherW,
     };
 
-    use super::{PRESHUTDOWN_BUDGET, ServiceControl, ServiceError};
+    use super::{
+        PRESHUTDOWN_BUDGET, ScmStatus, ServiceControl, ServiceError, StatusReporter, finish_status,
+        record_status,
+    };
 
     type Runner = Box<dyn FnOnce(Receiver<ServiceControl>) -> Result<(), ServiceError> + Send>;
 
@@ -198,8 +268,18 @@ mod windows_host {
     static CONTROL: OnceLock<Mutex<Option<Sender<ServiceControl>>>> = OnceLock::new();
     static RESULT: OnceLock<Mutex<Option<Result<(), ServiceError>>>> = OnceLock::new();
     static STATUS: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+    static STATUS_FAILED: AtomicBool = AtomicBool::new(false);
+
+    struct WindowsStatusReporter(SERVICE_STATUS_HANDLE);
+
+    impl StatusReporter for WindowsStatusReporter {
+        fn report(&self, status: ScmStatus) -> Result<(), ServiceError> {
+            report_windows_status(self.0, status)
+        }
+    }
 
     pub(super) fn run(runner: Runner) -> Result<(), ServiceError> {
+        STATUS_FAILED.store(false, Ordering::Release);
         let slot = RUNNER.get_or_init(|| Mutex::new(None));
         let mut guard = slot.lock().map_err(|_| ServiceError::DispatcherFailed)?;
         if guard.is_some() {
@@ -250,16 +330,10 @@ mod windows_host {
             return;
         }
         STATUS.store(handle, Ordering::Release);
-        if report_status(
-            handle,
-            SERVICE_START_PENDING,
-            0,
-            PRESHUTDOWN_BUDGET.as_millis() as u32,
-            false,
-        )
-        .is_err()
-        {
-            store_result(Err(ServiceError::HostFailed));
+        let reporter = WindowsStatusReporter(handle);
+        if record_status(&reporter, &STATUS_FAILED, ScmStatus::StartPending).is_err() {
+            store_result(Err(ServiceError::StatusFailed));
+            STATUS.store(ptr::null_mut(), Ordering::Release);
             return;
         }
         let (sender, receiver) = channel();
@@ -277,9 +351,7 @@ mod windows_host {
             .get()
             .and_then(|slot| slot.lock().ok())
             .and_then(|mut sender| sender.take());
-        let failed = result.is_err();
-        store_result(result);
-        let _ = report_status(handle, SERVICE_STOPPED, 0, 0, failed);
+        store_result(finish_status(&reporter, &STATUS_FAILED, result));
         STATUS.store(ptr::null_mut(), Ordering::Release);
     }
 
@@ -288,12 +360,10 @@ mod windows_host {
         if handle.is_null() {
             return Err(ServiceError::HostFailed);
         }
-        report_status(
-            handle,
-            SERVICE_RUNNING,
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN,
-            0,
-            false,
+        record_status(
+            &WindowsStatusReporter(handle),
+            &STATUS_FAILED,
+            ScmStatus::Running,
         )
     }
 
@@ -317,11 +387,11 @@ mod windows_host {
         };
         let handle = STATUS.load(Ordering::Acquire);
         if !handle.is_null() {
-            let wait_hint = match signal {
-                ServiceControl::Stop => 60_000,
-                ServiceControl::Preshutdown => PRESHUTDOWN_BUDGET.as_millis() as u32,
-            };
-            let _ = report_status(handle, SERVICE_STOP_PENDING, 0, wait_hint, false);
+            let _ = record_status(
+                &WindowsStatusReporter(handle),
+                &STATUS_FAILED,
+                ScmStatus::StopPending(signal),
+            );
         }
         if let Some(sender) = CONTROL
             .get()
@@ -333,13 +403,34 @@ mod windows_host {
         0
     }
 
-    fn report_status(
+    fn report_windows_status(
         handle: SERVICE_STATUS_HANDLE,
-        state: u32,
-        accepted: u32,
-        wait_hint: u32,
-        failed: bool,
+        transition: ScmStatus,
     ) -> Result<(), ServiceError> {
+        let (state, accepted, wait_hint, failed) = match transition {
+            ScmStatus::StartPending => (
+                SERVICE_START_PENDING,
+                0,
+                PRESHUTDOWN_BUDGET.as_millis() as u32,
+                false,
+            ),
+            ScmStatus::Running => (
+                SERVICE_RUNNING,
+                SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN,
+                0,
+                false,
+            ),
+            ScmStatus::StopPending(control) => (
+                SERVICE_STOP_PENDING,
+                0,
+                match control {
+                    ServiceControl::Stop => 60_000,
+                    ServiceControl::Preshutdown => PRESHUTDOWN_BUDGET.as_millis() as u32,
+                },
+                false,
+            ),
+            ScmStatus::Stopped { failed } => (SERVICE_STOPPED, 0, 0, failed),
+        };
         let status = SERVICE_STATUS {
             dwServiceType: SERVICE_WIN32_OWN_PROCESS,
             dwCurrentState: state,
@@ -359,9 +450,92 @@ mod windows_host {
         // SAFETY: `handle` is registered with SCM and `status` is a live,
         // fully initialized structure for this synchronous report.
         if unsafe { SetServiceStatus(handle, &status) } == 0 {
-            Err(ServiceError::HostFailed)
+            Err(ServiceError::StatusFailed)
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+
+    struct FakeReporter {
+        fail_on: ScmStatus,
+        seen: Mutex<Vec<ScmStatus>>,
+    }
+
+    impl StatusReporter for FakeReporter {
+        fn report(&self, status: ScmStatus) -> Result<(), ServiceError> {
+            self.seen.lock().unwrap().push(status);
+            if status == self.fail_on {
+                Err(ServiceError::HostFailed)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn reporter_failures_are_recorded_for_every_transition() {
+        for status in [
+            ScmStatus::StartPending,
+            ScmStatus::Running,
+            ScmStatus::StopPending(ServiceControl::Stop),
+            ScmStatus::StopPending(ServiceControl::Preshutdown),
+            ScmStatus::Stopped { failed: false },
+        ] {
+            let reporter = FakeReporter {
+                fail_on: status,
+                seen: Mutex::new(Vec::new()),
+            };
+            let failed = AtomicBool::new(false);
+            assert_eq!(
+                record_status(&reporter, &failed, status)
+                    .unwrap_err()
+                    .code(),
+                "service_status_failed"
+            );
+            assert!(failed.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn final_stopped_failure_overrides_a_successful_runner() {
+        let reporter = FakeReporter {
+            fail_on: ScmStatus::Stopped { failed: false },
+            seen: Mutex::new(Vec::new()),
+        };
+        let failed = AtomicBool::new(false);
+        assert_eq!(
+            finish_status(&reporter, &failed, Ok(()))
+                .unwrap_err()
+                .code(),
+            "service_status_failed"
+        );
+    }
+
+    #[test]
+    fn earlier_handler_status_failure_propagates_at_final_stop() {
+        let reporter = FakeReporter {
+            fail_on: ScmStatus::StopPending(ServiceControl::Stop),
+            seen: Mutex::new(Vec::new()),
+        };
+        let failed = AtomicBool::new(false);
+        let _ = record_status(
+            &reporter,
+            &failed,
+            ScmStatus::StopPending(ServiceControl::Stop),
+        );
+        assert_eq!(
+            finish_status(&reporter, &failed, Ok(()))
+                .unwrap_err()
+                .code(),
+            "service_status_failed"
+        );
     }
 }
