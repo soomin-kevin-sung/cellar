@@ -245,7 +245,7 @@ fn mutation_guard_rejects_wrong_subject_token_and_exact_expiries() {
 #[test]
 fn safe_methods_do_not_require_csrf() {
     let manager = CsrfManager::new();
-    for method in ["GET", "HEAD", "OPTIONS"] {
+    for method in ["GET", "HEAD", "OPTIONS", "TRACE"] {
         manager
             .validate_mutation(
                 method,
@@ -485,7 +485,7 @@ async fn http_csrf_binding_rejects_both_iat_and_exp_changes() {
 #[tokio::test]
 async fn http_safe_methods_require_owner_but_not_csrf_and_emit_no_cors() {
     let app = enrolled_app();
-    for method in ["GET", "HEAD", "OPTIONS"] {
+    for method in ["GET", "HEAD", "OPTIONS", "TRACE"] {
         let response = app
             .clone()
             .oneshot(http_request(method, "/api/v1/files", Some(claims())))

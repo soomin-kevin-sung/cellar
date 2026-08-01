@@ -111,7 +111,7 @@ impl CsrfManager {
         canonical_origin: &str,
         now_unix_seconds: i64,
     ) -> Result<(), CsrfError> {
-        if matches!(method, "GET" | "HEAD" | "OPTIONS") {
+        if matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE") {
             return Ok(());
         }
         let binding = authenticate(claims, owner_subject, now_unix_seconds)?;
