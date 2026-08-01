@@ -9,12 +9,17 @@ license.workspace = true
 [dependencies]
 sha1 = "0.11.0"
 thiserror = "2"
+uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Services",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [dev-dependencies]

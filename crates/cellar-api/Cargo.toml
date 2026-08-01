@@ -10,6 +10,7 @@ license.workspace = true
 axum.workspace = true
 base64 = "=0.22.1"
 cellar-auth = { path = "../cellar-auth" }
+cellar-core = { path = "../cellar-core" }
 serde.workspace = true
 serde_json.workspace = true
 
