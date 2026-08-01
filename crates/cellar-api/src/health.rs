@@ -7,13 +7,14 @@ use axum::{Json, Router, extract::State};
 use cellar_core::ReadinessBlocker;
 use serde::Serialize;
 
-const ORDERED_BLOCKERS: [ReadinessBlocker; 6] = [
+const ORDERED_BLOCKERS: [ReadinessBlocker; 7] = [
     ReadinessBlocker::ConfigurationRequired,
     ReadinessBlocker::OwnerEnrollmentRequired,
     ReadinessBlocker::MigrationRequired,
     ReadinessBlocker::RecoveryRequired,
     ReadinessBlocker::StorageUnavailable,
     ReadinessBlocker::ReconciliationRequired,
+    ReadinessBlocker::OriginTrustUpdateRequired,
 ];
 const ALL_BLOCKED: u8 = (1 << ORDERED_BLOCKERS.len()) - 1;
 
@@ -74,6 +75,7 @@ const fn bit(blocker: ReadinessBlocker) -> u8 {
         ReadinessBlocker::RecoveryRequired => 1 << 3,
         ReadinessBlocker::StorageUnavailable => 1 << 4,
         ReadinessBlocker::ReconciliationRequired => 1 << 5,
+        ReadinessBlocker::OriginTrustUpdateRequired => 1 << 6,
     }
 }
 

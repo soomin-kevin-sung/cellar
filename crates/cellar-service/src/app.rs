@@ -32,7 +32,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::watch;
 use tokio_util::io::StreamReader;
 
-use crate::tls::{OriginTlsPaths, ensure_origin_tls};
+use crate::tls::{OriginTlsPaths, TlsMaterial, ensure_origin_tls};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ListenerConfig {
@@ -185,7 +185,7 @@ pub trait OriginAuthenticator: Send + Sync + 'static {
 }
 
 struct CloudflareAuthenticator {
-    validators: Vec<AccessValidator>,
+    validator: AccessValidator,
     max_token_len: usize,
 }
 
@@ -196,14 +196,7 @@ impl OriginAuthenticator for CloudflareAuthenticator {
         token: &str,
         owner_mode: OwnerMode<'_>,
     ) -> Result<AccessClaims, AuthError> {
-        let mut last = None;
-        for validator in &self.validators {
-            match validator.validate(token, owner_mode).await {
-                Ok(claims) => return Ok(claims),
-                Err(error) => last = Some(error),
-            }
-        }
-        Err(last.expect("validated configuration always has an audience"))
+        self.validator.validate(token, owner_mode).await
     }
 
     fn max_token_len(&self) -> usize {
@@ -352,30 +345,33 @@ fn is_unsafe_method(method: &Method) -> bool {
 fn production_authenticator(
     config: &CellarConfig,
 ) -> Result<Arc<dyn OriginAuthenticator>, AppError> {
-    let issuer = config.team_domain.origin().ascii_serialization();
-    let jwks_url = config
-        .team_domain
-        .join("/cdn-cgi/access/certs")
-        .map_err(|_| AppError::Authentication)?;
     let client = reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| AppError::Authentication)?;
     let fetcher: Arc<dyn JwksFetcher> = Arc::new(ReqwestJwksFetcher { client });
-    let mut validators = Vec::with_capacity(config.aud_tags.len());
-    let mut max_token_len = usize::MAX;
-    for audience in &config.aud_tags {
-        let validator_config = AccessValidatorConfig::new(&issuer, audience, jwks_url.as_str())
-            .map_err(|_| AppError::Authentication)?;
-        max_token_len = max_token_len.min(validator_config.max_token_len());
-        validators.push(AccessValidator::new(validator_config, Arc::clone(&fetcher)));
-    }
-    if validators.is_empty() {
-        return Err(AppError::Authentication);
-    }
+    build_origin_authenticator(config, fetcher)
+}
+
+fn build_origin_authenticator(
+    config: &CellarConfig,
+    fetcher: Arc<dyn JwksFetcher>,
+) -> Result<Arc<dyn OriginAuthenticator>, AppError> {
+    let issuer = config.team_domain.origin().ascii_serialization();
+    let jwks_url = config
+        .team_domain
+        .join("/cdn-cgi/access/certs")
+        .map_err(|_| AppError::Authentication)?;
+    let validator_config = AccessValidatorConfig::new_with_audiences(
+        &issuer,
+        config.aud_tags.iter().cloned(),
+        jwks_url.as_str(),
+    )
+    .map_err(|_| AppError::Authentication)?;
+    let max_token_len = validator_config.max_token_len();
     Ok(Arc::new(CloudflareAuthenticator {
-        validators,
+        validator: AccessValidator::new(validator_config, fetcher),
         max_token_len,
     }))
 }
@@ -543,6 +539,7 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
 
     let tls = ensure_origin_tls(&options.tls_paths, time::OffsetDateTime::now_utc())
         .map_err(|_| AppError::Tls)?;
+    sync_origin_trust_readiness(&readiness, &tls);
     let listeners = bind_listeners(ListenerConfig {
         origin_port: options.config.origin_port,
         health_port: options.config.health_port,
@@ -575,6 +572,14 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
     .await;
     pool.close().await;
     result.map_err(|_| AppError::Listener)
+}
+
+pub(crate) fn sync_origin_trust_readiness(readiness: &Readiness, material: &TlsMaterial) {
+    if material.pending_rotation().is_some() {
+        readiness.block(ReadinessBlocker::OriginTrustUpdateRequired);
+    } else {
+        readiness.clear(ReadinessBlocker::OriginTrustUpdateRequired);
+    }
 }
 
 pub async fn check_startup_gates(pool: &sqlx::SqlitePool) -> Result<StartupGates, AppError> {
@@ -702,4 +707,56 @@ fn compare_filename_ordinal(left: &str, right: &str) -> Ordering {
 #[cfg(not(windows))]
 fn compare_filename_ordinal(left: &str, right: &str) -> Ordering {
     left.cmp(right)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct CountingFetcher(AtomicUsize);
+
+    #[async_trait]
+    impl JwksFetcher for CountingFetcher {
+        async fn fetch(&self, _url: &Url) -> Result<JwksResponse, JwksFetchError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(JwksResponse::new(
+                200,
+                Cursor::new(br#"{"keys":[]}"#.to_vec()),
+                None,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn production_multi_audience_composition_uses_one_validator_and_fetch_path() {
+        let fetcher = Arc::new(CountingFetcher(AtomicUsize::new(0)));
+        let config = CellarConfig {
+            external_origin: Url::parse("https://cellar.example.test").unwrap(),
+            team_domain: Url::parse("https://team.cloudflareaccess.com").unwrap(),
+            aud_tags: vec!["first-audience".into(), "later-audience".into()],
+            bootstrap_owner_email: None,
+            owner_subject: Some("owner-subject".into()),
+            storage_root: PathBuf::from(r"C:\cellar-storage"),
+            origin_port: 8443,
+            health_port: 8081,
+        };
+        let authenticator = build_origin_authenticator(&config, fetcher.clone())
+            .expect("multi-audience authenticator");
+
+        let error = authenticator
+            .validate(
+                "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6Im1pc3NpbmcifQ.e30.AA",
+                OwnerMode::Enrolled {
+                    owner_subject: "owner-subject",
+                },
+            )
+            .await
+            .expect_err("empty JWKS is rejected");
+
+        assert_eq!(error.code(), "jwks_malformed");
+        assert_eq!(fetcher.0.load(Ordering::SeqCst), 1);
+    }
 }

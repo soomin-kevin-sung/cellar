@@ -160,6 +160,10 @@ fn readiness_blockers_have_stable_codes_and_display() {
             ReadinessBlocker::ReconciliationRequired,
             "reconciliation_required",
         ),
+        (
+            ReadinessBlocker::OriginTrustUpdateRequired,
+            "origin_trust_update_required",
+        ),
     ];
 
     for (blocker, expected_code) in cases {

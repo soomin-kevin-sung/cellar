@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cellar_config::{
-    BootstrapClaim, CellarConfig, ConfigError, PersistedConfig, load_config, save_config,
+    BootstrapClaim, CellarConfig, ConfigError, MAX_AUD_TAGS, PersistedConfig, load_config,
+    save_config,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -178,6 +179,17 @@ fn audience_tags_reject_duplicates() {
     config.aud_tags = vec!["same".to_owned(), "same".to_owned()];
 
     assert_code(&config, "aud_tags_duplicate");
+}
+
+#[test]
+fn audience_tags_reject_a_count_above_the_named_bound() {
+    let directory = tempdir().unwrap();
+    let mut config = unenrolled_config(directory.path());
+    config.aud_tags = (0..=MAX_AUD_TAGS)
+        .map(|index| format!("audience-{index}"))
+        .collect();
+
+    assert_code(&config, "aud_tags_too_many");
 }
 
 #[test]

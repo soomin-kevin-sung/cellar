@@ -1715,7 +1715,13 @@ fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Tls
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use cellar_api::health::Readiness;
+    use cellar_api::health::health_router;
+    use cellar_core::ReadinessBlocker;
     use tempfile::TempDir;
+    use tower::ServiceExt;
 
     fn paths(temp: &TempDir) -> OriginTlsPaths {
         OriginTlsPaths {
@@ -2048,8 +2054,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn pending_rotation_survives_restart_blocks_rerotation_and_requires_matching_ack() {
+    #[tokio::test]
+    async fn pending_rotation_survives_restart_blocks_rerotation_and_requires_matching_ack() {
         let temp = TempDir::new().unwrap();
         let paths = paths(&temp);
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
@@ -2064,6 +2070,25 @@ mod tests {
         let ca_serial = serial(rotated.material().ca_certificate());
 
         let restarted = ensure_origin_tls_for_test(&paths, now + Duration::days(1)).unwrap();
+        let readiness = Readiness::new([]);
+        crate::app::sync_origin_trust_readiness(&readiness, &restarted);
+        assert_eq!(
+            readiness.blocker_codes(),
+            [ReadinessBlocker::OriginTrustUpdateRequired.code()]
+        );
+        assert_eq!(
+            health_router(readiness.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/ready")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_eq!(
             restarted
                 .pending_rotation()
@@ -2088,11 +2113,22 @@ mod tests {
         );
 
         acknowledge_origin_ca_rotation_impl(&paths, &fingerprint, false).unwrap();
-        assert!(
-            ensure_origin_tls_for_test(&paths, now + Duration::days(2))
+        let acknowledged = ensure_origin_tls_for_test(&paths, now + Duration::days(2)).unwrap();
+        assert!(acknowledged.pending_rotation().is_none());
+        crate::app::sync_origin_trust_readiness(&readiness, &acknowledged);
+        assert!(readiness.is_ready());
+        assert_eq!(
+            health_router(readiness)
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/ready")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
                 .unwrap()
-                .pending_rotation()
-                .is_none()
+                .status(),
+            StatusCode::OK
         );
     }
 

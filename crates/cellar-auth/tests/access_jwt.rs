@@ -14,6 +14,7 @@ use cellar_auth::{
     AccessClaims, AccessValidator, AccessValidatorConfig, JwksFetchError, JwksFetcher,
     JwksResponse, OwnerMode, select_access_jwt_header,
 };
+use cellar_config::MAX_AUD_TAGS;
 use jsonwebtoken::crypto::sign;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
@@ -285,6 +286,19 @@ fn config() -> AccessValidatorConfig {
     .with_min_refresh_interval(Duration::ZERO)
 }
 
+fn multi_audience_config() -> AccessValidatorConfig {
+    AccessValidatorConfig::new_with_audiences(
+        ISSUER,
+        ["first-audience", "later-audience"],
+        "https://cellar.cloudflareaccess.com/cdn-cgi/access/certs",
+    )
+    .expect("valid multi-audience validator config")
+    .with_clock_skew(Duration::from_secs(5))
+    .with_fetch_timeout(Duration::from_millis(100))
+    .with_cache_ttl(Duration::from_secs(300))
+    .with_min_refresh_interval(Duration::ZERO)
+}
+
 fn validator(fetcher: Arc<MockFetcher>) -> AccessValidator {
     AccessValidator::new(config(), fetcher)
 }
@@ -379,6 +393,77 @@ async fn validates_exact_issuer_audience_and_app_type() {
         "invalid_token_type",
     )
     .await;
+}
+
+#[tokio::test]
+async fn accepts_first_or_later_configured_audience_and_rejects_no_match() {
+    let fetcher = MockFetcher::new([FetchOutcome::Body(jwks(&[&keys().first]))]);
+    let validator = AccessValidator::new(multi_audience_config(), fetcher.clone());
+
+    for audience in ["first-audience", "later-audience"] {
+        let mut matching = claims();
+        matching["aud"] = json!([audience]);
+        validator
+            .validate(&token_with(&keys().first, &matching), enrolled())
+            .await
+            .expect("one configured audience matches");
+    }
+
+    let mut no_match = claims();
+    no_match["aud"] = json!(["unconfigured-audience"]);
+    assert_code(
+        &validator,
+        &token_with(&keys().first, &no_match),
+        enrolled(),
+        "invalid_audience",
+    )
+    .await;
+    assert_eq!(fetcher.calls(), 1);
+}
+
+#[test]
+fn multi_audience_config_rejects_empty_duplicate_and_over_limit_without_leaking_values() {
+    let url = "https://cellar.cloudflareaccess.com/cdn-cgi/access/certs";
+    for audiences in [
+        Vec::<String>::new(),
+        vec![" secret-audience".into()],
+        vec!["secret-audience".into(), "secret-audience".into()],
+        (0..=MAX_AUD_TAGS)
+            .map(|index| format!("secret-audience-{index}"))
+            .collect(),
+    ] {
+        let error = AccessValidatorConfig::new_with_audiences(ISSUER, audiences, url)
+            .expect_err("invalid audience collection");
+        assert_eq!(error.code(), "invalid_auth_config");
+        assert!(!format!("{error:?}").contains("secret-audience"));
+    }
+
+    let config = multi_audience_config();
+    let debug = format!("{config:?}");
+    assert!(!debug.contains("first-audience"));
+    assert!(!debug.contains("later-audience"));
+}
+
+#[test]
+fn multi_audience_config_bounds_collection_before_allocating() {
+    let mut emitted = 0_usize;
+    let unbounded = std::iter::from_fn(move || {
+        assert!(
+            emitted <= MAX_AUD_TAGS,
+            "constructor read beyond the bounded rejection threshold"
+        );
+        let audience = format!("audience-{emitted}");
+        emitted += 1;
+        Some(audience)
+    });
+
+    let error = AccessValidatorConfig::new_with_audiences(
+        ISSUER,
+        unbounded,
+        "https://cellar.cloudflareaccess.com/cdn-cgi/access/certs",
+    )
+    .expect_err("unbounded audience iterator");
+    assert_eq!(error.code(), "invalid_auth_config");
 }
 
 #[tokio::test]
@@ -908,6 +993,55 @@ async fn concurrent_unknown_kid_refresh_is_single_flight() {
             .expect("single-flight validation");
     }
     assert_eq!(fetcher.calls(), 1);
+}
+
+#[tokio::test]
+async fn multiple_audiences_share_one_initial_and_unknown_kid_refresh_under_concurrency() {
+    let initial_gate = FetchGate::new();
+    let rotated_gate = FetchGate::new();
+    let fetcher = MockFetcher::new([
+        FetchOutcome::Gated(initial_gate.clone(), jwks(&[&keys().first])),
+        FetchOutcome::Gated(rotated_gate.clone(), jwks(&[&keys().rotated])),
+    ]);
+    let validator = Arc::new(AccessValidator::new(
+        multi_audience_config(),
+        fetcher.clone(),
+    ));
+
+    async fn validate_concurrently(
+        validator: &Arc<AccessValidator>,
+        key: &TestKey,
+        gate: &Arc<FetchGate>,
+        expected_calls: usize,
+        fetcher: &Arc<MockFetcher>,
+    ) {
+        let mut tasks = Vec::new();
+        for index in 0..24 {
+            let mut value = claims();
+            value["aud"] = json!([if index % 2 == 0 {
+                "first-audience"
+            } else {
+                "later-audience"
+            }]);
+            let token = token_with(key, &value);
+            let validator = validator.clone();
+            tasks.push(tokio::spawn(async move {
+                validator.validate(&token, enrolled()).await
+            }));
+        }
+        gate.wait_started().await;
+        assert_eq!(fetcher.calls(), expected_calls);
+        gate.release();
+        for task in tasks {
+            task.await
+                .expect("validation task")
+                .expect("shared multi-audience validation");
+        }
+        assert_eq!(fetcher.calls(), expected_calls);
+    }
+
+    validate_concurrently(&validator, &keys().first, &initial_gate, 1, &fetcher).await;
+    validate_concurrently(&validator, &keys().rotated, &rotated_gate, 2, &fetcher).await;
 }
 
 #[tokio::test]

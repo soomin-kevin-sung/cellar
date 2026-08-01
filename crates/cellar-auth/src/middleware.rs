@@ -1,9 +1,11 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use cellar_config::{MAX_AUD_TAG_BYTES, MAX_AUD_TAGS};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{Algorithm, Validation, decode, decode_header};
 use url::Url;
@@ -58,10 +60,10 @@ impl fmt::Debug for AuthError {
 
 impl std::error::Error for AuthError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AccessValidatorConfig {
     issuer: String,
-    audience: String,
+    audiences: Vec<String>,
     jwks_url: Url,
     clock_skew: Duration,
     max_token_len: usize,
@@ -79,9 +81,34 @@ impl AccessValidatorConfig {
         audience: impl Into<String>,
         jwks_url: impl AsRef<str>,
     ) -> Result<Self, AuthError> {
-        let issuer = normalize_issuer(issuer.as_ref())?;
         let audience = audience.into();
-        if audience.is_empty() || audience.len() > 2_048 {
+        Self::new_with_audiences(issuer, [audience], jwks_url)
+    }
+
+    pub fn new_with_audiences<I, S>(
+        issuer: impl AsRef<str>,
+        audiences: I,
+        jwks_url: impl AsRef<str>,
+    ) -> Result<Self, AuthError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let issuer = normalize_issuer(issuer.as_ref())?;
+        let audiences: Vec<String> = audiences
+            .into_iter()
+            .take(MAX_AUD_TAGS + 1)
+            .map(Into::into)
+            .collect();
+        if audiences.is_empty()
+            || audiences.len() > MAX_AUD_TAGS
+            || audiences.iter().any(|audience| {
+                audience.is_empty()
+                    || audience.trim() != audience
+                    || audience.len() > MAX_AUD_TAG_BYTES
+            })
+            || audiences.iter().collect::<HashSet<_>>().len() != audiences.len()
+        {
             return Err(AuthError::new("invalid_auth_config"));
         }
         let jwks_url =
@@ -101,7 +128,7 @@ impl AccessValidatorConfig {
 
         Ok(Self {
             issuer,
-            audience,
+            audiences,
             jwks_url,
             clock_skew: Duration::from_secs(30),
             max_token_len: DEFAULT_MAX_TOKEN_BYTES,
@@ -170,8 +197,8 @@ impl AccessValidatorConfig {
         &self.issuer
     }
 
-    pub(crate) fn audience(&self) -> &str {
-        &self.audience
+    pub(crate) fn audiences(&self) -> &[String] {
+        &self.audiences
     }
 
     pub(crate) const fn jwks_url(&self) -> &Url {
@@ -207,6 +234,18 @@ impl AccessValidatorConfig {
     }
 }
 
+impl fmt::Debug for AccessValidatorConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccessValidatorConfig")
+            .field("issuer", &self.issuer)
+            .field("audiences", &"[redacted]")
+            .field("audience_count", &self.audiences.len())
+            .field("jwks_url", &self.jwks_url)
+            .finish_non_exhaustive()
+    }
+}
+
 fn normalize_issuer(value: &str) -> Result<String, AuthError> {
     if value.is_empty() || value.len() > 2_048 {
         return Err(AuthError::new("invalid_auth_config"));
@@ -235,7 +274,7 @@ impl fmt::Debug for AccessValidator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AccessValidator")
             .field("issuer", &self.config.issuer)
-            .field("audience", &"[redacted]")
+            .field("audiences", &"[redacted]")
             .field("jwks_url", &self.config.jwks_url)
             .finish_non_exhaustive()
     }
@@ -303,7 +342,7 @@ impl AccessValidator {
         validate_claims(
             &claims,
             self.config.issuer(),
-            self.config.audience(),
+            self.config.audiences(),
             skew,
             now,
             owner_mode,

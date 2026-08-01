@@ -7,6 +7,7 @@ use url::Url;
 use crate::CellarConfig;
 
 pub const MAX_AUD_TAG_BYTES: usize = 256;
+pub const MAX_AUD_TAGS: usize = 32;
 
 /// Fail-closed configuration failures with stable machine-readable codes.
 #[derive(Debug, Error)]
@@ -37,6 +38,8 @@ pub enum ConfigError {
     TeamDomainMustBeOriginOnly,
     #[error("at least one audience tag is required")]
     AudTagsRequired,
+    #[error("audience tag count exceeds the configured maximum")]
+    AudTagsTooMany,
     #[error("audience tags must not be empty")]
     AudTagEmpty,
     #[error("audience tags must not contain surrounding whitespace")]
@@ -92,6 +95,7 @@ impl ConfigError {
             Self::TeamDomainFragmentForbidden => "team_domain_fragment_forbidden",
             Self::TeamDomainMustBeOriginOnly => "team_domain_must_be_origin_only",
             Self::AudTagsRequired => "aud_tags_required",
+            Self::AudTagsTooMany => "aud_tags_too_many",
             Self::AudTagEmpty => "aud_tag_empty",
             Self::AudTagNotTrimmed => "aud_tag_not_trimmed",
             Self::AudTagTooLong => "aud_tag_too_long",
@@ -188,6 +192,9 @@ fn validate_origin(url: &Url, kind: OriginKind) -> Result<(), ConfigError> {
 fn validate_aud_tags(aud_tags: &[String]) -> Result<(), ConfigError> {
     if aud_tags.is_empty() {
         return Err(ConfigError::AudTagsRequired);
+    }
+    if aud_tags.len() > MAX_AUD_TAGS {
+        return Err(ConfigError::AudTagsTooMany);
     }
 
     let mut unique = HashSet::with_capacity(aud_tags.len());

@@ -62,7 +62,7 @@ impl fmt::Debug for OwnerMode<'_> {
 pub(crate) fn validate_claims(
     claims: &AccessClaims,
     issuer: &str,
-    audience: &str,
+    configured_audiences: &[String],
     clock_skew_seconds: i64,
     now: i64,
     owner_mode: OwnerMode<'_>,
@@ -76,7 +76,11 @@ pub(crate) fn validate_claims(
             .aud
             .iter()
             .any(|value| value.is_empty() || value.len() > MAX_AUDIENCE_BYTES)
-        || !claims.aud.iter().any(|value| value == audience)
+        || !claims.aud.iter().any(|claim_audience| {
+            configured_audiences
+                .iter()
+                .any(|configured| configured == claim_audience)
+        })
     {
         return Err(AuthError::new("invalid_audience"));
     }
@@ -143,10 +147,11 @@ mod tests {
     }
 
     fn validate(claims: &AccessClaims) -> Result<(), crate::AuthError> {
+        let audiences = ["audience".to_owned()];
         validate_claims(
             claims,
             "https://cellar.cloudflareaccess.com",
-            "audience",
+            &audiences,
             SKEW,
             NOW,
             OwnerMode::Enrolled {

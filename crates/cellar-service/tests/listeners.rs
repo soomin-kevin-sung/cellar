@@ -59,6 +59,7 @@ async fn live_and_ready_are_bounded_and_reveal_only_stable_codes() {
     readiness.clear(ReadinessBlocker::RecoveryRequired);
     readiness.clear(ReadinessBlocker::StorageUnavailable);
     readiness.clear(ReadinessBlocker::ReconciliationRequired);
+    readiness.clear(ReadinessBlocker::OriginTrustUpdateRequired);
     let (ready_status, ready_body) = response(Method::GET, "/health/ready", app).await;
     assert_eq!(ready_status, StatusCode::OK);
     assert_eq!(
@@ -74,6 +75,7 @@ async fn blocked_readiness_is_deduplicated_ordered_and_redacted() {
         ReadinessBlocker::MigrationRequired,
         ReadinessBlocker::StorageUnavailable,
         ReadinessBlocker::ConfigurationRequired,
+        ReadinessBlocker::OriginTrustUpdateRequired,
     ]);
     readiness.block(ReadinessBlocker::MigrationRequired);
     let app = health_router(readiness);
@@ -89,7 +91,8 @@ async fn blocked_readiness_is_deduplicated_ordered_and_redacted() {
             "blockers":[
                 "configuration_required",
                 "migration_required",
-                "storage_unavailable"
+                "storage_unavailable",
+                "origin_trust_update_required"
             ]
         })
     );

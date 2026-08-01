@@ -12,6 +12,7 @@ pub enum ReadinessBlocker {
     RecoveryRequired,
     StorageUnavailable,
     ReconciliationRequired,
+    OriginTrustUpdateRequired,
 }
 
 impl ReadinessBlocker {
@@ -25,6 +26,7 @@ impl ReadinessBlocker {
             Self::RecoveryRequired => "recovery_required",
             Self::StorageUnavailable => "storage_unavailable",
             Self::ReconciliationRequired => "reconciliation_required",
+            Self::OriginTrustUpdateRequired => "origin_trust_update_required",
         }
     }
 }

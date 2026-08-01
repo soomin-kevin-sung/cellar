@@ -10,7 +10,9 @@ use cellar_auth::{
     EnrollmentSnapshot, EnrollmentStore, EnrollmentStoreError, FileEnrollmentStore, RouteAccess,
     route_access,
 };
-use cellar_config::{BootstrapClaim, CellarConfig, PersistedConfig, load_config, save_config};
+use cellar_config::{
+    BootstrapClaim, CellarConfig, MAX_AUD_TAGS, PersistedConfig, load_config, save_config,
+};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -371,7 +373,9 @@ fn independent_file_adapters_still_allow_exactly_one_claim_winner() {
             config: CellarConfig {
                 external_origin: "https://cellar.example".parse().unwrap(),
                 team_domain: "https://team.cloudflareaccess.com".parse().unwrap(),
-                aud_tags: (0..2_000).map(|index| format!("aud-{index}")).collect(),
+                aud_tags: (0..MAX_AUD_TAGS)
+                    .map(|index| format!("aud-{index}"))
+                    .collect(),
                 bootstrap_owner_email: Some(EMAIL.into()),
                 owner_subject: None,
                 storage_root: PathBuf::from(r"C:\cellar-storage"),
@@ -513,7 +517,9 @@ fn independent_processes_have_exactly_one_durable_claim_winner() {
             config: CellarConfig {
                 external_origin: "https://cellar.example".parse().unwrap(),
                 team_domain: "https://team.cloudflareaccess.com".parse().unwrap(),
-                aud_tags: (0..2_000).map(|index| format!("aud-{index}")).collect(),
+                aud_tags: (0..MAX_AUD_TAGS)
+                    .map(|index| format!("aud-{index}"))
+                    .collect(),
                 bootstrap_owner_email: Some(EMAIL.into()),
                 owner_subject: None,
                 storage_root: PathBuf::from(r"C:\cellar-storage"),
