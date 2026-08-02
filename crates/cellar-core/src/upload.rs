@@ -827,37 +827,39 @@ impl UploadService {
         verified: Option<crate::VerifiedUpload>,
         now: OffsetDateTime,
     ) -> Result<FileEntry, UploadServiceError> {
-        if intent.result_identity.is_none()
-            && let Err(error) = finalization
-                .repository
-                .validate_upload_publication(&intent)
-                .await
-        {
-            match error {
-                UploadFinalizeRepositoryError::Conflict
-                | UploadFinalizeRepositoryError::NotFound => {
-                    finalization
+        let observation = finalization
+            .publisher
+            .observe(&intent)
+            .await
+            .map_err(map_publication)?;
+        let published = match decide_upload_recovery(observation) {
+            RecoveryDecision::Publish => {
+                if intent.result_identity.is_none()
+                    && let Err(error) = finalization
                         .repository
-                        .fail_upload_commit(&intent, "publication_precondition_changed", now)
+                        .validate_upload_publication(&intent)
                         .await
-                        .map_err(map_finalize_repository)?;
-                    return Err(map_finalize_repository(error));
+                {
+                    match error {
+                        UploadFinalizeRepositoryError::Conflict
+                        | UploadFinalizeRepositoryError::NotFound => {
+                            finalization
+                                .repository
+                                .fail_upload_commit(
+                                    &intent,
+                                    "publication_precondition_changed",
+                                    now,
+                                )
+                                .await
+                                .map_err(map_finalize_repository)?;
+                            return Err(map_finalize_repository(error));
+                        }
+                        error => return Err(map_finalize_repository(error)),
+                    }
                 }
-                error => return Err(map_finalize_repository(error)),
-            }
-        }
-        let published = if let Some(verified) = verified {
-            self.publish_verified(finalization, &intent, verified, now)
-                .await?
-        } else {
-            let observation = finalization
-                .publisher
-                .observe(&intent)
-                .await
-                .map_err(map_publication)?;
-            match decide_upload_recovery(observation) {
-                RecoveryDecision::Publish => {
-                    let verified = match finalization.publisher.resume_and_retain(&intent).await {
+                let verified = match verified {
+                    Some(verified) => verified,
+                    None => match finalization.publisher.resume_and_retain(&intent).await {
                         Ok(verified) => verified,
                         Err(UploadPublicationError::Conflict) => {
                             finalization
@@ -868,31 +870,31 @@ impl UploadService {
                             return Err(UploadServiceError::Conflict);
                         }
                         Err(error) => return Err(map_publication(error)),
-                    };
-                    self.publish_verified(finalization, &intent, verified, now)
-                        .await?
-                }
-                RecoveryDecision::CompleteCatalog => finalization
-                    .publisher
-                    .inspect_destination(&intent)
+                    },
+                };
+                self.publish_verified(finalization, &intent, verified, now)
+                    .await?
+            }
+            RecoveryDecision::CompleteCatalog => finalization
+                .publisher
+                .inspect_destination(&intent)
+                .await
+                .map_err(map_publication)?,
+            RecoveryDecision::FailConflict => {
+                finalization
+                    .repository
+                    .fail_upload_commit(&intent, "destination_conflict", now)
                     .await
-                    .map_err(map_publication)?,
-                RecoveryDecision::FailConflict => {
-                    finalization
-                        .repository
-                        .fail_upload_commit(&intent, "destination_conflict", now)
-                        .await
-                        .map_err(map_finalize_repository)?;
-                    return Err(UploadServiceError::Conflict);
-                }
-                RecoveryDecision::FailMissing => {
-                    finalization
-                        .repository
-                        .fail_upload_commit(&intent, "publication_missing", now)
-                        .await
-                        .map_err(map_finalize_repository)?;
-                    return Err(UploadServiceError::Unavailable);
-                }
+                    .map_err(map_finalize_repository)?;
+                return Err(UploadServiceError::Conflict);
+            }
+            RecoveryDecision::FailMissing => {
+                finalization
+                    .repository
+                    .fail_upload_commit(&intent, "publication_missing", now)
+                    .await
+                    .map_err(map_finalize_repository)?;
+                return Err(UploadServiceError::Unavailable);
             }
         };
         if published.identity != intent.staging_identity || published.size != intent.expected_size {

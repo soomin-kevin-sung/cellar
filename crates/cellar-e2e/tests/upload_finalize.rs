@@ -416,6 +416,30 @@ impl Harness {
             .await
             .unwrap()
     }
+
+    async fn renamed_pending(&self, id: UploadId) -> UploadCommitIntent {
+        let operations = SqliteOperationRepository::new(self.pool.clone());
+        let target = operations.upload_finalize_target(id).await.unwrap();
+        let verified = self
+            .namespace
+            .verify_and_retain(id, &target, 3)
+            .await
+            .unwrap();
+        let facts = verified.facts();
+        let intent = match operations
+            .prepare_upload_commit(id, &target, facts, self.now)
+            .await
+            .unwrap()
+        {
+            UploadFinalizeStart::Intent(intent) => intent,
+            UploadFinalizeStart::Completed(_) => panic!("new upload unexpectedly complete"),
+        };
+        self.namespace
+            .publish_no_replace(&intent, verified)
+            .await
+            .unwrap();
+        intent
+    }
 }
 
 #[tokio::test]
@@ -546,6 +570,68 @@ async fn fs_applied_restart_completes_after_parent_revision_name_and_state_chang
     restarted.initialize(harness.now).await.unwrap();
     let entry = restarted.finalize(id, harness.now).await.unwrap();
     assert_eq!(entry.id, applied.file_entry_id);
+    assert_eq!(entry.parent_id, Some(parent_id));
+    assert_terminal_exact_once(&harness, id, 2).await;
+}
+
+#[tokio::test]
+async fn renamed_pending_restart_completes_after_project_is_archived() {
+    let harness = Harness::new().await;
+    let id = harness.uploaded("renamed-before-archive.bin").await;
+    let intent = harness.renamed_pending(id).await;
+    sqlx::query("UPDATE project SET status = 'archived', version = version + 1 WHERE id = ?")
+        .bind(harness.project_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    let restarted = harness.service();
+    restarted.initialize(harness.now).await.unwrap();
+    restarted.initialize(harness.now).await.unwrap();
+    let entry = restarted.finalize(id, harness.now).await.unwrap();
+    assert_eq!(entry.id, intent.file_entry_id);
+    assert_eq!(entry.exact_name.as_str(), "renamed-before-archive.bin");
+    assert_terminal_exact_once(&harness, id, 1).await;
+}
+
+#[tokio::test]
+async fn renamed_pending_restart_completes_after_parent_revision_name_and_state_change() {
+    let harness = Harness::new().await;
+    let parent_id = cellar_core::FileEntryId::new();
+    sqlx::query(
+        "INSERT INTO file_entry
+         (id, project_id, parent_id, exact_name, kind, platform_kind,
+          volume_serial, filesystem_file_id, size, mtime_filetime_100ns,
+          hash, hash_state, state, revision, scan_generation, observed_at)
+         VALUES (?, ?, NULL, 'before', 'directory', 'windows_file_id', ?, ?,
+                 0, 1, NULL, 'unknown', 'live', 1, 0,
+                 '1970-01-01T00:00:00.000000000Z')",
+    )
+    .bind(parent_id.to_string())
+    .bind(harness.project_id.to_string())
+    .bind(vec![1_u8; 8])
+    .bind(vec![2_u8; 16])
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+    let id = harness
+        .uploaded_at(Some(parent_id), "renamed-parent-changed.bin")
+        .await;
+    let intent = harness.renamed_pending(id).await;
+    sqlx::query(
+        "UPDATE file_entry SET exact_name = 'after', revision = revision + 1, state = 'missing'
+         WHERE id = ?",
+    )
+    .bind(parent_id.to_string())
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+
+    let restarted = harness.service();
+    restarted.initialize(harness.now).await.unwrap();
+    restarted.initialize(harness.now).await.unwrap();
+    let entry = restarted.finalize(id, harness.now).await.unwrap();
+    assert_eq!(entry.id, intent.file_entry_id);
     assert_eq!(entry.parent_id, Some(parent_id));
     assert_terminal_exact_once(&harness, id, 2).await;
 }

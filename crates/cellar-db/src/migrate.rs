@@ -287,8 +287,16 @@ async fn upgrade_upload_finalization_extension(
         let unsafe_rows: i64 = sqlx::query_scalar(
             "SELECT count(*)
              FROM upload_finalization AS f
-             JOIN operation AS o ON o.id = f.operation_id
-             WHERE o.state NOT IN ('complete', 'failed')",
+             LEFT JOIN operation AS o ON o.id = f.operation_id
+             LEFT JOIN upload_session AS u ON u.id = f.upload_id
+             LEFT JOIN upload_staging_identity AS s ON s.upload_id = f.upload_id
+             WHERE o.id IS NULL
+                OR u.id IS NULL
+                OR s.upload_id IS NULL
+                OR o.kind <> 'upload_finalize'
+                OR o.project_id <> u.project_id
+                OR NOT ((o.state = 'complete' AND u.state = 'complete')
+                     OR (o.state = 'failed' AND u.state = 'failed'))",
         )
         .fetch_one(&mut **transaction)
         .await

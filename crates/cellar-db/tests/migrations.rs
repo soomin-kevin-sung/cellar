@@ -385,7 +385,7 @@ async fn row_bearing_v1_nonterminal_finalization_rolls_back_before_any_alter() {
     for operation_state in ["pending", "fs_applied"] {
         let (_db, pool) = migrated_db().await;
         recreate_v1_upload_finalization(&pool).await;
-        insert_v1_finalization(&pool, operation_state).await;
+        insert_v1_finalization(&pool, operation_state, "committing").await;
 
         assert!(matches!(migrate(&pool).await, Err(DbError::SchemaVersion)));
         assert_v1_finalization_unchanged(&pool).await;
@@ -403,7 +403,7 @@ async fn row_bearing_v1_terminal_finalization_upgrades_with_null_snapshots() {
     for operation_state in ["complete", "failed"] {
         let (_db, pool) = migrated_db().await;
         recreate_v1_upload_finalization(&pool).await;
-        insert_v1_finalization(&pool, operation_state).await;
+        insert_v1_finalization(&pool, operation_state, operation_state).await;
 
         migrate(&pool).await.unwrap();
         assert!(previous_release_v2_accepts_schema_history(&pool).await);
@@ -438,6 +438,59 @@ async fn row_bearing_v1_terminal_finalization_upgrades_with_null_snapshots() {
     }
 }
 
+#[tokio::test]
+async fn row_bearing_v1_inconsistent_terminal_pair_rolls_back_before_any_alter() {
+    let (_db, pool) = migrated_db().await;
+    recreate_v1_upload_finalization(&pool).await;
+    insert_v1_finalization(&pool, "complete", "committing").await;
+    let before = v1_finalization_rows(&pool).await;
+
+    assert!(matches!(migrate(&pool).await, Err(DbError::SchemaVersion)));
+    assert_v1_finalization_unchanged(&pool).await;
+    assert_eq!(v1_finalization_rows(&pool).await, before);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn row_bearing_v1_missing_required_join_rows_roll_back_before_any_alter() {
+    for missing in ["operation", "upload_session", "identity_mapping"] {
+        let (_db, pool) = migrated_db().await;
+        recreate_v1_upload_finalization(&pool).await;
+        insert_v1_finalization(&pool, "complete", "complete").await;
+
+        if missing == "identity_mapping" {
+            sqlx::query("DELETE FROM upload_staging_identity")
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query(if missing == "operation" {
+                "DELETE FROM operation"
+            } else {
+                "DELETE FROM upload_session"
+            })
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+        }
+        let before = v1_finalization_rows(&pool).await;
+
+        assert!(matches!(migrate(&pool).await, Err(DbError::SchemaVersion)));
+        assert_v1_finalization_unchanged(&pool).await;
+        assert_eq!(v1_finalization_rows(&pool).await, before, "{missing}");
+        pool.close().await;
+    }
+}
+
 async fn recreate_v1_upload_finalization(pool: &SqlitePool) {
     sqlx::raw_sql(
         "DROP TABLE upload_finalization;
@@ -457,17 +510,12 @@ async fn recreate_v1_upload_finalization(pool: &SqlitePool) {
     .unwrap();
 }
 
-async fn insert_v1_finalization(pool: &SqlitePool, operation_state: &str) {
+async fn insert_v1_finalization(pool: &SqlitePool, operation_state: &str, upload_state: &str) {
     let project_id = cellar_core::ProjectId::new().to_string();
     let upload_id = cellar_core::UploadId::new().to_string();
     let operation_id = cellar_core::OperationId::new().to_string();
     let file_entry_id = cellar_core::FileEntryId::new().to_string();
     insert_project(pool, &project_id).await;
-    let upload_state = if matches!(operation_state, "complete" | "failed") {
-        operation_state
-    } else {
-        "committing"
-    };
     insert_upload(
         pool,
         &upload_id,
@@ -490,6 +538,12 @@ async fn insert_v1_finalization(pool: &SqlitePool, operation_state: &str) {
     .execute(pool)
     .await
     .unwrap();
+    sqlx::query("INSERT INTO upload_staging_identity (upload_id, platform_identity) VALUES (?, ?)")
+        .bind(&upload_id)
+        .bind(vec![8_u8; 24])
+        .execute(pool)
+        .await
+        .unwrap();
     let result_identity =
         matches!(operation_state, "fs_applied" | "complete").then(|| vec![9_u8; 24]);
     sqlx::query(
@@ -504,6 +558,16 @@ async fn insert_v1_finalization(pool: &SqlitePool, operation_state: &str) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn v1_finalization_rows(pool: &SqlitePool) -> Vec<(String, String, String, Option<Vec<u8>>)> {
+    sqlx::query_as(
+        "SELECT upload_id, operation_id, file_entry_id, result_identity
+         FROM upload_finalization ORDER BY upload_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }
 
 async fn assert_v1_finalization_unchanged(pool: &SqlitePool) {
