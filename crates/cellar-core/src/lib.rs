@@ -15,11 +15,15 @@ pub use file_entry::{
 };
 pub use ids::{FileEntryId, OperationId, ParseIdError, ProjectId, TrashId, UploadId};
 pub use operation::{
-    MAX_UPLOAD_COMMIT_COMPONENTS, MAX_UPLOAD_COMMIT_PAYLOAD_BYTES, PublicationPresence,
+    CaseRenameObservation, CaseRenameRecoveryDecision, CopyMutationObservation,
+    CopyMutationRecoveryDecision, InMemoryProjectMutationCoordinator, MAX_UPLOAD_COMMIT_COMPONENTS,
+    MAX_UPLOAD_COMMIT_PAYLOAD_BYTES, NamespaceMutationObservation,
+    NamespaceMutationRecoveryDecision, ProjectMutationCoordinator, PublicationPresence,
     PublishedUpload, RecoveryDecision, UPLOAD_COMMIT_PAYLOAD_VERSION, UploadCommitIntent,
     UploadCommitPayload, UploadFinalizeRepository, UploadFinalizeRepositoryError,
     UploadFinalizeStart, UploadFinalizeTarget, UploadPublicationError,
     UploadPublicationObservation, UploadPublisher, VerifiedUpload, VerifiedUploadFacts,
+    decide_case_rename_recovery, decide_copy_mutation_recovery, decide_namespace_mutation_recovery,
     decide_upload_recovery,
 };
 pub use project::{

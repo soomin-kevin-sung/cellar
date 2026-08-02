@@ -16,7 +16,9 @@ use axum::response::{IntoResponse, Response};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use cellar_api::health::{Readiness, health_router};
-use cellar_api::routes::files::{DownloadSource, files_router_with_downloads};
+use cellar_api::routes::files::{
+    DownloadSource, FileMutationSource, files_router_with_downloads, files_router_with_services,
+};
 use cellar_api::routes::session::{
     RequestId, SessionState, prepare_request_id, session_router_with_routes, shared_error_response,
 };
@@ -322,6 +324,36 @@ pub fn origin_router_with_authenticator_and_services(
     )
 }
 
+pub struct OriginFileMutationServices {
+    pub uploads: UploadService,
+    pub files: FileService,
+    pub downloads: Arc<dyn DownloadSource>,
+    pub mutations: Arc<dyn FileMutationSource>,
+}
+
+pub fn origin_router_with_authenticator_and_file_mutations(
+    config_path: &std::path::Path,
+    authenticator: Arc<dyn OriginAuthenticator>,
+    readiness: Readiness,
+    shutdown: Shutdown,
+    services: OriginFileMutationServices,
+) -> Router {
+    let protected = uploads_router::<FileEnrollmentStore>(services.uploads).merge(
+        files_router_with_services::<FileEnrollmentStore>(
+            services.files,
+            services.downloads,
+            services.mutations,
+        ),
+    );
+    origin_router_with_authenticator_and_routes(
+        config_path,
+        authenticator,
+        readiness,
+        shutdown,
+        protected,
+    )
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -604,12 +636,27 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         .await
         .map_err(|_| AppError::Database)?;
     readiness.clear(ReadinessBlocker::MigrationRequired);
-    let upload_service = crate::recovery::initialize_upload_finalization_recovery(
+    let (reconciliation_scheduler, mut reconciliation_requests) =
+        BoundedReconciliationScheduler::channel(DEFAULT_RECONCILIATION_QUEUE_CAPACITY);
+    let project_mutations = Arc::new(cellar_core::InMemoryProjectMutationCoordinator::default());
+    let mutation_source = Arc::new(
+        crate::file_mutations::ProductionFileMutationSource::open_with_reconciliation(
+            pool.clone(),
+            storage.clone(),
+            reconciliation_scheduler.clone(),
+            project_mutations.clone(),
+        )
+        .await
+        .map_err(|_| AppError::Recovery)?,
+    );
+    crate::recovery::initialize_file_mutation_recovery(&mutation_source).await?;
+    let upload_service = crate::recovery::initialize_upload_finalization_recovery_with_coordinator(
         &pool,
         staging.clone(),
         staging,
         &readiness,
         time::OffsetDateTime::now_utc(),
+        project_mutations,
     )
     .await?;
     let startup_gates = match options.startup_gates {
@@ -619,9 +666,17 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
     if !startup_gates.recovery_complete {
         readiness.block(ReadinessBlocker::RecoveryRequired);
     }
-    if startup_gates.reconciliation_complete {
-        readiness.clear(ReadinessBlocker::ReconciliationRequired);
-    }
+    apply_reconciliation_startup_gate(
+        &readiness,
+        &startup_gates,
+        !reconciliation_requests.is_empty(),
+    );
+    let reconciliation_readiness = readiness.clone();
+    let reconciliation_task = tokio::spawn(async move {
+        while reconciliation_requests.recv().await.is_some() {
+            reconciliation_readiness.block(ReadinessBlocker::ReconciliationRequired);
+        }
+    });
 
     let tls = ensure_origin_tls(&options.tls_paths, time::OffsetDateTime::now_utc())
         .map_err(|_| AppError::Tls)?;
@@ -643,27 +698,22 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
     let rustls = RustlsConfig::from_config(Arc::new(server_config));
     let file_service =
         FileService::new(Arc::new(cellar_db::SqliteFileRepository::new(pool.clone())));
-    let (reconciliation_scheduler, mut reconciliation_requests) =
-        BoundedReconciliationScheduler::channel(DEFAULT_RECONCILIATION_QUEUE_CAPACITY);
-    let reconciliation_readiness = readiness.clone();
-    let reconciliation_task = tokio::spawn(async move {
-        while reconciliation_requests.recv().await.is_some() {
-            reconciliation_readiness.block(ReadinessBlocker::ReconciliationRequired);
-        }
-    });
     let download_source = Arc::new(ProductionDownloadSource::new(
         Arc::new(SqliteDownloadCatalog::new(pool.clone())),
         Arc::new(WindowsDownloadPlatform::new(storage)),
         reconciliation_scheduler,
     ));
-    let origin = origin_router_with_authenticator_and_services(
+    let origin = origin_router_with_authenticator_and_file_mutations(
         &options.config_path,
         production_authenticator(&options.config)?,
         readiness.clone(),
         options.shutdown.clone(),
-        upload_service,
-        file_service,
-        download_source,
+        OriginFileMutationServices {
+            uploads: upload_service,
+            files: file_service,
+            downloads: download_source,
+            mutations: mutation_source,
+        },
     );
     let result = serve_bound(
         listeners,
@@ -702,6 +752,16 @@ pub async fn check_startup_gates(pool: &sqlx::SqlitePool) -> Result<StartupGates
         recovery_complete: true,
         reconciliation_complete: true,
     })
+}
+
+fn apply_reconciliation_startup_gate(
+    readiness: &Readiness,
+    startup_gates: &StartupGates,
+    has_queued_reconciliation: bool,
+) {
+    if startup_gates.reconciliation_complete && !has_queued_reconciliation {
+        readiness.clear(ReadinessBlocker::ReconciliationRequired);
+    }
 }
 
 pub async fn initialize_upload_recovery(
@@ -818,6 +878,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn queued_startup_reconciliation_keeps_readiness_blocked() {
+        let gates = StartupGates {
+            recovery_complete: true,
+            reconciliation_complete: true,
+        };
+        let queued = Readiness::all_blocked();
+        apply_reconciliation_startup_gate(&queued, &gates, true);
+        assert!(
+            queued
+                .blocker_codes()
+                .contains(&ReadinessBlocker::ReconciliationRequired.code())
+        );
+
+        let empty = Readiness::all_blocked();
+        apply_reconciliation_startup_gate(&empty, &gates, false);
+        assert!(
+            !empty
+                .blocker_codes()
+                .contains(&ReadinessBlocker::ReconciliationRequired.code())
+        );
+    }
 
     struct CountingFetcher(AtomicUsize);
 

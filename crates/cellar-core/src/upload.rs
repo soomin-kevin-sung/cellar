@@ -7,7 +7,8 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
-    FileEntry, FileEntryId, ProjectId, RecoveryDecision, UploadFinalizeRepository,
+    FileEntry, FileEntryId, InMemoryProjectMutationCoordinator, ProjectId,
+    ProjectMutationCoordinator, RecoveryDecision, UploadFinalizeRepository,
     UploadFinalizeRepositoryError, UploadFinalizeStart, UploadId, UploadPublicationError,
     UploadPublisher, decide_upload_recovery,
 };
@@ -266,6 +267,7 @@ pub struct UploadService {
     limits: UploadLimits,
     leases: Arc<UploadLeaseTable>,
     finalization: Option<Arc<FinalizationServices>>,
+    project_mutations: Arc<dyn ProjectMutationCoordinator>,
 }
 
 struct FinalizationServices {
@@ -287,6 +289,7 @@ impl UploadService {
             limits,
             leases: Arc::new(UploadLeaseTable::default()),
             finalization: None,
+            project_mutations: Arc::new(InMemoryProjectMutationCoordinator::default()),
         }
     }
 
@@ -296,7 +299,26 @@ impl UploadService {
         staging: Arc<dyn UploadStagingStore>,
         finalization_repository: Arc<dyn UploadFinalizeRepository>,
         publisher: Arc<dyn UploadPublisher>,
+        limits: UploadLimits,
+    ) -> Self {
+        Self::with_finalization_and_coordinator(
+            repository,
+            staging,
+            finalization_repository,
+            publisher,
+            limits,
+            Arc::new(InMemoryProjectMutationCoordinator::default()),
+        )
+    }
+
+    #[must_use]
+    pub fn with_finalization_and_coordinator(
+        repository: Arc<dyn UploadRepository>,
+        staging: Arc<dyn UploadStagingStore>,
+        finalization_repository: Arc<dyn UploadFinalizeRepository>,
+        publisher: Arc<dyn UploadPublisher>,
         mut limits: UploadLimits,
+        project_mutations: Arc<dyn ProjectMutationCoordinator>,
     ) -> Self {
         limits.max_chunk_size = limits.max_chunk_size.min(DEFAULT_MAX_CHUNK_SIZE);
         Self {
@@ -308,6 +330,7 @@ impl UploadService {
                 repository: finalization_repository,
                 publisher,
             })),
+            project_mutations,
         }
     }
 
@@ -506,12 +529,22 @@ impl UploadService {
             return match start {
                 UploadFinalizeStart::Completed(entry) => Ok(entry),
                 UploadFinalizeStart::Intent(intent) => {
+                    let _project_guard = self
+                        .project_mutations
+                        .project_lock(intent.project_id)
+                        .lock_owned()
+                        .await;
                     self.recover_commit(finalization, intent, None, now).await
                 }
             };
         }
 
         let session = self.reconcile_locked(id, now).await?;
+        let _project_guard = self
+            .project_mutations
+            .project_lock(session.project_id)
+            .lock_owned()
+            .await;
         if session.pending.is_some() || session.committed_offset != session.expected_size {
             return Err(UploadServiceError::Conflict);
         }
@@ -593,6 +626,11 @@ impl UploadService {
                 .map_err(map_finalize_repository)?;
             for intent in intents {
                 let _lease = self.leases.acquire(intent.upload_id).await;
+                let _project_guard = self
+                    .project_mutations
+                    .project_lock(intent.project_id)
+                    .lock_owned()
+                    .await;
                 self.recover_commit(finalization, intent, None, now).await?;
             }
         }

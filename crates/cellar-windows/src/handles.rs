@@ -102,6 +102,16 @@ mod platform {
             &self.root
         }
 
+        pub fn current_name(&self, handle: &VerifiedHandle) -> Result<String, StorageError> {
+            let facts = self.verify_existing(handle)?;
+            facts
+                .final_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .ok_or_else(io_error)
+        }
+
         pub fn open_verified(
             &self,
             parent: &VerifiedHandle,
@@ -110,6 +120,27 @@ mod platform {
             self.verify_parent(parent)?;
             let file = open_relative(parent.file.as_raw_handle(), name, OpenMode::Existing)?;
             self.verify_new_handle(file)
+        }
+
+        /// Opens a directory for stable namespace traversal. Multiple readers
+        /// may coexist, but delete sharing is denied so the namespace cannot
+        /// move after validation.
+        pub fn open_verified_directory_stable(
+            &self,
+            parent: &VerifiedHandle,
+            name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            self.verify_parent(parent)?;
+            let file = open_relative(
+                parent.file.as_raw_handle(),
+                name,
+                OpenMode::ExistingDirectoryStable,
+            )?;
+            let handle = self.verify_new_handle(file)?;
+            if handle.kind != EntryKind::Directory {
+                return Err(unsupported());
+            }
+            Ok(handle)
         }
 
         pub fn open_verified_writable(
@@ -185,6 +216,21 @@ mod platform {
                 parent.file.as_raw_handle(),
                 name,
                 OpenMode::ExistingPublication,
+            )?;
+            self.verify_new_handle(file)
+        }
+
+        /// Opens a stable file or directory namespace entry for a no-replace mutation.
+        pub fn open_verified_for_namespace_mutation(
+            &self,
+            parent: &VerifiedHandle,
+            name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            self.verify_parent(parent)?;
+            let file = open_relative(
+                parent.file.as_raw_handle(),
+                name,
+                OpenMode::ExistingMutation,
             )?;
             self.verify_new_handle(file)
         }
@@ -272,6 +318,26 @@ mod platform {
                 return Err(unsupported());
             }
             handle.file.sync_all().map_err(map_io)
+        }
+
+        pub fn copy_file_and_flush(
+            &self,
+            source: &VerifiedHandle,
+            destination: &VerifiedHandle,
+        ) -> Result<i64, StorageError> {
+            let source_facts = self.verify_existing(source)?;
+            let destination_facts = self.verify_existing(destination)?;
+            if source_facts.kind != EntryKind::File || destination_facts.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            let mut reader = source.file.try_clone().map_err(map_io)?;
+            let mut writer = destination.file.try_clone().map_err(map_io)?;
+            reader.seek(SeekFrom::Start(0)).map_err(map_io)?;
+            writer.set_len(0).map_err(map_io)?;
+            writer.seek(SeekFrom::Start(0)).map_err(map_io)?;
+            let copied = std::io::copy(&mut reader, &mut writer).map_err(map_io)?;
+            writer.sync_all().map_err(map_io)?;
+            i64::try_from(copied).map_err(|_| io_error())
         }
 
         pub fn file_length_and_mtime(
@@ -627,8 +693,10 @@ mod platform {
     enum OpenMode {
         Existing,
         ExistingWritable,
+        ExistingDirectoryStable,
         DownloadExisting,
         ExistingPublication,
+        ExistingMutation,
         CreateFile,
         CreateExclusiveFile,
         CreateDirectory,
@@ -733,6 +801,12 @@ mod platform {
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
                 FILE_SHARE_READ,
             ),
+            OpenMode::ExistingDirectoryStable => (
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                FILE_GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
             OpenMode::DownloadExisting => (
                 FILE_OPEN,
                 FILE_NON_DIRECTORY_FILE,
@@ -745,6 +819,9 @@ mod platform {
                 FILE_GENERIC_READ | DELETE,
                 FILE_SHARE_READ,
             ),
+            OpenMode::ExistingMutation => {
+                (FILE_OPEN, 0, FILE_GENERIC_READ | DELETE, FILE_SHARE_READ)
+            }
             OpenMode::CreateFile => (
                 FILE_CREATE,
                 FILE_NON_DIRECTORY_FILE,
@@ -760,7 +837,7 @@ mod platform {
             OpenMode::CreateDirectory => (
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE,
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
             ),
         };
@@ -919,7 +996,19 @@ mod platform_stub {
             unreachable!("WindowsStorage cannot be constructed off Windows")
         }
 
+        pub fn current_name(&self, _handle: &VerifiedHandle) -> Result<String, StorageError> {
+            Err(unsupported())
+        }
+
         pub fn open_verified(
+            &self,
+            _parent: &VerifiedHandle,
+            _name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn open_verified_directory_stable(
             &self,
             _parent: &VerifiedHandle,
             _name: &WindowsName,
@@ -1004,10 +1093,26 @@ mod platform_stub {
             Err(unsupported())
         }
 
+        pub fn open_verified_for_namespace_mutation(
+            &self,
+            _parent: &VerifiedHandle,
+            _name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
         pub fn file_length(&self, _handle: &VerifiedHandle) -> Result<i64, StorageError> {
             Err(unsupported())
         }
         pub fn flush_file(&self, _handle: &VerifiedHandle) -> Result<(), StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn copy_file_and_flush(
+            &self,
+            _source: &VerifiedHandle,
+            _destination: &VerifiedHandle,
+        ) -> Result<i64, StorageError> {
             Err(unsupported())
         }
         pub fn file_length_and_mtime(

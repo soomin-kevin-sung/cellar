@@ -50,7 +50,7 @@ impl WindowsUploadStaging {
         let directory = match storage.create_directory_no_replace(storage.root(), &name) {
             Ok(handle) => handle,
             Err(error) if error.kind() == StorageErrorKind::Conflict => {
-                storage.open_verified(storage.root(), &name)?
+                storage.open_verified_directory_stable(storage.root(), &name)?
             }
             Err(error) => return Err(error),
         };

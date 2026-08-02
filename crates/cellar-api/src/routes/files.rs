@@ -3,11 +3,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::{Extension, RawQuery, Request};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -30,6 +30,7 @@ pub const MAX_FILE_QUERY_BYTES: usize = 8 * 1024;
 pub const FILE_CURSOR_VERSION: u8 = 1;
 pub const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_OPEN_DOWNLOADS: usize = 8;
+pub const MAX_FILE_MUTATION_BODY_BYTES: usize = 64 * 1024;
 
 /// Keeps one download-capacity slot owned by cancellation-insensitive I/O.
 pub type DownloadReadLease = Arc<OwnedSemaphorePermit>;
@@ -41,6 +42,7 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 struct FilesState {
     service: FileService,
     downloads: Arc<dyn DownloadSource>,
+    mutations: Arc<dyn FileMutationSource>,
     download_permits: Arc<Semaphore>,
 }
 
@@ -48,12 +50,27 @@ pub fn files_router<S>(service: FileService) -> Router<SessionState<S>>
 where
     S: EnrollmentStore + 'static,
 {
-    files_router_with_downloads(service, Arc::new(DisabledDownloadSource))
+    files_router_with_services(
+        service,
+        Arc::new(DisabledDownloadSource),
+        Arc::new(DisabledFileMutationSource),
+    )
 }
 
 pub fn files_router_with_downloads<S>(
     service: FileService,
     downloads: Arc<dyn DownloadSource>,
+) -> Router<SessionState<S>>
+where
+    S: EnrollmentStore + 'static,
+{
+    files_router_with_services(service, downloads, Arc::new(DisabledFileMutationSource))
+}
+
+pub fn files_router_with_services<S>(
+    service: FileService,
+    downloads: Arc<dyn DownloadSource>,
+    mutations: Arc<dyn FileMutationSource>,
 ) -> Router<SessionState<S>>
 where
     S: EnrollmentStore + 'static,
@@ -64,8 +81,20 @@ where
             get(list_files).fallback(method_not_allowed),
         )
         .route(
-            "/api/v1/projects/{project_id}/files/{file_id}/{action}",
+            "/api/v1/projects/{project_id}/files/{file_id}/download",
             get(download_file).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/rename",
+            post(mutate_file).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/move",
+            post(mutate_file).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/copy",
+            post(mutate_file).fallback(method_not_allowed),
         )
         .route(
             "/api/v1/projects/{project_id}/files/",
@@ -73,6 +102,10 @@ where
         )
         .route(
             "/api/v1/projects/{project_id}/files/{file_id}",
+            any(invalid_file_path),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/{action}",
             any(invalid_file_path),
         )
         .route(
@@ -86,8 +119,78 @@ where
         .layer(Extension(FilesState {
             service,
             downloads,
+            mutations,
             download_permits: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
         }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileMutationCommand {
+    Rename {
+        expected_revision: i64,
+        name: cellar_core::FileExactName,
+    },
+    Move {
+        expected_revision: i64,
+        destination_parent_id: Option<FileEntryId>,
+    },
+    Copy {
+        expected_revision: i64,
+        destination_parent_id: Option<FileEntryId>,
+        name: cellar_core::FileExactName,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileMutationError {
+    ProjectNotFound,
+    FileNotFound,
+    Conflict,
+    StaleRevision,
+    InvalidName,
+    Unsupported,
+    InsufficientStorage,
+    Unavailable,
+}
+
+impl FileMutationError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProjectNotFound => "project_not_found",
+            Self::FileNotFound => "file_not_found",
+            Self::Conflict => "file_destination_conflict",
+            Self::StaleRevision => "stale_file_revision",
+            Self::InvalidName => "invalid_file_name",
+            Self::Unsupported => "unsupported_file_entry",
+            Self::InsufficientStorage => "insufficient_storage",
+            Self::Unavailable => "file_mutation_unavailable",
+        }
+    }
+}
+
+#[async_trait]
+pub trait FileMutationSource: Send + Sync {
+    async fn mutate(
+        &self,
+        project_id: ProjectId,
+        file_id: FileEntryId,
+        command: FileMutationCommand,
+    ) -> Result<FileEntry, FileMutationError>;
+}
+
+struct DisabledFileMutationSource;
+
+#[async_trait]
+impl FileMutationSource for DisabledFileMutationSource {
+    async fn mutate(
+        &self,
+        _: ProjectId,
+        _: FileEntryId,
+        _: FileMutationCommand,
+    ) -> Result<FileEntry, FileMutationError> {
+        Err(FileMutationError::Unavailable)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +397,123 @@ fn file_entry_body(entry: FileEntry, request_id: &str) -> Result<FileEntryBody, 
             .format(&Rfc3339)
             .map_err(|_| FileApiError::unavailable(request_id.to_owned()))?,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenameBody {
+    expected_revision: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MoveBody {
+    expected_revision: String,
+    destination_parent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CopyBody {
+    expected_revision: String,
+    destination_parent_id: Option<String>,
+    name: String,
+}
+
+async fn mutate_file(
+    Extension(state): Extension<FilesState>,
+    request: Request,
+) -> Result<impl IntoResponse, FileApiError> {
+    let request_id = request_id(request.headers())?;
+    let (project_id, file_id, action) = parse_mutation_path(request.uri().path(), &request_id)?;
+    let bytes = to_bytes(request.into_body(), MAX_FILE_MUTATION_BODY_BYTES)
+        .await
+        .map_err(|_| FileApiError::invalid("invalid_file_mutation", request_id.clone()))?;
+    let command = match action.as_str() {
+        "rename" => {
+            let body: RenameBody = serde_json::from_slice(&bytes)
+                .map_err(|_| FileApiError::invalid("invalid_file_mutation", request_id.clone()))?;
+            FileMutationCommand::Rename {
+                expected_revision: parse_expected_revision(&body.expected_revision, &request_id)?,
+                name: cellar_core::FileExactName::parse(body.name)
+                    .map_err(|_| FileApiError::invalid("invalid_file_name", request_id.clone()))?,
+            }
+        }
+        "move" => {
+            let body: MoveBody = serde_json::from_slice(&bytes)
+                .map_err(|_| FileApiError::invalid("invalid_file_mutation", request_id.clone()))?;
+            FileMutationCommand::Move {
+                expected_revision: parse_expected_revision(&body.expected_revision, &request_id)?,
+                destination_parent_id: parse_optional_file_id(
+                    body.destination_parent_id,
+                    &request_id,
+                )?,
+            }
+        }
+        "copy" => {
+            let body: CopyBody = serde_json::from_slice(&bytes)
+                .map_err(|_| FileApiError::invalid("invalid_file_mutation", request_id.clone()))?;
+            FileMutationCommand::Copy {
+                expected_revision: parse_expected_revision(&body.expected_revision, &request_id)?,
+                destination_parent_id: parse_optional_file_id(
+                    body.destination_parent_id,
+                    &request_id,
+                )?,
+                name: cellar_core::FileExactName::parse(body.name)
+                    .map_err(|_| FileApiError::invalid("invalid_file_name", request_id.clone()))?,
+            }
+        }
+        _ => {
+            return Err(FileApiError::invalid("invalid_file_mutation", request_id));
+        }
+    };
+    let entry = state
+        .mutations
+        .mutate(project_id, file_id, command)
+        .await
+        .map_err(|error| FileApiError::mutation(error, request_id.clone()))?;
+    Ok((
+        [(REQUEST_ID, request_id.clone())],
+        Json(file_entry_body(entry, &request_id)?),
+    ))
+}
+
+fn parse_expected_revision(value: &str, request_id: &str) -> Result<i64, FileApiError> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || value.starts_with('0')
+    {
+        return Err(FileApiError::invalid(
+            "invalid_file_revision",
+            request_id.to_owned(),
+        ));
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| FileApiError::invalid("invalid_file_revision", request_id.to_owned()))
+}
+
+fn parse_optional_file_id(
+    value: Option<String>,
+    request_id: &str,
+) -> Result<Option<FileEntryId>, FileApiError> {
+    value
+        .map(|value| {
+            let parsed = value.parse::<FileEntryId>().map_err(|_| {
+                FileApiError::invalid("invalid_destination_parent", request_id.to_owned())
+            })?;
+            if parsed.to_string() != value {
+                return Err(FileApiError::invalid(
+                    "invalid_destination_parent",
+                    request_id.to_owned(),
+                ));
+            }
+            Ok(parsed)
+        })
+        .transpose()
 }
 
 async fn download_file(
@@ -776,6 +996,31 @@ fn parse_download_path(
     Ok((project_id, file_id))
 }
 
+fn parse_mutation_path(
+    path: &str,
+    request_id: &str,
+) -> Result<(ProjectId, FileEntryId, String), FileApiError> {
+    let invalid = || FileApiError::invalid("invalid_file_path", request_id.to_owned());
+    let tail = path.strip_prefix("/api/v1/projects/").ok_or_else(invalid)?;
+    let (project, resource) = tail.split_once("/files/").ok_or_else(invalid)?;
+    let (file, action) = resource.split_once('/').ok_or_else(invalid)?;
+    if project.is_empty()
+        || file.is_empty()
+        || action.is_empty()
+        || action.contains(['/', '\\', '%'])
+        || project.contains(['/', '\\', '%'])
+        || file.contains(['/', '\\', '%'])
+    {
+        return Err(invalid());
+    }
+    let project_id = project.parse::<ProjectId>().map_err(|_| invalid())?;
+    let file_id = file.parse::<FileEntryId>().map_err(|_| invalid())?;
+    if project_id.to_string() != project || file_id.to_string() != file {
+        return Err(invalid());
+    }
+    Ok((project_id, file_id, action.to_owned()))
+}
+
 async fn invalid_file_path(headers: HeaderMap) -> FileApiError {
     match request_id(&headers) {
         Ok(request_id) => FileApiError::invalid("invalid_file_path", request_id),
@@ -871,6 +1116,45 @@ impl FileApiError {
             FileRepositoryError::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The file catalog is temporarily unavailable.",
+            ),
+        };
+        Self {
+            status,
+            code: error.code(),
+            message,
+            request_id,
+            content_range: None,
+            retry_after: false,
+        }
+    }
+
+    fn mutation(error: FileMutationError, request_id: String) -> Self {
+        let (status, message) = match error {
+            FileMutationError::ProjectNotFound => {
+                (StatusCode::NOT_FOUND, "The project was not found.")
+            }
+            FileMutationError::FileNotFound => (StatusCode::NOT_FOUND, "The file was not found."),
+            FileMutationError::Conflict => (
+                StatusCode::CONFLICT,
+                "The destination changed outside Cellar and was preserved.",
+            ),
+            FileMutationError::StaleRevision => (
+                StatusCode::CONFLICT,
+                "The file changed; refresh and try again.",
+            ),
+            FileMutationError::InvalidName => {
+                (StatusCode::BAD_REQUEST, "The destination name is invalid.")
+            }
+            FileMutationError::Unsupported => {
+                (StatusCode::CONFLICT, "The file cannot be changed safely.")
+            }
+            FileMutationError::InsufficientStorage => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "There is not enough storage to copy the file.",
+            ),
+            FileMutationError::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "File mutations are temporarily unavailable.",
             ),
         };
         Self {

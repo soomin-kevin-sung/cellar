@@ -1,14 +1,39 @@
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::sync::Mutex;
 
 use crate::{FileEntry, FileEntryId, OperationId, ProjectId, StagingIdentity, UploadId};
 
 pub const UPLOAD_COMMIT_PAYLOAD_VERSION: i64 = 2;
 pub const MAX_UPLOAD_COMMIT_COMPONENTS: usize = 256;
 pub const MAX_UPLOAD_COMMIT_PAYLOAD_BYTES: usize = 128 * 1024;
+
+pub trait ProjectMutationCoordinator: Send + Sync {
+    fn project_lock(&self, project_id: ProjectId) -> Arc<Mutex<()>>;
+}
+
+#[derive(Default)]
+pub struct InMemoryProjectMutationCoordinator {
+    locks: StdMutex<HashMap<ProjectId, Arc<Mutex<()>>>>,
+}
+
+impl ProjectMutationCoordinator for InMemoryProjectMutationCoordinator {
+    fn project_lock(&self, project_id: ProjectId) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks
+            .entry(project_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationPresence {
@@ -29,6 +54,118 @@ pub enum RecoveryDecision {
     CompleteCatalog,
     FailConflict,
     FailMissing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamespaceMutationObservation {
+    pub source: PublicationPresence,
+    pub destination: PublicationPresence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceMutationRecoveryDecision {
+    Retry,
+    Complete,
+    Conflict,
+    Missing,
+}
+
+#[must_use]
+pub const fn decide_namespace_mutation_recovery(
+    observation: NamespaceMutationObservation,
+) -> NamespaceMutationRecoveryDecision {
+    use NamespaceMutationRecoveryDecision::{Complete, Conflict, Missing, Retry};
+    use PublicationPresence::{Absent, Expected};
+    match (observation.source, observation.destination) {
+        (Expected, Absent) => Retry,
+        (Absent, Expected) => Complete,
+        (Absent, Absent) => Missing,
+        _ => Conflict,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyMutationObservation {
+    pub source: PublicationPresence,
+    pub staging: PublicationPresence,
+    pub destination: PublicationPresence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyMutationRecoveryDecision {
+    Publish,
+    Complete,
+    Recopy,
+    Conflict,
+    Missing,
+}
+
+#[must_use]
+pub const fn decide_copy_mutation_recovery(
+    observation: CopyMutationObservation,
+) -> CopyMutationRecoveryDecision {
+    use CopyMutationRecoveryDecision::{Complete, Conflict, Missing, Publish, Recopy};
+    use PublicationPresence::{Absent, Expected, Unexpected};
+    if matches!(observation.source, Unexpected)
+        || matches!(observation.staging, Unexpected)
+        || matches!(observation.destination, Unexpected)
+    {
+        return Conflict;
+    }
+    match (
+        observation.source,
+        observation.staging,
+        observation.destination,
+    ) {
+        (_, Expected, Absent) => Publish,
+        (_, Absent, Expected) => Complete,
+        (Expected, Absent, Absent) => Recopy,
+        (Absent, Absent, Absent) => Missing,
+        _ => Conflict,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaseRenameObservation {
+    pub source: PublicationPresence,
+    pub temporary: PublicationPresence,
+    pub final_name: PublicationPresence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaseRenameRecoveryDecision {
+    RenameToTemporary,
+    RenameToFinal,
+    Complete,
+    Conflict,
+    Missing,
+}
+
+#[must_use]
+pub const fn decide_case_rename_recovery(
+    observation: CaseRenameObservation,
+) -> CaseRenameRecoveryDecision {
+    use CaseRenameRecoveryDecision::{
+        Complete, Conflict, Missing, RenameToFinal, RenameToTemporary,
+    };
+    use PublicationPresence::{Absent, Expected, Unexpected};
+    if matches!(observation.source, Unexpected)
+        || matches!(observation.temporary, Unexpected)
+        || matches!(observation.final_name, Unexpected)
+    {
+        return Conflict;
+    }
+    match (
+        observation.source,
+        observation.temporary,
+        observation.final_name,
+    ) {
+        (Expected, Absent, Absent) => RenameToTemporary,
+        (Absent, Expected, Absent) => RenameToFinal,
+        (Absent, Absent, Expected) => Complete,
+        (Absent, Absent, Absent) => Missing,
+        _ => Conflict,
+    }
 }
 
 #[must_use]
@@ -249,4 +386,25 @@ pub trait UploadPublisher: Send + Sync {
         &self,
         intent: &UploadCommitIntent,
     ) -> Result<PublishedUpload, UploadPublicationError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn project_mutation_coordinator_serializes_only_the_same_project() {
+        let coordinator = InMemoryProjectMutationCoordinator::default();
+        let first_project = ProjectId::new();
+        let other_project = ProjectId::new();
+        let first_lock = coordinator.project_lock(first_project);
+        let same_lock = coordinator.project_lock(first_project);
+        let other_lock = coordinator.project_lock(other_project);
+
+        let guard = first_lock.lock_owned().await;
+        assert!(same_lock.try_lock().is_err());
+        assert!(other_lock.try_lock().is_ok());
+        drop(guard);
+        assert!(coordinator.project_lock(first_project).try_lock().is_ok());
+    }
 }
