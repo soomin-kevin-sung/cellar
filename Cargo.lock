@@ -269,15 +269,20 @@ dependencies = [
 name = "cellar-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "cellar-auth",
  "cellar-config",
  "cellar-core",
+ "cellar-db",
+ "futures-util",
  "http-body-util",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
+ "time",
  "tokio",
  "tower",
 ]
@@ -319,10 +324,13 @@ dependencies = [
 name = "cellar-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bincode",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
+ "time",
  "uuid",
 ]
 
@@ -330,10 +338,15 @@ dependencies = [
 name = "cellar-db"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "cellar-core",
  "libsqlite3-sys",
+ "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
 ]
 
@@ -582,6 +595,9 @@ name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "digest"
