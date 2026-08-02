@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
+use async_trait::async_trait;
+use axum::body::Body;
 use axum::extract::{Extension, RawQuery, Request};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
@@ -13,6 +16,7 @@ use cellar_core::{
     DEFAULT_FILE_LIST_LIMIT, FileCursor, FileEntry, FileEntryId, FileListRequest,
     FileRepositoryError, FileService, MAX_FILE_LIST_LIMIT, OperationId, ProjectId,
 };
+use cellar_storage::{RangeDecision, decide_range};
 use serde::{Deserialize, Serialize};
 use time::UtcOffset;
 use time::format_description::well_known::Rfc3339;
@@ -29,9 +33,20 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 #[derive(Clone)]
 struct FilesState {
     service: FileService,
+    downloads: Arc<dyn DownloadSource>,
 }
 
 pub fn files_router<S>(service: FileService) -> Router<SessionState<S>>
+where
+    S: EnrollmentStore + 'static,
+{
+    files_router_with_downloads(service, Arc::new(DisabledDownloadSource))
+}
+
+pub fn files_router_with_downloads<S>(
+    service: FileService,
+    downloads: Arc<dyn DownloadSource>,
+) -> Router<SessionState<S>>
 where
     S: EnrollmentStore + 'static,
 {
@@ -41,14 +56,131 @@ where
             get(list_files).fallback(method_not_allowed),
         )
         .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/{action}",
+            get(download_file).fallback(method_not_allowed),
+        )
+        .route(
             "/api/v1/projects/{project_id}/files/",
             any(invalid_file_path),
         )
         .route(
-            "/api/v1/projects/{project_id}/files/{*rest}",
+            "/api/v1/projects/{project_id}/files/{file_id}",
             any(invalid_file_path),
         )
-        .layer(Extension(FilesState { service }))
+        .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/{action}/",
+            any(invalid_file_path),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/{file_id}/{action}/{*rest}",
+            any(invalid_file_path),
+        )
+        .layer(Extension(FilesState { service, downloads }))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DownloadMetadata {
+    filename: String,
+    length: u64,
+    ready_sha256: Option<[u8; 32]>,
+}
+
+impl DownloadMetadata {
+    pub fn new(
+        filename: impl Into<String>,
+        length: u64,
+        ready_sha256: Option<[u8; 32]>,
+    ) -> Result<Self, DownloadMetadataError> {
+        let filename = filename.into();
+        if filename.is_empty() || filename.len() > 4 * 1024 || length > i64::MAX as u64 {
+            return Err(DownloadMetadataError);
+        }
+        Ok(Self {
+            filename,
+            length,
+            ready_sha256,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadMetadataError;
+
+impl fmt::Display for DownloadMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid_download_metadata")
+    }
+}
+
+impl std::error::Error for DownloadMetadataError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DownloadSpan {
+    start: u64,
+    length: u64,
+}
+
+impl DownloadSpan {
+    #[must_use]
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn length(self) -> u64 {
+        self.length
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadError {
+    ProjectNotFound,
+    FileNotFound,
+    NotAFile,
+    Settling,
+    Unsupported,
+    IdentityChanged,
+    Unavailable,
+}
+
+/// An opened download whose metadata, verification, and body all refer to the
+/// same stable filesystem handle.
+#[async_trait]
+pub trait VerifiedDownload: Send {
+    fn metadata(&self) -> &DownloadMetadata;
+
+    async fn verify(&self) -> Result<(), DownloadError>;
+
+    fn into_body(self: Box<Self>, span: DownloadSpan) -> Body;
+}
+
+#[async_trait]
+pub trait DownloadSource: Send + Sync {
+    /// Opens and validates project/catalog state, then returns a stable handle.
+    ///
+    /// Implementations accept active and archived projects, reject deleted
+    /// projects and non-live file states with the matching `DownloadError`,
+    /// compare the catalog identity/size/mtime against the opened handle, and
+    /// schedule reconciliation before returning `IdentityChanged`. A SHA-256
+    /// is supplied in `DownloadMetadata` only when its catalog state is ready.
+    async fn open_verified(
+        &self,
+        project_id: ProjectId,
+        file_id: FileEntryId,
+    ) -> Result<Box<dyn VerifiedDownload>, DownloadError>;
+}
+
+struct DisabledDownloadSource;
+
+#[async_trait]
+impl DownloadSource for DisabledDownloadSource {
+    async fn open_verified(
+        &self,
+        _: ProjectId,
+        _: FileEntryId,
+    ) -> Result<Box<dyn VerifiedDownload>, DownloadError> {
+        Err(DownloadError::Unavailable)
+    }
 }
 
 #[derive(Serialize)]
@@ -99,6 +231,190 @@ fn file_entry_body(entry: FileEntry, request_id: &str) -> Result<FileEntryBody, 
             .format(&Rfc3339)
             .map_err(|_| FileApiError::unavailable(request_id.to_owned()))?,
     })
+}
+
+async fn download_file(
+    Extension(state): Extension<FilesState>,
+    request: Request,
+) -> Result<Response, FileApiError> {
+    let request_id = request_id(request.headers())?;
+    let (project_id, file_id) = parse_download_path(request.uri().path(), &request_id)?;
+    let download = state
+        .downloads
+        .open_verified(project_id, file_id)
+        .await
+        .map_err(|error| FileApiError::download(error, request_id.clone()))?;
+    let metadata = download.metadata().clone();
+    download
+        .verify()
+        .await
+        .map_err(|error| FileApiError::download(error, request_id.clone()))?;
+
+    let etag = metadata.ready_sha256.map(strong_sha256_etag);
+    let decision = match header_value(request.headers(), header::RANGE) {
+        HeaderField::Value(range) => match header_value(request.headers(), header::IF_RANGE) {
+            HeaderField::Missing => decide_range(Some(&range), metadata.length),
+            HeaderField::Value(if_range) if etag.as_deref() == Some(if_range.as_str()) => {
+                decide_range(Some(&range), metadata.length)
+            }
+            HeaderField::Value(_) | HeaderField::Invalid => RangeDecision::Full,
+        },
+        HeaderField::Missing | HeaderField::Invalid => RangeDecision::Full,
+    };
+    let (status, span, content_range) = match decision {
+        RangeDecision::Full => (
+            StatusCode::OK,
+            DownloadSpan {
+                start: 0,
+                length: metadata.length,
+            },
+            None,
+        ),
+        RangeDecision::Partial {
+            start,
+            end_inclusive,
+        } => (
+            StatusCode::PARTIAL_CONTENT,
+            DownloadSpan {
+                start,
+                length: end_inclusive - start + 1,
+            },
+            Some(format!("bytes {start}-{end_inclusive}/{}", metadata.length)),
+        ),
+        RangeDecision::Unsatisfiable { len } => {
+            return Err(FileApiError::range(len, request_id));
+        }
+    };
+
+    let mut headers = download_headers(&metadata, &request_id)?;
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&span.length.to_string())
+            .map_err(|_| FileApiError::unavailable(request_id.clone()))?,
+    );
+    if let Some(content_range) = content_range {
+        headers.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&content_range)
+                .map_err(|_| FileApiError::unavailable(request_id.clone()))?,
+        );
+    }
+    if let Some(etag) = etag {
+        headers.insert(
+            header::ETAG,
+            HeaderValue::from_str(&etag)
+                .map_err(|_| FileApiError::unavailable(request_id.clone()))?,
+        );
+    }
+    let body = if request.method() == Method::HEAD {
+        Body::empty()
+    } else {
+        download.into_body(span)
+    };
+    Ok((status, headers, body).into_response())
+}
+
+enum HeaderField {
+    Missing,
+    Value(String),
+    Invalid,
+}
+
+fn header_value(headers: &HeaderMap, name: HeaderName) -> HeaderField {
+    let values: Vec<_> = headers.get_all(name).iter().collect();
+    match values.as_slice() {
+        [] => HeaderField::Missing,
+        [value] => value
+            .to_str()
+            .map(|value| HeaderField::Value(value.to_owned()))
+            .unwrap_or(HeaderField::Invalid),
+        _ => HeaderField::Invalid,
+    }
+}
+
+fn strong_sha256_etag(hash: [u8; 32]) -> String {
+    format!("\"sha256-{}\"", URL_SAFE_NO_PAD.encode(hash))
+}
+
+fn download_headers(
+    metadata: &DownloadMetadata,
+    request_id: &str,
+) -> Result<HeaderMap, FileApiError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(
+        REQUEST_ID,
+        HeaderValue::from_str(request_id)
+            .map_err(|_| FileApiError::unavailable(request_id.to_owned()))?,
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(&metadata.filename))
+            .map_err(|_| FileApiError::unavailable(request_id.to_owned()))?,
+    );
+    Ok(headers)
+}
+
+fn content_disposition(filename: &str) -> String {
+    let sanitized: String = filename
+        .chars()
+        .filter(|character| {
+            !character.is_control() && !matches!(character, '/' | '\\' | '\r' | '\n')
+        })
+        .collect();
+    let sanitized = if sanitized.is_empty() {
+        "download"
+    } else {
+        &sanitized
+    };
+    let fallback: String = sanitized
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() && !matches!(character, '"' | '\\') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded = percent_encode_filename(sanitized);
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+fn percent_encode_filename(filename: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(filename.len());
+    for byte in filename.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 async fn list_files(
@@ -309,6 +625,31 @@ fn parse_project_file_path(path: &str, request_id: &str) -> Result<ProjectId, Fi
         .map_err(|_| FileApiError::invalid("invalid_project_id", request_id.to_owned()))
 }
 
+fn parse_download_path(
+    path: &str,
+    request_id: &str,
+) -> Result<(ProjectId, FileEntryId), FileApiError> {
+    let invalid = || FileApiError::invalid("invalid_file_path", request_id.to_owned());
+    let tail = path
+        .strip_prefix("/api/v1/projects/")
+        .and_then(|tail| tail.strip_suffix("/download"))
+        .ok_or_else(invalid)?;
+    let (project, file) = tail.split_once("/files/").ok_or_else(invalid)?;
+    if project.is_empty()
+        || file.is_empty()
+        || project.contains(['/', '\\', '%'])
+        || file.contains(['/', '\\', '%'])
+    {
+        return Err(invalid());
+    }
+    let project_id: ProjectId = project.parse().map_err(|_| invalid())?;
+    let file_id: FileEntryId = file.parse().map_err(|_| invalid())?;
+    if project_id.to_string() != project || file_id.to_string() != file {
+        return Err(invalid());
+    }
+    Ok((project_id, file_id))
+}
+
 async fn invalid_file_path(headers: HeaderMap) -> FileApiError {
     match request_id(&headers) {
         Ok(request_id) => FileApiError::invalid("invalid_file_path", request_id),
@@ -366,6 +707,7 @@ pub struct FileApiError {
     code: &'static str,
     message: &'static str,
     request_id: String,
+    content_range: Option<String>,
 }
 
 impl FileApiError {
@@ -375,6 +717,7 @@ impl FileApiError {
             code,
             message: "The file listing request is invalid.",
             request_id,
+            content_range: None,
         }
     }
 
@@ -407,6 +750,7 @@ impl FileApiError {
             code: error.code(),
             message,
             request_id,
+            content_range: None,
         }
     }
 
@@ -420,6 +764,64 @@ impl FileApiError {
             code: "method_not_allowed",
             message: "The request method is not allowed for this file resource.",
             request_id,
+            content_range: None,
+        }
+    }
+
+    fn download(error: DownloadError, request_id: String) -> Self {
+        let (status, code, message) = match error {
+            DownloadError::ProjectNotFound => (
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+                "The project was not found.",
+            ),
+            DownloadError::FileNotFound => (
+                StatusCode::NOT_FOUND,
+                "file_not_found",
+                "The file was not found.",
+            ),
+            DownloadError::NotAFile => (
+                StatusCode::CONFLICT,
+                "not_a_file",
+                "The requested entry is not a downloadable file.",
+            ),
+            DownloadError::Settling => (
+                StatusCode::CONFLICT,
+                "file_settling",
+                "The file is still settling and cannot be downloaded yet.",
+            ),
+            DownloadError::Unsupported => (
+                StatusCode::CONFLICT,
+                "unsupported_file_entry",
+                "The file cannot be accessed safely.",
+            ),
+            DownloadError::IdentityChanged => (
+                StatusCode::CONFLICT,
+                "file_identity_changed",
+                "The file changed before the download could start.",
+            ),
+            DownloadError::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "file_storage_unavailable",
+                "File storage is temporarily unavailable.",
+            ),
+        };
+        Self {
+            status,
+            code,
+            message,
+            request_id,
+            content_range: None,
+        }
+    }
+
+    fn range(len: u64, request_id: String) -> Self {
+        Self {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            code: "invalid_range",
+            message: "The requested byte range cannot be satisfied.",
+            request_id,
+            content_range: Some(format!("bytes */{len}")),
         }
     }
 }
@@ -443,7 +845,29 @@ impl IntoResponse for FileApiError {
             request_id: self.request_id.clone(),
             details: BTreeMap::new(),
         };
-        (self.status, [(REQUEST_ID, self.request_id)], Json(body)).into_response()
+        let mut response =
+            (self.status, [(REQUEST_ID, self.request_id)], Json(body)).into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("cross-origin-resource-policy"),
+            HeaderValue::from_static("same-origin"),
+        );
+        if let Some(content_range) = self.content_range
+            && let Ok(value) = HeaderValue::from_str(&content_range)
+        {
+            response.headers_mut().insert(header::CONTENT_RANGE, value);
+            response
+                .headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        }
+        response
     }
 }
 

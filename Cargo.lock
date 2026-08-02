@@ -276,6 +276,7 @@ dependencies = [
  "cellar-config",
  "cellar-core",
  "cellar-db",
+ "cellar-storage",
  "futures-util",
  "http-body-util",
  "serde",
