@@ -1,5 +1,6 @@
 mod file_repo;
 mod migrate;
+mod operation_repo;
 mod pool;
 mod project_repo;
 mod upload_repo;
@@ -8,6 +9,7 @@ use thiserror::Error;
 
 pub use file_repo::SqliteFileRepository;
 pub use migrate::migrate;
+pub use operation_repo::{SqliteOperationRepository, decode_upload_commit_payload};
 pub use pool::{FilenameCollation, open_pool};
 pub use project_repo::{
     MAX_PROJECT_CREATE_PAYLOAD_BYTES, RecoveredProjectCreate, SqliteProjectRepository,

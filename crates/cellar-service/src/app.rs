@@ -604,9 +604,14 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         .await
         .map_err(|_| AppError::Database)?;
     readiness.clear(ReadinessBlocker::MigrationRequired);
-    let upload_service =
-        initialize_upload_recovery(&pool, staging, &readiness, time::OffsetDateTime::now_utc())
-            .await?;
+    let upload_service = crate::recovery::initialize_upload_finalization_recovery(
+        &pool,
+        staging.clone(),
+        staging,
+        &readiness,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await?;
     let startup_gates = match options.startup_gates {
         Some(gates) => gates,
         None => check_startup_gates(&pool).await?,

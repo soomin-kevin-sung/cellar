@@ -6,7 +6,11 @@ use sha2::{Digest as _, Sha256};
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::{FileEntryId, ProjectId, UploadId};
+use crate::{
+    FileEntry, FileEntryId, ProjectId, RecoveryDecision, UploadFinalizeRepository,
+    UploadFinalizeRepositoryError, UploadFinalizeStart, UploadId, UploadPublicationError,
+    UploadPublisher, decide_upload_recovery,
+};
 
 pub const DEFAULT_MAX_CHUNK_SIZE: i64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_ACTIVE_SESSIONS: u32 = 8;
@@ -261,6 +265,12 @@ pub struct UploadService {
     staging: Arc<dyn UploadStagingStore>,
     limits: UploadLimits,
     leases: Arc<UploadLeaseTable>,
+    finalization: Option<Arc<FinalizationServices>>,
+}
+
+struct FinalizationServices {
+    repository: Arc<dyn UploadFinalizeRepository>,
+    publisher: Arc<dyn UploadPublisher>,
 }
 
 impl UploadService {
@@ -276,6 +286,28 @@ impl UploadService {
             staging,
             limits,
             leases: Arc::new(UploadLeaseTable::default()),
+            finalization: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_finalization(
+        repository: Arc<dyn UploadRepository>,
+        staging: Arc<dyn UploadStagingStore>,
+        finalization_repository: Arc<dyn UploadFinalizeRepository>,
+        publisher: Arc<dyn UploadPublisher>,
+        mut limits: UploadLimits,
+    ) -> Self {
+        limits.max_chunk_size = limits.max_chunk_size.min(DEFAULT_MAX_CHUNK_SIZE);
+        Self {
+            repository,
+            staging,
+            limits,
+            leases: Arc::new(UploadLeaseTable::default()),
+            finalization: Some(Arc::new(FinalizationServices {
+                repository: finalization_repository,
+                publisher,
+            })),
         }
     }
 
@@ -356,6 +388,19 @@ impl UploadService {
     ) -> Result<UploadSession, UploadServiceError> {
         self.maintain_runtime(now, Some(id)).await?;
         let _lease = self.leases.acquire(id).await;
+        if let Some(finalization) = &self.finalization {
+            match finalization.repository.upload_commit(id).await {
+                Ok(Some(UploadFinalizeStart::Intent(_)))
+                | Ok(Some(UploadFinalizeStart::Completed(_))) => {
+                    return self.repository.read(id).await.map_err(map_repository);
+                }
+                Ok(None) => {}
+                Err(UploadFinalizeRepositoryError::Conflict) => {
+                    return Err(UploadServiceError::NotFound);
+                }
+                Err(error) => return Err(map_finalize_repository(error)),
+            }
+        }
         self.reconcile_locked(id, now).await
     }
 
@@ -376,6 +421,7 @@ impl UploadService {
         }
         self.maintain_runtime(now, Some(id)).await?;
         let _lease = self.leases.acquire(id).await;
+        self.reject_if_finalizing(id).await?;
         let session = self.reconcile_locked(id, now).await?;
         let end = offset
             .checked_add(length)
@@ -429,6 +475,7 @@ impl UploadService {
 
     pub async fn cancel(&self, id: UploadId) -> Result<(), UploadServiceError> {
         let _lease = self.leases.acquire(id).await;
+        self.reject_if_finalizing(id).await?;
         self.repository.cancel(id).await.map_err(map_repository)?;
         match self.staging.remove(id).await {
             Ok(()) | Err(UploadStagingError::NotFound) => self
@@ -437,6 +484,63 @@ impl UploadService {
                 .await
                 .map_err(map_repository),
             Err(error) => Err(map_staging(error)),
+        }
+    }
+
+    pub async fn finalize(
+        &self,
+        id: UploadId,
+        now: OffsetDateTime,
+    ) -> Result<FileEntry, UploadServiceError> {
+        let finalization = self
+            .finalization
+            .as_ref()
+            .ok_or(UploadServiceError::Unavailable)?;
+        let _lease = self.leases.acquire(id).await;
+        if let Some(start) = finalization
+            .repository
+            .upload_commit(id)
+            .await
+            .map_err(map_finalize_repository)?
+        {
+            return match start {
+                UploadFinalizeStart::Completed(entry) => Ok(entry),
+                UploadFinalizeStart::Intent(intent) => {
+                    self.recover_commit(finalization, intent, now).await
+                }
+            };
+        }
+
+        let session = self.reconcile_locked(id, now).await?;
+        if session.pending.is_some() || session.committed_offset != session.expected_size {
+            return Err(UploadServiceError::Conflict);
+        }
+        let available = self.staging.available_space().await.map_err(map_staging)?;
+        if available < self.limits.free_space_reserve {
+            return Err(UploadServiceError::InsufficientStorage);
+        }
+        let verified = finalization
+            .publisher
+            .verify_and_close(id, session.expected_size)
+            .await
+            .map_err(map_publication)?;
+        if verified.size != session.expected_size
+            || session
+                .expected_hash
+                .is_some_and(|expected| expected != verified.sha256)
+        {
+            return Err(UploadServiceError::Conflict);
+        }
+        let start = finalization
+            .repository
+            .prepare_upload_commit(id, verified, now)
+            .await
+            .map_err(map_finalize_repository)?;
+        match start {
+            UploadFinalizeStart::Completed(entry) => Ok(entry),
+            UploadFinalizeStart::Intent(intent) => {
+                self.recover_commit(finalization, intent, now).await
+            }
         }
     }
 
@@ -474,6 +578,17 @@ impl UploadService {
     }
 
     async fn initialize_all(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
+        if let Some(finalization) = &self.finalization {
+            let intents = finalization
+                .repository
+                .pending_upload_commits()
+                .await
+                .map_err(map_finalize_repository)?;
+            for intent in intents {
+                let _lease = self.leases.acquire(intent.upload_id).await;
+                self.recover_commit(finalization, intent, now).await?;
+            }
+        }
         let ids = self.repository.active_ids().await.map_err(map_repository)?;
         for id in ids {
             let _lease = self.leases.acquire(id).await;
@@ -482,6 +597,9 @@ impl UploadService {
                 Ok(_) | Err(UploadRepositoryError::NotFound) => continue,
                 Err(error) => return Err(map_repository(error)),
             };
+            if session.state == UploadState::Committing && self.finalization.is_some() {
+                return Err(UploadServiceError::Unavailable);
+            }
             if let Err(error) = self.verify_staging_identity(id).await {
                 if matches!(error, UploadServiceError::NotFound)
                     && session.state == UploadState::Created
@@ -682,6 +800,114 @@ impl UploadService {
             Some(_) => Ok(()),
         }
     }
+
+    async fn reject_if_finalizing(&self, id: UploadId) -> Result<(), UploadServiceError> {
+        let Some(finalization) = &self.finalization else {
+            return Ok(());
+        };
+        match finalization.repository.upload_commit(id).await {
+            Ok(Some(_)) => Err(UploadServiceError::Conflict),
+            Ok(None) => Ok(()),
+            Err(UploadFinalizeRepositoryError::Conflict) => Err(UploadServiceError::NotFound),
+            Err(error) => Err(map_finalize_repository(error)),
+        }
+    }
+
+    async fn recover_commit(
+        &self,
+        finalization: &FinalizationServices,
+        intent: crate::UploadCommitIntent,
+        now: OffsetDateTime,
+    ) -> Result<FileEntry, UploadServiceError> {
+        let observation = finalization
+            .publisher
+            .observe(&intent)
+            .await
+            .map_err(map_publication)?;
+        let published = match decide_upload_recovery(observation) {
+            RecoveryDecision::Publish => {
+                match finalization.publisher.publish_no_replace(&intent).await {
+                    Ok(published) => published,
+                    Err(UploadPublicationError::Conflict) => {
+                        let raced = finalization
+                            .publisher
+                            .observe(&intent)
+                            .await
+                            .map_err(map_publication)?;
+                        match decide_upload_recovery(raced) {
+                            RecoveryDecision::CompleteCatalog => finalization
+                                .publisher
+                                .inspect_destination(&intent)
+                                .await
+                                .map_err(map_publication)?,
+                            RecoveryDecision::FailConflict => {
+                                finalization
+                                    .repository
+                                    .fail_upload_commit(&intent, "destination_conflict", now)
+                                    .await
+                                    .map_err(map_finalize_repository)?;
+                                return Err(UploadServiceError::Conflict);
+                            }
+                            RecoveryDecision::Publish | RecoveryDecision::FailMissing => {
+                                return Err(UploadServiceError::Unavailable);
+                            }
+                        }
+                    }
+                    Err(error) => return Err(map_publication(error)),
+                }
+            }
+            RecoveryDecision::CompleteCatalog => finalization
+                .publisher
+                .inspect_destination(&intent)
+                .await
+                .map_err(map_publication)?,
+            RecoveryDecision::FailConflict => {
+                finalization
+                    .repository
+                    .fail_upload_commit(&intent, "destination_conflict", now)
+                    .await
+                    .map_err(map_finalize_repository)?;
+                return Err(UploadServiceError::Conflict);
+            }
+            RecoveryDecision::FailMissing => {
+                finalization
+                    .repository
+                    .fail_upload_commit(&intent, "publication_missing", now)
+                    .await
+                    .map_err(map_finalize_repository)?;
+                return Err(UploadServiceError::Unavailable);
+            }
+        };
+        if published.identity != intent.staging_identity || published.size != intent.expected_size {
+            finalization
+                .repository
+                .fail_upload_commit(&intent, "publication_identity_mismatch", now)
+                .await
+                .map_err(map_finalize_repository)?;
+            return Err(UploadServiceError::Conflict);
+        }
+        let intent = finalization
+            .repository
+            .mark_upload_fs_applied(&intent, published, now)
+            .await
+            .map_err(map_finalize_repository)?;
+        match finalization
+            .repository
+            .complete_upload_commit(&intent, published, now)
+            .await
+        {
+            Ok(entry) => Ok(entry),
+            Err(UploadFinalizeRepositoryError::Conflict) => {
+                finalization
+                    .repository
+                    .fail_upload_commit(&intent, "catalog_conflict", now)
+                    .await
+                    .map_err(map_finalize_repository)?;
+                Err(UploadServiceError::Conflict)
+            }
+            Err(error) => Err(map_finalize_repository(error)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -759,16 +985,25 @@ impl Drop for UploadLease {
 }
 
 fn validate_new_upload(input: &NewUpload) -> Result<(), UploadServiceError> {
-    if input.expected_size < 0
-        || input.destination_name.is_empty()
-        || input.destination_name.len() > MAX_UPLOAD_NAME_BYTES
-        || input.destination_name.contains(['/', '\\', '\0'])
-        || input.destination_name == "."
-        || input.destination_name == ".."
-    {
+    if input.expected_size < 0 || !is_safe_upload_name(&input.destination_name) {
         return Err(UploadServiceError::Invalid);
     }
     Ok(())
+}
+
+#[must_use]
+pub fn is_safe_upload_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_UPLOAD_NAME_BYTES
+        && value.encode_utf16().count() <= 255
+        && !value.contains(['/', '\\', '\0'])
+        && value != "."
+        && value != ".."
+        && !value.ends_with(['.', ' '])
+        && !value.chars().any(|character| {
+            character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
+        && !is_windows_device_name(value)
 }
 
 fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -794,5 +1029,46 @@ fn map_staging(error: UploadStagingError) -> UploadServiceError {
             UploadServiceError::Unavailable
         }
         UploadStagingError::InsufficientStorage => UploadServiceError::InsufficientStorage,
+    }
+}
+
+fn is_windows_device_name(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value).to_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let Some(suffix) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+    )
+}
+
+fn map_finalize_repository(error: UploadFinalizeRepositoryError) -> UploadServiceError {
+    match error {
+        UploadFinalizeRepositoryError::NotFound => UploadServiceError::NotFound,
+        UploadFinalizeRepositoryError::Conflict => UploadServiceError::Conflict,
+        UploadFinalizeRepositoryError::InsufficientStorage => {
+            UploadServiceError::InsufficientStorage
+        }
+        UploadFinalizeRepositoryError::Unavailable => UploadServiceError::Unavailable,
+    }
+}
+
+fn map_publication(error: UploadPublicationError) -> UploadServiceError {
+    match error {
+        UploadPublicationError::NotFound | UploadPublicationError::Unavailable => {
+            UploadServiceError::Unavailable
+        }
+        UploadPublicationError::Conflict => UploadServiceError::Conflict,
+        UploadPublicationError::InsufficientStorage => UploadServiceError::InsufficientStorage,
     }
 }

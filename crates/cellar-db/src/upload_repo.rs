@@ -251,7 +251,7 @@ impl UploadRepository for SqliteUploadRepository {
              SET state = 'failed', pending_offset = NULL, pending_length = NULL,
                  pending_digest = NULL
              WHERE id = ? AND expires_at <= ?
-               AND state IN ('created', 'uploading', 'verifying', 'committing')",
+               AND state IN ('created', 'uploading', 'verifying')",
         )
         .bind(id.to_string())
         .bind(timestamp(now)?)

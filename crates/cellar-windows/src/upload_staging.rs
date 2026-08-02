@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use cellar_core::{StagingIdentity, UploadId, UploadStagingError, UploadStagingStore};
+use cellar_core::{
+    PublicationPresence, PublishedUpload, StagingIdentity, UploadCommitIntent, UploadId,
+    UploadPublicationError, UploadPublicationObservation, UploadPublisher, UploadStagingError,
+    UploadStagingStore, VerifiedUpload,
+};
 use cellar_storage::{EntryKind, StorageError, StorageErrorKind};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Mutex;
@@ -105,6 +109,75 @@ impl WindowsUploadStaging {
             .is_some_and(|current| Arc::ptr_eq(current, entry))
         {
             entries.remove(&id);
+        }
+    }
+
+    fn staging_handle(&self, id: UploadId) -> Result<VerifiedHandle, UploadPublicationError> {
+        let name = Self::name(id).map_err(|_| UploadPublicationError::Unavailable)?;
+        self.storage
+            .open_verified(&self.directory, &name)
+            .map_err(map_publication_storage)
+    }
+
+    fn destination_parent(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<VerifiedHandle, UploadPublicationError> {
+        let projects =
+            WindowsName::parse("projects").map_err(|_| UploadPublicationError::Unavailable)?;
+        let mut current = self
+            .storage
+            .open_verified(self.storage.root(), &projects)
+            .map_err(map_publication_storage)?;
+        for component in [intent.project_id.to_string(), "files".to_owned()]
+            .into_iter()
+            .chain(intent.destination_components.iter().cloned())
+        {
+            let name =
+                WindowsName::parse(component).map_err(|_| UploadPublicationError::Conflict)?;
+            current = self
+                .storage
+                .open_verified(&current, &name)
+                .map_err(map_publication_storage)?;
+            if current.kind() != EntryKind::Directory {
+                return Err(UploadPublicationError::Conflict);
+            }
+        }
+        if let Some(expected) = intent.destination_parent_identity
+            && staging_identity(current.identity()) != expected
+        {
+            return Err(UploadPublicationError::Conflict);
+        }
+        Ok(current)
+    }
+
+    fn destination_handle(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<VerifiedHandle, UploadPublicationError> {
+        let parent = self.destination_parent(intent)?;
+        let name = WindowsName::parse(intent.destination_name.clone())
+            .map_err(|_| UploadPublicationError::Conflict)?;
+        self.storage
+            .open_verified(&parent, &name)
+            .map_err(map_publication_storage)
+    }
+
+    fn presence(
+        result: Result<VerifiedHandle, UploadPublicationError>,
+        expected: StagingIdentity,
+    ) -> Result<PublicationPresence, UploadPublicationError> {
+        match result {
+            Ok(handle) => {
+                let actual = staging_identity(handle.identity());
+                Ok(if handle.kind() == EntryKind::File && actual == expected {
+                    PublicationPresence::Expected
+                } else {
+                    PublicationPresence::Unexpected
+                })
+            }
+            Err(UploadPublicationError::NotFound) => Ok(PublicationPresence::Absent),
+            Err(error) => Err(error),
         }
     }
 }
@@ -275,6 +348,131 @@ impl UploadStagingStore for WindowsUploadStaging {
     }
 }
 
+#[async_trait]
+impl UploadPublisher for WindowsUploadStaging {
+    async fn verify_and_close(
+        &self,
+        id: UploadId,
+        expected_size: i64,
+    ) -> Result<VerifiedUpload, UploadPublicationError> {
+        let this = self.clone();
+        let entry = self.entry(id);
+        tokio::task::spawn_blocking(move || {
+            let _guard = entry.io.blocking_lock();
+            let result = (|| {
+                let handle = this
+                    .ensure_handle(id, &entry)
+                    .map_err(map_staging_publication)?;
+                this.storage
+                    .flush_file(&handle)
+                    .map_err(map_publication_storage)?;
+                let identity = staging_identity(handle.identity());
+                let length = this
+                    .storage
+                    .file_length(&handle)
+                    .map_err(map_publication_storage)?;
+                if length != expected_size {
+                    return Err(UploadPublicationError::Conflict);
+                }
+                let mut hasher = Sha256::new();
+                let mut offset = 0_i64;
+                const VERIFY_BLOCK: i64 = 8 * 1024 * 1024;
+                while offset < length {
+                    let block = (length - offset).min(VERIFY_BLOCK);
+                    let bytes = this
+                        .storage
+                        .read_exact_at(&handle, offset, block)
+                        .map_err(map_publication_storage)?;
+                    hasher.update(bytes);
+                    offset += block;
+                }
+                Ok(VerifiedUpload {
+                    size: length,
+                    sha256: hasher.finalize().into(),
+                    staging_identity: identity,
+                })
+            })();
+            this.release_entry(id, &entry);
+            result
+        })
+        .await
+        .map_err(|_| UploadPublicationError::Unavailable)?
+    }
+
+    async fn observe(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<UploadPublicationObservation, UploadPublicationError> {
+        let this = self.clone();
+        let intent = intent.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok(UploadPublicationObservation {
+                staging: Self::presence(
+                    this.staging_handle(intent.upload_id),
+                    intent.staging_identity,
+                )?,
+                destination: Self::presence(
+                    this.destination_handle(&intent),
+                    intent.staging_identity,
+                )?,
+            })
+        })
+        .await
+        .map_err(|_| UploadPublicationError::Unavailable)?
+    }
+
+    async fn publish_no_replace(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<PublishedUpload, UploadPublicationError> {
+        let this = self.clone();
+        let intent = intent.clone();
+        tokio::task::spawn_blocking(move || {
+            let source = this.staging_handle(intent.upload_id)?;
+            if source.kind() != EntryKind::File
+                || staging_identity(source.identity()) != intent.staging_identity
+            {
+                return Err(UploadPublicationError::Conflict);
+            }
+            let parent = this.destination_parent(&intent)?;
+            let name = WindowsName::parse(intent.destination_name.clone())
+                .map_err(|_| UploadPublicationError::Conflict)?;
+            let renamed = this
+                .storage
+                .rename_no_replace(&source, &parent, &name)
+                .map_err(map_publication_storage)?;
+            if staging_identity(renamed) != intent.staging_identity {
+                return Err(UploadPublicationError::Conflict);
+            }
+            // The retained rename handle deliberately does not share DELETE.
+            // Close it before reopening the destination for independent
+            // post-rename identity verification.
+            drop(source);
+            let destination = this
+                .storage
+                .open_verified(&parent, &name)
+                .map_err(map_publication_storage)?;
+            published_facts(&this.storage, &destination, intent.staging_identity)
+        })
+        .await
+        .map_err(|_| UploadPublicationError::Unavailable)?
+    }
+
+    async fn inspect_destination(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<PublishedUpload, UploadPublicationError> {
+        let this = self.clone();
+        let intent = intent.clone();
+        tokio::task::spawn_blocking(move || {
+            let destination = this.destination_handle(&intent)?;
+            published_facts(&this.storage, &destination, intent.staging_identity)
+        })
+        .await
+        .map_err(|_| UploadPublicationError::Unavailable)?
+    }
+}
+
 async fn blocking<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, UploadStagingError> + Send + 'static,
 ) -> Result<T, UploadStagingError> {
@@ -289,6 +487,48 @@ fn map_storage(error: StorageError) -> UploadStagingError {
         StorageErrorKind::InsufficientStorage => UploadStagingError::InsufficientStorage,
         _ => UploadStagingError::Unavailable,
     }
+}
+
+fn map_staging_publication(error: UploadStagingError) -> UploadPublicationError {
+    match error {
+        UploadStagingError::NotFound => UploadPublicationError::NotFound,
+        UploadStagingError::InsufficientStorage => UploadPublicationError::InsufficientStorage,
+        UploadStagingError::Unavailable => UploadPublicationError::Unavailable,
+    }
+}
+
+fn map_publication_storage(error: StorageError) -> UploadPublicationError {
+    match error.kind() {
+        StorageErrorKind::NotFound => UploadPublicationError::NotFound,
+        StorageErrorKind::Conflict => UploadPublicationError::Conflict,
+        StorageErrorKind::InsufficientStorage => UploadPublicationError::InsufficientStorage,
+        _ => UploadPublicationError::Unavailable,
+    }
+}
+
+fn staging_identity(identity: cellar_storage::FileIdentity) -> StagingIdentity {
+    let mut bytes = [0_u8; 24];
+    bytes[..8].copy_from_slice(&identity.volume_serial.to_le_bytes());
+    bytes[8..].copy_from_slice(&identity.file_id.to_le_bytes());
+    StagingIdentity::new(bytes)
+}
+
+fn published_facts(
+    storage: &WindowsStorage,
+    handle: &VerifiedHandle,
+    expected: StagingIdentity,
+) -> Result<PublishedUpload, UploadPublicationError> {
+    if handle.kind() != EntryKind::File || staging_identity(handle.identity()) != expected {
+        return Err(UploadPublicationError::Conflict);
+    }
+    let (size, mtime_filetime_100ns) = storage
+        .file_length_and_mtime(handle)
+        .map_err(map_publication_storage)?;
+    Ok(PublishedUpload {
+        identity: expected,
+        size,
+        mtime_filetime_100ns,
+    })
 }
 
 #[cfg(all(test, windows))]

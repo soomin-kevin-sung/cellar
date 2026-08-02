@@ -36,6 +36,20 @@ const UPLOAD_CLEANUP_EXTENSION_FINGERPRINT: &str = "cellar-upload-staging-cleanu
 const UPLOAD_IDENTITY_EXTENSION_SQL: &str =
     include_str!("../../../migrations/expand_upload_staging_identity.sql");
 const UPLOAD_IDENTITY_EXTENSION_FINGERPRINT: &str = "cellar-upload-staging-identity-v1";
+const UPLOAD_FINALIZATION_EXTENSION_SQL: &str =
+    include_str!("../../../migrations/expand_upload_finalization.sql");
+const UPLOAD_FINALIZATION_EXTENSION_FINGERPRINT: &str = "cellar-upload-finalization-v1";
+const UPLOAD_FINALIZATION_TABLE_SQL: &str = "
+    CREATE TABLE upload_finalization (
+      upload_id TEXT PRIMARY KEY NOT NULL,
+      operation_id TEXT NOT NULL UNIQUE,
+      file_entry_id TEXT NOT NULL UNIQUE,
+      result_identity BLOB CHECK (
+        result_identity IS NULL OR length(result_identity) = 24
+      ),
+      FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
+      FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
+    )";
 const UPLOAD_IDENTITY_TABLE_SQL: &str = "
     CREATE TABLE upload_staging_identity (
       upload_id TEXT PRIMARY KEY NOT NULL,
@@ -171,6 +185,20 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
             .map_err(DbError::Migration)?;
     }
     validate_upload_identity_extension(transaction).await?;
+    let upload_finalization_marker: Option<String> = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_finalization'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if upload_finalization_marker.is_none() {
+        sqlx::raw_sql(UPLOAD_FINALIZATION_EXTENSION_SQL)
+            .execute(&mut **transaction)
+            .await
+            .map_err(DbError::Migration)?;
+    }
+    validate_upload_finalization_extension(transaction).await?;
 
     let metadata: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM cellar_schema_metadata
@@ -185,6 +213,32 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
         return Err(DbError::SchemaVersion);
     }
 
+    Ok(())
+}
+
+async fn validate_upload_finalization_extension(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DbError> {
+    let fingerprint: Option<String> = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_finalization'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if fingerprint.as_deref() != Some(UPLOAD_FINALIZATION_EXTENSION_FINGERPRINT) {
+        return Err(DbError::SchemaVersion);
+    }
+    let definition: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'upload_finalization'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if !definition.is_some_and(|sql| sql_eq(&sql, UPLOAD_FINALIZATION_TABLE_SQL)) {
+        return Err(DbError::SchemaVersion);
+    }
     Ok(())
 }
 

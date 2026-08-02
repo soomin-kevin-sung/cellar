@@ -304,6 +304,44 @@ async fn expand_only_upload_staging_identity_is_v2_compatible_and_tamper_evident
 }
 
 #[tokio::test]
+async fn expand_only_upload_finalization_journal_is_v2_compatible_and_tamper_evident() {
+    let (_db, pool) = migrated_db().await;
+    assert!(previous_release_v2_accepts_schema_history(&pool).await);
+    let marker: String = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_finalization'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marker, "cellar-upload-finalization-v1");
+    let table: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'upload_finalization'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(table, 1);
+    pool.close().await;
+
+    let (_tampered_db, tampered_pool) = migrated_db().await;
+    sqlx::query(
+        "UPDATE cellar_schema_extension SET fingerprint = 'tampered'
+         WHERE name = 'upload_finalization'",
+    )
+    .execute(&tampered_pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        migrate(&tampered_pool).await,
+        Err(DbError::SchemaVersion)
+    ));
+    assert!(previous_release_v2_accepts_schema_history(&tampered_pool).await);
+    tampered_pool.close().await;
+}
+
+#[tokio::test]
 async fn upload_cleanup_extension_tampering_fails_closed() {
     let (_marker_db, marker_pool) = migrated_db().await;
     sqlx::query(

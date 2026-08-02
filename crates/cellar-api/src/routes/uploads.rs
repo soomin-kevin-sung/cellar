@@ -86,6 +86,10 @@ where
             "/api/v1/uploads/{id}/chunk",
             put(put_chunk).fallback(method_not_allowed),
         )
+        .route(
+            "/api/v1/uploads/{id}/finalize",
+            post(finalize_upload).fallback(method_not_allowed),
+        )
         .route("/api/v1/uploads/", any(invalid_path))
         .route("/api/v1/uploads/{id}/", any(invalid_path))
         .route("/api/v1/uploads/{id}/{extra}", any(invalid_path))
@@ -204,7 +208,7 @@ async fn upload_status(
     request: Request,
 ) -> Result<impl IntoResponse, UploadApiError> {
     let request_id = request_id(request.headers())?;
-    let id = parse_upload_path(request.uri().path(), false, &request_id)?;
+    let id = parse_upload_path(request.uri().path(), None, &request_id)?;
     let session = state
         .service
         .status(id, (state.clock)())
@@ -225,7 +229,7 @@ async fn put_chunk(
 ) -> Result<impl IntoResponse, UploadApiError> {
     let (parts, body) = request.into_parts();
     let request_id = request_id(&parts.headers)?;
-    let id = parse_upload_path(parts.uri.path(), true, &request_id)?;
+    let id = parse_upload_path(parts.uri.path(), Some("chunk"), &request_id)?;
     require_octet_stream(&parts.headers, &request_id)?;
     let offset = one_header(&parts.headers, &UPLOAD_OFFSET)
         .and_then(parse_decimal_i64)
@@ -316,13 +320,49 @@ async fn cancel_upload(
     request: Request,
 ) -> Result<impl IntoResponse, UploadApiError> {
     let request_id = request_id(request.headers())?;
-    let id = parse_upload_path(request.uri().path(), false, &request_id)?;
+    let id = parse_upload_path(request.uri().path(), None, &request_id)?;
     state
         .service
         .cancel(id)
         .await
         .map_err(|error| UploadApiError::service(error, request_id.clone()))?;
     Ok((StatusCode::NO_CONTENT, [(REQUEST_ID, request_id)]))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalizedUploadBody {
+    file_id: String,
+    project_id: String,
+    destination_parent_id: Option<String>,
+    name: String,
+    size: String,
+    sha256: String,
+}
+
+async fn finalize_upload(
+    Extension(state): Extension<UploadsState>,
+    request: Request,
+) -> Result<impl IntoResponse, UploadApiError> {
+    let request_id = request_id(request.headers())?;
+    let id = parse_upload_path(request.uri().path(), Some("finalize"), &request_id)?;
+    let entry = state
+        .service
+        .finalize(id, (state.clock)())
+        .await
+        .map_err(|error| UploadApiError::service(error, request_id.clone()))?;
+    let digest = entry
+        .hash
+        .ok_or_else(|| UploadApiError::unavailable(request_id.clone()))?;
+    let body = FinalizedUploadBody {
+        file_id: entry.id.to_string(),
+        project_id: entry.project_id.to_string(),
+        destination_parent_id: entry.parent_id.map(|parent| parent.to_string()),
+        name: entry.exact_name.as_str().to_owned(),
+        size: entry.size.to_string(),
+        sha256: STANDARD.encode(digest),
+    };
+    Ok((StatusCode::OK, [(REQUEST_ID, request_id)], Json(body)))
 }
 
 async fn parse_json<T: DeserializeOwned>(
@@ -389,17 +429,15 @@ fn parse_base64_digest(value: &str) -> Result<[u8; 32], ()> {
 
 fn parse_upload_path(
     path: &str,
-    chunk: bool,
+    subresource: Option<&str>,
     request_id: &str,
 ) -> Result<UploadId, UploadApiError> {
     let id = path
         .strip_prefix("/api/v1/uploads/")
         .and_then(|tail| {
-            if chunk {
-                tail.strip_suffix("/chunk")
-            } else {
-                Some(tail)
-            }
+            subresource.map_or(Some(tail), |subresource| {
+                tail.strip_suffix(&format!("/{subresource}"))
+            })
         })
         .filter(|id| !id.is_empty() && !id.contains(['/', '\\', '%']))
         .ok_or_else(|| UploadApiError::invalid("invalid_upload_id", request_id.to_owned()))?;

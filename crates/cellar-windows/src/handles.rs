@@ -250,6 +250,39 @@ mod platform {
             i64::try_from(handle.file.metadata().map_err(map_io)?.len()).map_err(|_| io_error())
         }
 
+        pub fn flush_file(&self, handle: &VerifiedHandle) -> Result<(), StorageError> {
+            let facts = self.verify_existing(handle)?;
+            if facts.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            handle.file.sync_all().map_err(map_io)
+        }
+
+        pub fn file_length_and_mtime(
+            &self,
+            handle: &VerifiedHandle,
+        ) -> Result<(i64, i64), StorageError> {
+            let facts = self.verify_existing(handle)?;
+            if facts.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+            // SAFETY: the verified file handle is live and `information` is writable.
+            if unsafe { GetFileInformationByHandle(handle.file.as_raw_handle(), &mut information) }
+                == 0
+            {
+                return Err(last_error());
+            }
+            let size =
+                (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+            let mtime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+                | u64::from(information.ftLastWriteTime.dwLowDateTime);
+            Ok((
+                i64::try_from(size).map_err(|_| io_error())?,
+                i64::try_from(mtime).map_err(|_| io_error())?,
+            ))
+        }
+
         pub fn read_exact_at(
             &self,
             handle: &VerifiedHandle,
@@ -941,6 +974,15 @@ mod platform_stub {
         }
 
         pub fn file_length(&self, _handle: &VerifiedHandle) -> Result<i64, StorageError> {
+            Err(unsupported())
+        }
+        pub fn flush_file(&self, _handle: &VerifiedHandle) -> Result<(), StorageError> {
+            Err(unsupported())
+        }
+        pub fn file_length_and_mtime(
+            &self,
+            _handle: &VerifiedHandle,
+        ) -> Result<(i64, i64), StorageError> {
             Err(unsupported())
         }
         pub fn read_exact_at(
