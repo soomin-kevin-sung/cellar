@@ -28,8 +28,9 @@ mod platform {
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
         FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileCaseSensitiveInfo, FileIdInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        FILE_SHARE_WRITE, FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        SetFileInformationByHandle,
     };
 
     use crate::WindowsName;
@@ -113,7 +114,7 @@ mod platform {
         ) -> Result<VerifiedHandle, StorageError> {
             self.verify_parent(parent)?;
             let file = open_relative(parent.file.as_raw_handle(), name, OpenMode::CreateFile)?;
-            self.verify_new_handle(file)
+            self.verify_created_handle(file)
         }
 
         pub fn create_directory_no_replace(
@@ -123,7 +124,7 @@ mod platform {
         ) -> Result<VerifiedHandle, StorageError> {
             self.verify_parent(parent)?;
             let file = open_relative(parent.file.as_raw_handle(), name, OpenMode::CreateDirectory)?;
-            self.verify_new_handle(file)
+            self.verify_created_handle(file)
         }
 
         pub fn rename_no_replace(
@@ -179,6 +180,23 @@ mod platform {
             })
         }
 
+        fn verify_created_handle(&self, file: File) -> Result<VerifiedHandle, StorageError> {
+            let (file, facts) = verify_created_with_cleanup(
+                file,
+                |file| {
+                    let facts = inspect(file)?;
+                    self.verify_facts(&facts)?;
+                    Ok(facts)
+                },
+                delete_created,
+            )?;
+            Ok(VerifiedHandle {
+                file: Arc::new(file),
+                identity: facts.identity,
+                kind: facts.kind,
+            })
+        }
+
         fn verify_existing(&self, handle: &VerifiedHandle) -> Result<HandleFacts, StorageError> {
             let facts = inspect(&handle.file)?;
             if facts.identity != handle.identity || facts.kind != handle.kind {
@@ -189,13 +207,14 @@ mod platform {
         }
 
         fn verify_facts(&self, facts: &HandleFacts) -> Result<(), StorageError> {
-            if facts.identity.volume_serial != self.root_volume
-                || facts.reparse
-                || facts.hard_linked
-                || (facts.kind == EntryKind::Directory && facts.case_sensitive)
-            {
+            if facts.identity.volume_serial != self.root_volume {
                 return Err(unsupported());
             }
+            reject_unsupported_characteristics(
+                facts.reparse,
+                facts.hard_linked,
+                facts.kind == EntryKind::Directory && facts.case_sensitive,
+            )?;
             let root_path = final_path(&self.root.file)?;
             if !is_within(&root_path, &facts.final_path) {
                 return Err(unsupported());
@@ -211,6 +230,53 @@ mod platform {
         hard_linked: bool,
         case_sensitive: bool,
         final_path: PathBuf,
+    }
+
+    pub(super) fn reject_unsupported_characteristics(
+        reparse: bool,
+        hard_linked: bool,
+        case_sensitive_directory: bool,
+    ) -> Result<(), StorageError> {
+        if reparse || hard_linked || case_sensitive_directory {
+            Err(unsupported())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn verify_created_with_cleanup<T, V>(
+        owned: T,
+        verify: impl FnOnce(&T) -> Result<V, StorageError>,
+        cleanup: impl FnOnce(T) -> Result<(), StorageError>,
+    ) -> Result<(T, V), StorageError> {
+        match verify(&owned) {
+            Ok(verified) => Ok((owned, verified)),
+            Err(verification_error) => match cleanup(owned) {
+                Ok(()) => Err(verification_error),
+                Err(_) => Err(StorageError::new(StorageErrorKind::CleanupFailed)),
+            },
+        }
+    }
+
+    fn delete_created(file: File) -> Result<(), StorageError> {
+        let information =
+            windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the exact newly-created owned handle has DELETE access and
+        // `information` matches FileDispositionInfo for this synchronous call.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&raw const information).cast(),
+                size_of_val(&information) as u32,
+            )
+        };
+        let failure = (result == 0).then(last_error);
+        drop(file);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn inspect(file: &File) -> Result<HandleFacts, StorageError> {
@@ -658,5 +724,50 @@ impl Storage for WindowsStorage {
             let _ = (source, destination_parent, name);
             Err(StorageError::new(StorageErrorKind::Unsupported))
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::cell::Cell;
+
+    use cellar_storage::{StorageError, StorageErrorKind};
+
+    use super::platform::{reject_unsupported_characteristics, verify_created_with_cleanup};
+
+    #[test]
+    fn verification_failure_deletes_the_exact_owned_creation() {
+        let cleaned = Cell::new(None);
+        let error = verify_created_with_cleanup(
+            73_u32,
+            |_| Err::<(), _>(StorageError::new(StorageErrorKind::Unsupported)),
+            |owned| {
+                cleaned.set(Some(owned));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), StorageErrorKind::Unsupported);
+        assert_eq!(cleaned.get(), Some(73));
+    }
+
+    #[test]
+    fn cleanup_failure_returns_distinct_fail_closed_evidence() {
+        let error = verify_created_with_cleanup(
+            91_u32,
+            |_| Err::<(), _>(StorageError::new(StorageErrorKind::Unsupported)),
+            |_| Err(StorageError::new(StorageErrorKind::AccessDenied)),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), StorageErrorKind::CleanupFailed);
+        assert_eq!(error.code(), "cleanup_failed");
+    }
+
+    #[test]
+    fn case_sensitive_directory_flag_is_always_rejected_by_the_pure_seam() {
+        let error = reject_unsupported_characteristics(false, false, true).unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Unsupported);
     }
 }

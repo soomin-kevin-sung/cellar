@@ -76,7 +76,10 @@ pub enum WindowsNameError {
 
 fn is_reserved_device(stem: &str) -> bool {
     let upper = stem.to_uppercase();
-    if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") {
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) {
         return true;
     }
     let Some(suffix) = upper
@@ -100,6 +103,8 @@ mod tests {
         for invalid in [
             "nul",
             "Con.txt",
+            "CONIN$",
+            "conout$.txt",
             "COM\u{00B9}.log",
             "LPT\u{00B2}",
             "COM\u{00B3}",

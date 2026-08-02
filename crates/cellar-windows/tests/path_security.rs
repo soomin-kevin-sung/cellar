@@ -12,6 +12,8 @@ fn rejects_dangerous_windows_names() {
         "file.txt:secret",
         "CON",
         "con.txt",
+        "CONIN$",
+        "conout$.txt",
         "COM1.log",
         "COM\u{00B9}.log",
         "LPT\u{00B2}",
@@ -51,6 +53,7 @@ fn enforces_windows_utf16_component_and_control_character_limits() {
 mod windows {
     use std::fs;
     use std::os::windows::fs::{OpenOptionsExt, symlink_dir};
+    use std::sync::{Arc, Barrier};
 
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -103,6 +106,84 @@ mod windows {
             fs::read(directory.path().join("destination.txt")).unwrap(),
             b"destination"
         );
+    }
+
+    #[test]
+    fn successful_rename_preserves_full_file_identity() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("source.txt"), b"source").unwrap();
+        let storage = WindowsStorage::open(directory.path()).unwrap();
+        let source = storage
+            .open_verified(storage.root(), &name("source.txt"))
+            .unwrap();
+        let source_identity = source.identity();
+
+        let renamed_identity = storage
+            .rename_no_replace(&source, storage.root(), &name("destination.txt"))
+            .unwrap();
+        drop(source);
+        let destination = storage
+            .open_verified(storage.root(), &name("destination.txt"))
+            .unwrap();
+
+        assert_eq!(renamed_identity, source_identity);
+        assert_eq!(destination.identity(), source_identity);
+        assert_eq!(storage.read_all(&destination).unwrap(), b"source");
+        assert!(!directory.path().join("source.txt").exists());
+    }
+
+    #[test]
+    fn destination_create_race_has_exactly_one_winner_without_loss() {
+        let directory = tempdir().unwrap();
+        let storage = Arc::new(WindowsStorage::open(directory.path()).unwrap());
+
+        for iteration in 0..32 {
+            let source_name = format!("source-{iteration}.txt");
+            let destination_name = format!("destination-{iteration}.txt");
+            let source_path = directory.path().join(&source_name);
+            let destination_path = directory.path().join(&destination_name);
+            fs::write(&source_path, b"source").unwrap();
+            let source = storage
+                .open_verified(storage.root(), &name(&source_name))
+                .unwrap();
+            let barrier = Arc::new(Barrier::new(3));
+
+            let create_barrier = Arc::clone(&barrier);
+            let create_destination = destination_path.clone();
+            let create = std::thread::spawn(move || {
+                create_barrier.wait();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(create_destination)
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, b"external"))
+            });
+
+            let rename_barrier = Arc::clone(&barrier);
+            let rename_storage = Arc::clone(&storage);
+            let rename_destination = name(&destination_name);
+            let rename = std::thread::spawn(move || {
+                rename_barrier.wait();
+                rename_storage.rename_no_replace(
+                    &source,
+                    rename_storage.root(),
+                    &rename_destination,
+                )
+            });
+
+            barrier.wait();
+            let create_won = create.join().unwrap().is_ok();
+            let rename_won = rename.join().unwrap().is_ok();
+            assert_ne!(create_won, rename_won, "iteration {iteration}");
+
+            if create_won {
+                assert_eq!(fs::read(&destination_path).unwrap(), b"external");
+                assert_eq!(fs::read(&source_path).unwrap(), b"source");
+            } else {
+                assert_eq!(fs::read(&destination_path).unwrap(), b"source");
+                assert!(!source_path.exists());
+            }
+        }
     }
 
     #[test]
@@ -246,7 +327,10 @@ mod windows {
         let directory = tempdir().unwrap();
         let child = directory.path().join("sensitive");
         fs::create_dir(&child).unwrap();
-        if !enable_case_sensitivity(&child) {
+        if let Err(error) = enable_case_sensitivity(&child) {
+            eprintln!(
+                "acceptance skipped: this Windows/NTFS environment cannot enable case sensitivity: {error}"
+            );
             return;
         }
         let storage = WindowsStorage::open(directory.path()).unwrap();
@@ -278,7 +362,7 @@ mod windows {
         drop(storage);
     }
 
-    fn enable_case_sensitivity(path: &std::path::Path) -> bool {
+    fn enable_case_sensitivity(path: &std::path::Path) -> std::io::Result<()> {
         let file = std::fs::OpenOptions::new()
             .access_mode(FILE_WRITE_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -287,13 +371,18 @@ mod windows {
             .unwrap();
         let information = FILE_CASE_SENSITIVE_INFO { Flags: 1 };
         // SAFETY: the handle is live and the fixed-size input structure is readable.
-        unsafe {
+        let result = unsafe {
             SetFileInformationByHandle(
                 std::os::windows::io::AsRawHandle::as_raw_handle(&file),
                 FileCaseSensitiveInfo,
                 (&raw const information).cast(),
                 std::mem::size_of_val(&information) as u32,
-            ) != 0
+            )
+        };
+        if result == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 

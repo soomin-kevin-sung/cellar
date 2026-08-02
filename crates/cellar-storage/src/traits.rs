@@ -22,6 +22,7 @@ pub enum StorageErrorKind {
     Conflict,
     Unsupported,
     AccessDenied,
+    CleanupFailed,
     Io,
 }
 
@@ -47,6 +48,7 @@ impl StorageError {
             StorageErrorKind::Conflict => "conflict",
             StorageErrorKind::Unsupported => "unsupported",
             StorageErrorKind::AccessDenied => "access_denied",
+            StorageErrorKind::CleanupFailed => "cleanup_failed",
             StorageErrorKind::Io => "io_error",
         }
     }
