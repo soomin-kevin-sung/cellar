@@ -23,6 +23,7 @@ impl SqliteProjectRepository {
 const FIXED_UTC_TIMESTAMP_FORMAT: &str =
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z";
 const MAX_REQUEST_DIGEST_BYTES: usize = 128;
+pub const MAX_PROJECT_CREATE_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -75,6 +76,9 @@ impl std::fmt::Debug for RecoveredProjectCreate {
 pub fn decode_project_create_payload(
     payload: &str,
 ) -> Result<RecoveredProjectCreate, ProjectRepositoryError> {
+    if payload.len() > MAX_PROJECT_CREATE_PAYLOAD_BYTES {
+        return Err(ProjectRepositoryError::Unavailable);
+    }
     let payload: StoredCreatePayload =
         serde_json::from_str(payload).map_err(|_| ProjectRepositoryError::Unavailable)?;
     if payload.request_digest.is_empty()
@@ -121,6 +125,16 @@ impl ProjectRepository for SqliteProjectRepository {
         project: &Project,
         request_digest: &str,
     ) -> Result<OperationStart, ProjectRepositoryError> {
+        if request_digest.is_empty()
+            || request_digest.len() > MAX_REQUEST_DIGEST_BYTES
+            || !request_digest.bytes().all(|byte| byte.is_ascii_graphic())
+            || project.status != ProjectStatus::Active
+            || project.version != 1
+            || project.created_at != project.updated_at
+            || project.deleted_at.is_some()
+        {
+            return Err(ProjectRepositoryError::Unavailable);
+        }
         let payload = serde_json::to_string(&CreatePayload {
             project_id: project.id.to_string(),
             name: project.name.as_str(),
@@ -132,6 +146,9 @@ impl ProjectRepository for SqliteProjectRepository {
             request_digest,
         })
         .map_err(|_| ProjectRepositoryError::Unavailable)?;
+        if payload.len() > MAX_PROJECT_CREATE_PAYLOAD_BYTES {
+            return Err(ProjectRepositoryError::Unavailable);
+        }
         let now = timestamp(project.created_at)?;
         let inserted = sqlx::query(
             "INSERT INTO operation
@@ -794,6 +811,118 @@ mod tests {
 
         assert_eq!(repository.recover_create(operation).await.unwrap(), project);
         assert_eq!(repository.recover_create(operation).await.unwrap(), project);
+        pool.close().await;
+    }
+
+    #[test]
+    fn create_payload_decoder_has_a_strict_preallocation_byte_bound() {
+        let project = Project::from_new(
+            ProjectId::new(),
+            cellar_core::NewProject::try_new("maximum", "description").unwrap(),
+            OffsetDateTime::from_unix_timestamp(5).unwrap(),
+        );
+        let payload = serde_json::to_string(&CreatePayload {
+            project_id: project.id.to_string(),
+            name: project.name.as_str(),
+            description: project.description.as_str(),
+            status: project.status,
+            version: project.version,
+            created_at: timestamp(project.created_at).unwrap(),
+            updated_at: timestamp(project.updated_at).unwrap(),
+            request_digest: "digest",
+        })
+        .unwrap();
+        let mut exact = payload.clone();
+        exact.extend(std::iter::repeat_n(
+            ' ',
+            MAX_PROJECT_CREATE_PAYLOAD_BYTES - exact.len(),
+        ));
+        assert_eq!(exact.len(), MAX_PROJECT_CREATE_PAYLOAD_BYTES);
+        assert_eq!(
+            decode_project_create_payload(&exact).unwrap().project,
+            project
+        );
+
+        let over = format!("{exact} ");
+        let error = decode_project_create_payload(&over).unwrap_err();
+        assert_eq!(error, ProjectRepositoryError::Unavailable);
+        assert!(!format!("{error:?}").contains("maximum"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_durable_payloads_fail_closed_without_disclosure() {
+        let (_directory, pool, repository) = repository().await;
+        let operation = OperationId::new();
+        let project = Project::from_new(
+            ProjectId::new(),
+            cellar_core::NewProject::try_new("recover", "durable").unwrap(),
+            OffsetDateTime::from_unix_timestamp(5).unwrap(),
+        );
+        repository
+            .begin_create(operation, &project, "digest")
+            .await
+            .unwrap();
+        repository
+            .mark_create_fs_applied(operation, project.created_at)
+            .await
+            .unwrap();
+        let valid: String = sqlx::query_scalar("SELECT payload FROM operation WHERE id = ?")
+            .bind(operation.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let oversized = format!(
+            "{valid}{}oversized-secret",
+            " ".repeat(MAX_PROJECT_CREATE_PAYLOAD_BYTES - valid.len() + 1)
+        );
+
+        for (payload, secret) in [
+            ("{\"corrupt-secret\":".to_owned(), "corrupt-secret"),
+            (oversized, "oversized-secret"),
+        ] {
+            sqlx::query("UPDATE operation SET payload = ? WHERE id = ?")
+                .bind(payload)
+                .bind(operation.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            let error = repository.recover_create(operation).await.unwrap_err();
+            assert_eq!(error, ProjectRepositoryError::Unavailable);
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn maximum_valid_domain_payload_fits_the_operation_bound() {
+        let (_directory, pool, repository) = repository().await;
+        let project = Project::from_new(
+            ProjectId::new(),
+            cellar_core::NewProject::try_new(
+                "\\".repeat(cellar_core::MAX_PROJECT_NAME_BYTES),
+                "\u{1}".repeat(cellar_core::MAX_PROJECT_DESCRIPTION_BYTES),
+            )
+            .unwrap(),
+            OffsetDateTime::from_unix_timestamp(5).unwrap(),
+        );
+        let operation = OperationId::new();
+        assert_eq!(
+            repository
+                .begin_create(operation, &project, &"d".repeat(64))
+                .await
+                .unwrap(),
+            OperationStart::New
+        );
+        let payload: String = sqlx::query_scalar("SELECT payload FROM operation WHERE id = ?")
+            .bind(operation.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(payload.len() <= MAX_PROJECT_CREATE_PAYLOAD_BYTES);
+        assert_eq!(
+            decode_project_create_payload(&payload).unwrap().project,
+            project
+        );
         pool.close().await;
     }
 

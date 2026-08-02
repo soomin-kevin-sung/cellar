@@ -15,8 +15,9 @@ use cellar_auth::{
 };
 use cellar_core::{
     DirectoryStoreError, MAX_PROJECT_DESCRIPTION_BYTES, MAX_PROJECT_NAME_BYTES, NewProject,
-    OperationId, ProjectDirectoryStore, ProjectId, ProjectPatch, ProjectService,
-    ProjectServiceError, ProjectStatus,
+    OperationId, OperationStart, Project, ProjectDirectoryStore, ProjectId, ProjectListFilter,
+    ProjectPatch, ProjectRepository, ProjectRepositoryError, ProjectService, ProjectServiceError,
+    ProjectStatus,
 };
 use cellar_db::{FilenameCollation, SqliteProjectRepository, migrate, open_pool};
 use futures_util::stream;
@@ -64,6 +65,87 @@ struct RecordingDirectories {
     pool: SqlitePool,
     calls: AtomicUsize,
     outcome: Option<DirectoryStoreError>,
+}
+
+struct FailingMarkRepository {
+    inner: Arc<SqliteProjectRepository>,
+}
+
+#[async_trait]
+impl ProjectRepository for FailingMarkRepository {
+    async fn begin_create(
+        &self,
+        operation_id: OperationId,
+        project: &Project,
+        request_digest: &str,
+    ) -> Result<OperationStart, ProjectRepositoryError> {
+        self.inner
+            .begin_create(operation_id, project, request_digest)
+            .await
+    }
+
+    async fn mark_create_fs_applied(
+        &self,
+        operation_id: OperationId,
+        now: OffsetDateTime,
+    ) -> Result<(), ProjectRepositoryError> {
+        self.inner.mark_create_fs_applied(operation_id, now).await
+    }
+
+    async fn mark_create_failed(
+        &self,
+        _: OperationId,
+        _: &'static str,
+        _: OffsetDateTime,
+    ) -> Result<(), ProjectRepositoryError> {
+        Err(ProjectRepositoryError::Unavailable)
+    }
+
+    async fn create(
+        &self,
+        operation_id: OperationId,
+        project: &Project,
+    ) -> Result<Project, ProjectRepositoryError> {
+        self.inner.create(operation_id, project).await
+    }
+
+    async fn recover_create(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Project, ProjectRepositoryError> {
+        self.inner.recover_create(operation_id).await
+    }
+
+    async fn read(&self, id: ProjectId) -> Result<Project, ProjectRepositoryError> {
+        self.inner.read(id).await
+    }
+
+    async fn list(
+        &self,
+        filter: ProjectListFilter,
+        limit: u32,
+    ) -> Result<Vec<Project>, ProjectRepositoryError> {
+        self.inner.list(filter, limit).await
+    }
+
+    async fn update(
+        &self,
+        id: ProjectId,
+        expected_version: i64,
+        patch: &ProjectPatch,
+        now: OffsetDateTime,
+    ) -> Result<Project, ProjectRepositoryError> {
+        self.inner.update(id, expected_version, patch, now).await
+    }
+
+    async fn archive(
+        &self,
+        id: ProjectId,
+        expected_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<Project, ProjectRepositoryError> {
+        self.inner.archive(id, expected_version, now).await
+    }
 }
 
 #[async_trait]
@@ -757,6 +839,72 @@ async fn terminal_storage_failures_replay_the_same_outward_error_without_retryin
         assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
         pool.close().await;
     }
+}
+
+#[tokio::test]
+async fn failed_terminal_journal_write_returns_503_and_leaves_pending_recovery_evidence() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("cellar.db");
+    let collation = FilenameCollation::windows_ordinal_ci_v1(|left, right| left.cmp(right));
+    let pool = open_pool(path, collation).await.unwrap();
+    migrate(&pool).await.unwrap();
+    let repository = Arc::new(SqliteProjectRepository::new(pool.clone()));
+    let directories = Arc::new(RecordingDirectories {
+        pool: pool.clone(),
+        calls: AtomicUsize::new(0),
+        outcome: Some(DirectoryStoreError::Conflict),
+    });
+    let service = ProjectService::new(
+        Arc::new(FailingMarkRepository { inner: repository }),
+        directories.clone(),
+    );
+    let protected = projects_router_with_clock::<EnrolledStore, _>(service, || {
+        OffsetDateTime::from_unix_timestamp(NOW).unwrap()
+    });
+    let app = session_router_with_routes(
+        EnrollmentService::new(Arc::new(EnrolledStore)),
+        Arc::new(CsrfManager::new()),
+        || NOW,
+        protected,
+    );
+    let token = csrf_token(&app).await;
+    let operation = OperationId::new();
+
+    let send = || {
+        let mut create = json_request(
+            "POST",
+            "/api/v1/projects",
+            json!({"name":"journal failure","description":"same"}),
+        );
+        create.headers_mut().insert(
+            HeaderName::from_static("idempotency-key"),
+            operation.to_string().parse().unwrap(),
+        );
+        authorize_mutation(&mut create, &token);
+        create
+    };
+    assert_project_error(
+        app.clone().oneshot(send()).await.unwrap(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "project_service_unavailable",
+    )
+    .await;
+    let state: String = sqlx::query_scalar("SELECT state FROM operation WHERE id = ?")
+        .bind(operation.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending");
+    assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+
+    assert_project_error(
+        app.clone().oneshot(send()).await.unwrap(),
+        StatusCode::CONFLICT,
+        "project_create_in_progress",
+    )
+    .await;
+    assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+    pool.close().await;
 }
 
 #[tokio::test]

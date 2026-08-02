@@ -438,10 +438,14 @@ impl ProjectService {
             Err(error) => return Err(map_repository_error(error)),
         }
         if let Err(error) = self.directories.create_project_directory(project_id).await {
-            let _ = self
+            if self
                 .repository
                 .mark_create_failed(operation_id, error.code(), now)
-                .await;
+                .await
+                .is_err()
+            {
+                return Err(ProjectServiceError::Unavailable);
+            }
             return Err(match error {
                 DirectoryStoreError::Conflict => ProjectServiceError::Conflict,
                 DirectoryStoreError::Unavailable => ProjectServiceError::Unavailable,

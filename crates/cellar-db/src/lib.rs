@@ -7,7 +7,8 @@ use thiserror::Error;
 pub use migrate::migrate;
 pub use pool::{FilenameCollation, open_pool};
 pub use project_repo::{
-    RecoveredProjectCreate, SqliteProjectRepository, decode_project_create_payload,
+    MAX_PROJECT_CREATE_PAYLOAD_BYTES, RecoveredProjectCreate, SqliteProjectRepository,
+    decode_project_create_payload,
 };
 
 /// Stable, client-safe database failure categories.
