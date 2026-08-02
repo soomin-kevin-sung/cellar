@@ -1,17 +1,13 @@
-#[cfg(not(windows))]
-use std::path::Path;
-
 use cellar_storage::{FileIdentity, SafeName, Storage, StorageError, StorageErrorKind};
 
 use crate::WindowsName;
 
 #[cfg(windows)]
 mod platform {
-    use std::fs::{File, OpenOptions};
+    use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
     use std::mem::{offset_of, size_of, size_of_val};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
     use std::ptr;
@@ -25,15 +21,14 @@ mod platform {
     use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
-        FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        SetFileInformationByHandle,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle,
     };
 
     use crate::WindowsName;
+    use crate::preflight::{StorageIdentity, TrustedRootHandle};
 
     const MAX_PATH_CHARS: usize = 32_768;
     const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x0000_0001;
@@ -65,25 +60,27 @@ mod platform {
         }
     }
 
+    #[derive(Clone)]
     pub struct WindowsStorage {
         root: VerifiedHandle,
         root_volume: u64,
     }
 
     impl WindowsStorage {
-        pub fn open(path: &Path) -> Result<Self, StorageError> {
-            let file = OpenOptions::new()
-                .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)
-                .map_err(map_io)?;
+        pub fn adopt(identity: StorageIdentity<TrustedRootHandle>) -> Result<Self, StorageError> {
+            let (preflight_coordinates, trusted_root) = identity.into_parts();
+            let file = trusted_root.into_file();
             let facts = inspect(&file)?;
             if facts.kind != EntryKind::Directory || facts.reparse || facts.case_sensitive {
                 return Err(unsupported());
             }
+            if facts.identity.volume_serial != preflight_coordinates.volume_serial
+                || facts.identity.file_id != preflight_coordinates.root_file_id
+            {
+                return Err(unsupported());
+            }
             let root = VerifiedHandle {
-                file: Arc::new(file),
+                file,
                 identity: facts.identity,
                 kind: facts.kind,
             };
@@ -610,6 +607,7 @@ pub use platform::{VerifiedHandle, WindowsStorage};
 #[cfg(not(windows))]
 mod platform_stub {
     use super::*;
+    use crate::preflight::{StorageIdentity, TrustedRootHandle};
     use cellar_storage::EntryKind;
 
     #[derive(Clone, Debug)]
@@ -628,10 +626,13 @@ mod platform_stub {
         }
     }
 
-    pub struct WindowsStorage;
+    #[derive(Clone)]
+    pub struct WindowsStorage {
+        _private: (),
+    }
 
     impl WindowsStorage {
-        pub fn open(_path: &Path) -> Result<Self, StorageError> {
+        pub fn adopt(_identity: StorageIdentity<TrustedRootHandle>) -> Result<Self, StorageError> {
             Err(StorageError::new(StorageErrorKind::Unsupported))
         }
 
@@ -685,6 +686,17 @@ mod platform_stub {
 #[cfg(not(windows))]
 pub use platform_stub::{VerifiedHandle, WindowsStorage};
 
+async fn dispatch_blocking<T>(
+    operation: impl FnOnce() -> Result<T, StorageError> + Send + 'static,
+) -> Result<T, StorageError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| StorageError::new(StorageErrorKind::WorkerFailed))?
+}
+
 #[async_trait::async_trait]
 impl Storage for WindowsStorage {
     type Handle = VerifiedHandle;
@@ -696,15 +708,9 @@ impl Storage for WindowsStorage {
     ) -> Result<Self::Handle, StorageError> {
         let name = WindowsName::parse(name.as_str())
             .map_err(|_| StorageError::new(StorageErrorKind::InvalidName))?;
-        #[cfg(windows)]
-        {
-            WindowsStorage::open_verified(self, parent, &name)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (parent, name);
-            Err(StorageError::new(StorageErrorKind::Unsupported))
-        }
+        let storage = self.clone();
+        let parent = parent.clone();
+        dispatch_blocking(move || WindowsStorage::open_verified(&storage, &parent, &name)).await
     }
 
     async fn rename_no_replace(
@@ -715,15 +721,13 @@ impl Storage for WindowsStorage {
     ) -> Result<FileIdentity, StorageError> {
         let name = WindowsName::parse(destination_name.as_str())
             .map_err(|_| StorageError::new(StorageErrorKind::InvalidName))?;
-        #[cfg(windows)]
-        {
-            WindowsStorage::rename_no_replace(self, source, destination_parent, &name)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (source, destination_parent, name);
-            Err(StorageError::new(StorageErrorKind::Unsupported))
-        }
+        let storage = self.clone();
+        let source = source.clone();
+        let destination_parent = destination_parent.clone();
+        dispatch_blocking(move || {
+            WindowsStorage::rename_no_replace(&storage, &source, &destination_parent, &name)
+        })
+        .await
     }
 }
 
@@ -733,7 +737,31 @@ mod tests {
 
     use cellar_storage::{StorageError, StorageErrorKind};
 
+    use super::dispatch_blocking;
     use super::platform::{reject_unsupported_characteristics, verify_created_with_cleanup};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_storage_dispatches_sync_work_off_the_runtime_thread() {
+        let runtime_thread = std::thread::current().id();
+
+        let worker_thread = dispatch_blocking(|| Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+
+        assert_ne!(worker_thread, runtime_thread);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_worker_failure_is_stable_and_redacted() {
+        let error =
+            dispatch_blocking(|| -> Result<(), StorageError> { panic!("private worker detail") })
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.kind(), StorageErrorKind::WorkerFailed);
+        assert_eq!(error.code(), "worker_failed");
+        assert!(!error.to_string().contains("private worker detail"));
+    }
 
     #[test]
     fn verification_failure_deletes_the_exact_owned_creation() {

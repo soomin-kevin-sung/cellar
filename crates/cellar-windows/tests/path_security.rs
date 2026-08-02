@@ -69,8 +69,8 @@ mod windows {
     #[test]
     fn create_no_replace_preserves_existing_destination() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::write(directory.path().join("present.txt"), b"owner").unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
 
         let error = storage
             .create_file_no_replace(storage.root(), &name("present.txt"))
@@ -84,11 +84,26 @@ mod windows {
     }
 
     #[test]
+    fn adapter_adopts_the_exact_preflight_root_identity() {
+        let directory = tempdir().unwrap();
+        let identity = cellar_windows::preflight::run_as_service(directory.path()).unwrap();
+        let coordinates = identity.coordinates();
+
+        let storage = WindowsStorage::adopt(identity).unwrap();
+
+        assert_eq!(
+            storage.root().identity().volume_serial,
+            coordinates.volume_serial
+        );
+        assert_eq!(storage.root().identity().file_id, coordinates.root_file_id);
+    }
+
+    #[test]
     fn rename_no_replace_preserves_both_files_on_conflict() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::write(directory.path().join("source.txt"), b"source").unwrap();
         fs::write(directory.path().join("destination.txt"), b"destination").unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
         let source = storage
             .open_verified(storage.root(), &name("source.txt"))
             .unwrap();
@@ -111,8 +126,8 @@ mod windows {
     #[test]
     fn successful_rename_preserves_full_file_identity() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::write(directory.path().join("source.txt"), b"source").unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
         let source = storage
             .open_verified(storage.root(), &name("source.txt"))
             .unwrap();
@@ -135,7 +150,7 @@ mod windows {
     #[test]
     fn destination_create_race_has_exactly_one_winner_without_loss() {
         let directory = tempdir().unwrap();
-        let storage = Arc::new(WindowsStorage::open(directory.path()).unwrap());
+        let storage = Arc::new(adopted_storage(directory.path()));
 
         for iteration in 0..32 {
             let source_name = format!("source-{iteration}.txt");
@@ -192,7 +207,7 @@ mod windows {
         let configured = parent.path().join("configured");
         let retained = parent.path().join("retained");
         fs::create_dir(&configured).unwrap();
-        let storage = WindowsStorage::open(&configured).unwrap();
+        let storage = adopted_storage(&configured);
         assert!(fs::rename(&configured, &retained).is_err());
         storage
             .create_file_no_replace(storage.root(), &name("trusted.txt"))
@@ -204,14 +219,13 @@ mod windows {
     #[test]
     fn rejects_hard_link_aliases_before_mutation() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::write(directory.path().join("original.txt"), b"owner").unwrap();
         fs::hard_link(
             directory.path().join("original.txt"),
             directory.path().join("alias.txt"),
         )
         .unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
-
         let error = storage
             .open_verified(storage.root(), &name("original.txt"))
             .unwrap_err();
@@ -230,6 +244,7 @@ mod windows {
         let outside = parent.path().join("outside");
         fs::create_dir(&root).unwrap();
         fs::create_dir(&outside).unwrap();
+        let storage = adopted_storage(&root);
         let link = root.join("escape");
         if symlink_dir(&outside, &link).is_err() {
             let output = std::process::Command::new("cmd")
@@ -245,8 +260,6 @@ mod windows {
                 "could not create a test reparse point"
             );
         }
-        let storage = WindowsStorage::open(&root).unwrap();
-
         let error = storage
             .open_verified(storage.root(), &name("escape"))
             .unwrap_err();
@@ -257,13 +270,13 @@ mod windows {
     #[test]
     fn opens_nested_components_only_from_verified_directory_handles() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::create_dir(directory.path().join("folder")).unwrap();
         fs::write(
             directory.path().join("folder").join("inside.txt"),
             b"inside",
         )
         .unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
         let folder = storage
             .open_verified(storage.root(), &name("folder"))
             .unwrap();
@@ -275,7 +288,7 @@ mod windows {
     #[tokio::test]
     async fn storage_port_revalidates_platform_rules() {
         let directory = tempdir().unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
+        let storage = adopted_storage(directory.path());
         let ads = SafeName::parse("file.txt:stream").unwrap();
 
         let error = Storage::open_verified(&storage, storage.root(), &ads)
@@ -288,8 +301,8 @@ mod windows {
     #[test]
     fn verified_source_handle_blocks_namespace_replacement() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::write(directory.path().join("source.txt"), b"original").unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
         let source = storage
             .open_verified(storage.root(), &name("source.txt"))
             .unwrap();
@@ -307,9 +320,9 @@ mod windows {
     #[test]
     fn create_directory_no_replace_preserves_existing_directory() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         fs::create_dir(directory.path().join("present")).unwrap();
         fs::write(directory.path().join("present").join("owner.txt"), b"owner").unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
 
         let error = storage
             .create_directory_no_replace(storage.root(), &name("present"))
@@ -325,6 +338,7 @@ mod windows {
     #[test]
     fn rejects_case_sensitive_directory_subtrees_when_supported() {
         let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
         let child = directory.path().join("sensitive");
         fs::create_dir(&child).unwrap();
         if let Err(error) = enable_case_sensitivity(&child) {
@@ -333,8 +347,6 @@ mod windows {
             );
             return;
         }
-        let storage = WindowsStorage::open(directory.path()).unwrap();
-
         let error = storage
             .open_verified(storage.root(), &name("sensitive"))
             .unwrap_err();
@@ -345,7 +357,7 @@ mod windows {
     #[test]
     fn handle_relative_creation_supports_paths_beyond_legacy_max_path() {
         let directory = tempdir().unwrap();
-        let storage = WindowsStorage::open(directory.path()).unwrap();
+        let storage = adopted_storage(directory.path());
         let component = name(&"n".repeat(100));
         let mut parent = storage.root().clone();
         for _ in 0..30 {
@@ -388,5 +400,10 @@ mod windows {
 
     fn name(value: &str) -> WindowsName {
         WindowsName::parse(value).unwrap()
+    }
+
+    fn adopted_storage(path: &std::path::Path) -> WindowsStorage {
+        let identity = cellar_windows::preflight::run_as_service(path).unwrap();
+        WindowsStorage::adopt(identity).unwrap()
     }
 }

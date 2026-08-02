@@ -147,6 +147,10 @@ impl<H> StorageIdentity<H> {
     pub const fn trusted_root(&self) -> &H {
         &self.trusted_root
     }
+
+    pub(crate) fn into_parts(self) -> (StorageCoordinates, H) {
+        (self.coordinates, self.trusted_root)
+    }
 }
 
 impl<H> fmt::Debug for StorageIdentity<H> {
@@ -324,9 +328,10 @@ mod platform {
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_ENCRYPTED,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
         FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW,
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_LIST_DIRECTORY,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, FileIdInfo, GetDriveTypeW, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
         GetVolumePathNameW, SetFileInformationByHandle, WRITE_DAC,
     };
     use windows_sys::Win32::System::WindowsProgramming::{
@@ -342,7 +347,6 @@ mod platform {
 
     const MAX_PATH_CHARS: usize = 32_768;
 
-    #[derive(Clone)]
     pub struct TrustedRootHandle {
         pub(super) file: Arc<File>,
     }
@@ -369,7 +373,7 @@ mod platform {
             }
             let file = OpenOptions::new()
                 .access_mode(FILE_LIST_DIRECTORY)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(root)
                 .map_err(map_io)?;
@@ -389,11 +393,7 @@ mod platform {
             // Do not enumerate through a reparse root. Validation rejects it
             // using the attributes obtained from the non-following handle.
             let empty = is_directory && !is_reparse && retained_directory_is_empty(&file)?;
-            let coordinates = StorageCoordinates {
-                volume_serial: u64::from(information.dwVolumeSerialNumber),
-                root_file_id: (u128::from(information.nFileIndexHigh) << 32)
-                    | u128::from(information.nFileIndexLow),
-            };
+            let coordinates = file_identity(raw)?;
             let inspection = RootInspection {
                 filesystem,
                 volume_kind,
@@ -510,20 +510,34 @@ mod platform {
             &self,
             root: &Self::RootHandle,
         ) -> Result<StorageCoordinates, AdapterError> {
-            let mut information = BY_HANDLE_FILE_INFORMATION::default();
-            // SAFETY: the retained root `File` owns a live handle and the
-            // output structure is writable for the call.
-            if unsafe { GetFileInformationByHandle(root.file.as_raw_handle(), &mut information) }
-                == 0
-            {
-                return Err(AdapterError::io());
-            }
-            Ok(StorageCoordinates {
-                volume_serial: u64::from(information.dwVolumeSerialNumber),
-                root_file_id: (u128::from(information.nFileIndexHigh) << 32)
-                    | u128::from(information.nFileIndexLow),
-            })
+            file_identity(root.file.as_raw_handle())
         }
+    }
+
+    impl TrustedRootHandle {
+        pub(crate) fn into_file(self) -> Arc<File> {
+            self.file
+        }
+    }
+
+    fn file_identity(handle: *mut core::ffi::c_void) -> Result<StorageCoordinates, AdapterError> {
+        let mut identity = FILE_ID_INFO::default();
+        // SAFETY: `handle` is live and the fixed-size identity output is writable.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut identity as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(AdapterError::io());
+        }
+        Ok(StorageCoordinates {
+            volume_serial: identity.VolumeSerialNumber,
+            root_file_id: u128::from_le_bytes(identity.FileId.Identifier),
+        })
     }
 
     #[repr(C)]
@@ -905,10 +919,7 @@ mod windows_tests {
     use std::sync::Arc;
 
     use tempfile::tempdir;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
     use super::platform::{
         TrustedRootHandle, WindowsPreflight, records_contain_non_dot_entry,
@@ -940,14 +951,13 @@ mod windows_tests {
     }
 
     #[test]
-    fn retained_root_handle_cannot_be_redirected_by_path_swap() {
+    fn retained_root_handle_blocks_path_replacement() {
         let parent = tempdir().unwrap();
         let configured = parent.path().join("configured");
         let retained = parent.path().join("retained");
         std::fs::create_dir(&configured).unwrap();
         let (_, root) = WindowsPreflight.inspect(&configured).unwrap();
-        std::fs::rename(&configured, &retained).unwrap();
-        std::fs::create_dir(&configured).unwrap();
+        assert!(std::fs::rename(&configured, &retained).is_err());
         let source = ProbeName("source.tmp".into());
         let destination = ProbeName("destination.tmp".into());
 
@@ -957,38 +967,30 @@ mod windows_tests {
             .unwrap();
         WindowsPreflight.flush(&mut probe).unwrap();
 
-        assert!(retained.join(source.as_str()).exists());
-        assert!(!configured.join(source.as_str()).exists());
+        assert!(configured.join(source.as_str()).exists());
+        assert!(!retained.exists());
         WindowsPreflight
             .rename_no_replace(&root, &mut probe, &destination)
             .unwrap();
-        assert!(retained.join(destination.as_str()).exists());
-        assert!(!configured.join(destination.as_str()).exists());
+        assert!(configured.join(destination.as_str()).exists());
+        assert!(!retained.exists());
         WindowsPreflight.delete_owned(probe).unwrap();
-        assert!(!retained.join(destination.as_str()).exists());
         assert!(!configured.join(destination.as_str()).exists());
     }
 
     #[test]
-    fn retained_root_emptiness_cannot_be_redirected_by_path_swap() {
+    fn retained_root_emptiness_check_blocks_path_replacement() {
         let parent = tempdir().unwrap();
         let configured = parent.path().join("configured");
         let retained = parent.path().join("retained");
         std::fs::create_dir(&configured).unwrap();
         std::fs::write(configured.join("existing-data"), b"must be detected").unwrap();
-        let root = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&configured)
-            .unwrap();
+        let (_, root) = WindowsPreflight.inspect(&configured).unwrap();
 
-        std::fs::rename(&configured, &retained).unwrap();
-        std::fs::create_dir(&configured).unwrap();
-
-        assert!(!retained_directory_is_empty(&root).unwrap());
-        assert!(configured.read_dir().unwrap().next().is_none());
-        assert!(retained.join("existing-data").exists());
+        assert!(std::fs::rename(&configured, &retained).is_err());
+        assert!(!retained_directory_is_empty(&root.file).unwrap());
+        assert!(configured.join("existing-data").exists());
+        assert!(!retained.exists());
     }
 
     #[test]
