@@ -17,17 +17,20 @@ use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use cellar_api::health::{Readiness, health_router};
 use cellar_api::routes::session::{
-    RequestId, prepare_request_id, session_router, shared_error_response,
+    RequestId, prepare_request_id, session_router, session_router_with_routes,
+    shared_error_response,
 };
+use cellar_api::uploads_router;
 use cellar_auth::{
     AccessClaims, AccessValidator, AccessValidatorConfig, AuthError, CsrfManager,
     EnrollmentService, FileEnrollmentStore, JwksFetchError, JwksFetcher, JwksResponse, OwnerMode,
     select_access_jwt_header,
 };
 use cellar_config::CellarConfig;
-use cellar_core::ReadinessBlocker;
-use cellar_db::FilenameCollation;
+use cellar_core::{ReadinessBlocker, UploadLimits, UploadService, UploadStagingStore};
+use cellar_db::{FilenameCollation, SqliteUploadRepository};
 use cellar_windows::service::{NORMAL_STOP_TARGET, PRESHUTDOWN_BUDGET, ServiceControl};
+use cellar_windows::{WindowsStorage, WindowsUploadStaging};
 use futures_util::TryStreamExt;
 use rustls::ServerConfig;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -251,6 +254,31 @@ pub fn origin_router_with_authenticator(
     session_router(enrollment, Arc::new(CsrfManager::new()), unix_now)
         .layer(from_fn_with_state(shutdown, mutation_shutdown_boundary))
         .layer(from_fn_with_state(auth_state, access_boundary))
+}
+
+pub fn origin_router_with_authenticator_and_uploads(
+    config_path: &std::path::Path,
+    authenticator: Arc<dyn OriginAuthenticator>,
+    readiness: Readiness,
+    shutdown: Shutdown,
+    upload_service: UploadService,
+) -> Router {
+    let store = Arc::new(FileEnrollmentStore::new(config_path));
+    let enrollment = EnrollmentService::new(Arc::clone(&store));
+    let auth_state = Arc::new(OriginAuthState {
+        authenticator,
+        config_path: config_path.to_path_buf(),
+        readiness,
+    });
+    let protected = uploads_router::<FileEnrollmentStore>(upload_service);
+    session_router_with_routes(
+        enrollment,
+        Arc::new(CsrfManager::new()),
+        unix_now,
+        protected,
+    )
+    .layer(from_fn_with_state(shutdown, mutation_shutdown_boundary))
+    .layer(from_fn_with_state(auth_state, access_boundary))
 }
 
 fn unix_now() -> i64 {
@@ -515,8 +543,11 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         readiness.clear(ReadinessBlocker::OwnerEnrollmentRequired);
     }
 
-    let _identity = cellar_windows::preflight::run_as_service(&options.config.storage_root)
+    let identity = cellar_windows::preflight::open_as_service(&options.config.storage_root)
         .map_err(|_| AppError::StoragePreflight)?;
+    let storage = WindowsStorage::adopt(identity).map_err(|_| AppError::StoragePreflight)?;
+    let staging =
+        Arc::new(WindowsUploadStaging::open(storage).map_err(|_| AppError::StoragePreflight)?);
     readiness.clear(ReadinessBlocker::StorageUnavailable);
 
     let database_directory = options.database_path.parent().ok_or(AppError::Database)?;
@@ -531,12 +562,15 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         .await
         .map_err(|_| AppError::Database)?;
     readiness.clear(ReadinessBlocker::MigrationRequired);
+    let upload_service =
+        initialize_upload_recovery(&pool, staging, &readiness, time::OffsetDateTime::now_utc())
+            .await?;
     let startup_gates = match options.startup_gates {
         Some(gates) => gates,
         None => check_startup_gates(&pool).await?,
     };
-    if startup_gates.recovery_complete {
-        readiness.clear(ReadinessBlocker::RecoveryRequired);
+    if !startup_gates.recovery_complete {
+        readiness.block(ReadinessBlocker::RecoveryRequired);
     }
     if startup_gates.reconciliation_complete {
         readiness.clear(ReadinessBlocker::ReconciliationRequired);
@@ -560,11 +594,12 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         )
         .map_err(|_| AppError::Tls)?;
     let rustls = RustlsConfig::from_config(Arc::new(server_config));
-    let origin = origin_router_with_authenticator(
+    let origin = origin_router_with_authenticator_and_uploads(
         &options.config_path,
         production_authenticator(&options.config)?,
         readiness.clone(),
         options.shutdown.clone(),
+        upload_service,
     );
     let result = serve_bound(
         listeners,
@@ -594,32 +629,29 @@ pub async fn check_startup_gates(pool: &sqlx::SqlitePool) -> Result<StartupGates
     .fetch_one(pool)
     .await
     .map_err(|_| AppError::Database)?;
-    let active_uploads: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM upload_session
-         WHERE state IN ('created', 'uploading', 'verifying', 'committing')",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|_| AppError::Database)?;
-    if pending_operations != 0 || active_uploads != 0 {
+    if pending_operations != 0 {
         return Err(AppError::Recovery);
-    }
-    let catalog_rows: i64 = sqlx::query_scalar(
-        "SELECT
-           (SELECT count(*) FROM project) +
-           (SELECT count(*) FROM file_entry) +
-           (SELECT count(*) FROM trash_item)",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|_| AppError::Database)?;
-    if catalog_rows != 0 {
-        return Err(AppError::Reconciliation);
     }
     Ok(StartupGates {
         recovery_complete: true,
         reconciliation_complete: true,
     })
+}
+
+pub async fn initialize_upload_recovery(
+    pool: &sqlx::SqlitePool,
+    staging: Arc<dyn UploadStagingStore>,
+    readiness: &Readiness,
+    now: time::OffsetDateTime,
+) -> Result<UploadService, AppError> {
+    let repository = Arc::new(SqliteUploadRepository::new(pool.clone()));
+    let service = UploadService::new(repository, staging, UploadLimits::default());
+    service
+        .initialize(now)
+        .await
+        .map_err(|_| AppError::Recovery)?;
+    readiness.clear(ReadinessBlocker::RecoveryRequired);
+    Ok(service)
 }
 
 async fn serve_bound(

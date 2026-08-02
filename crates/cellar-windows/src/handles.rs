@@ -5,7 +5,7 @@ use crate::WindowsName;
 #[cfg(windows)]
 mod platform {
     use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::mem::{offset_of, size_of, size_of_val};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -15,16 +15,17 @@ mod platform {
 
     use cellar_storage::{EntryKind, FileIdentity, StorageError, StorageErrorKind};
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND,
-        ERROR_PATH_NOT_FOUND, GetLastError,
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DISK_FULL, ERROR_FILE_EXISTS,
+        ERROR_FILE_NOT_FOUND, ERROR_HANDLE_DISK_FULL, ERROR_PATH_NOT_FOUND, GetLastError,
     };
     use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_GENERIC_READ,
         FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle,
+        FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, GetDiskFreeSpaceExW,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        SetFileInformationByHandle,
     };
 
     use crate::WindowsName;
@@ -104,6 +105,20 @@ mod platform {
             self.verify_new_handle(file)
         }
 
+        pub fn open_verified_writable(
+            &self,
+            parent: &VerifiedHandle,
+            name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            self.verify_parent(parent)?;
+            let file = open_relative(
+                parent.file.as_raw_handle(),
+                name,
+                OpenMode::ExistingWritable,
+            )?;
+            self.verify_new_handle(file)
+        }
+
         pub fn create_file_no_replace(
             &self,
             parent: &VerifiedHandle,
@@ -157,6 +172,98 @@ mod platform {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(map_io)?;
             Ok(bytes)
+        }
+
+        pub fn file_length(&self, handle: &VerifiedHandle) -> Result<i64, StorageError> {
+            let facts = self.verify_existing(handle)?;
+            if facts.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            i64::try_from(handle.file.metadata().map_err(map_io)?.len()).map_err(|_| io_error())
+        }
+
+        pub fn read_exact_at(
+            &self,
+            handle: &VerifiedHandle,
+            offset: i64,
+            length: i64,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.verify_existing(handle)?;
+            let offset = u64::try_from(offset).map_err(|_| io_error())?;
+            let length = usize::try_from(length).map_err(|_| io_error())?;
+            let mut file = handle.file.try_clone().map_err(map_io)?;
+            file.seek(SeekFrom::Start(offset)).map_err(map_io)?;
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes).map_err(map_io)?;
+            Ok(bytes)
+        }
+
+        pub fn truncate_file(
+            &self,
+            handle: &VerifiedHandle,
+            length: i64,
+        ) -> Result<(), StorageError> {
+            self.verify_existing(handle)?;
+            let length = u64::try_from(length).map_err(|_| io_error())?;
+            handle.file.set_len(length).map_err(map_io)?;
+            handle.file.sync_all().map_err(map_io)
+        }
+
+        pub fn write_exact_at_and_flush(
+            &self,
+            handle: &VerifiedHandle,
+            offset: i64,
+            bytes: &[u8],
+        ) -> Result<(), StorageError> {
+            self.verify_existing(handle)?;
+            let offset = u64::try_from(offset).map_err(|_| io_error())?;
+            let mut file = handle.file.try_clone().map_err(map_io)?;
+            file.seek(SeekFrom::Start(offset)).map_err(map_io)?;
+            file.write_all(bytes).map_err(map_io)?;
+            file.sync_all().map_err(map_io)
+        }
+
+        pub fn remove_file(&self, handle: VerifiedHandle) -> Result<(), StorageError> {
+            let facts = self.verify_existing(&handle)?;
+            if facts.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            let information =
+                windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: the retained verified handle has DELETE access and the
+            // information value has the exact FileDispositionInfo layout.
+            if unsafe {
+                SetFileInformationByHandle(
+                    handle.file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&raw const information).cast(),
+                    size_of_val(&information) as u32,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            drop(handle);
+            Ok(())
+        }
+
+        pub fn available_space(&self) -> Result<i64, StorageError> {
+            let path = final_path(&self.root.file)?;
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut available = 0_u64;
+            // SAFETY: `wide` is a live NUL-terminated path and `available` is writable.
+            if unsafe {
+                GetDiskFreeSpaceExW(
+                    wide.as_mut_ptr(),
+                    &mut available,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            i64::try_from(available).map_err(|_| io_error())
         }
 
         fn verify_parent(&self, parent: &VerifiedHandle) -> Result<(), StorageError> {
@@ -392,6 +499,7 @@ mod platform {
 
     enum OpenMode {
         Existing,
+        ExistingWritable,
         CreateFile,
         CreateDirectory,
     }
@@ -484,6 +592,11 @@ mod platform {
         let mut handle = ptr::null_mut();
         let (disposition, type_option, desired_access) = match mode {
             OpenMode::Existing => (FILE_OPEN, 0, FILE_GENERIC_READ | DELETE),
+            OpenMode::ExistingWritable => (
+                FILE_OPEN,
+                0,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+            ),
             OpenMode::CreateFile => (
                 FILE_CREATE,
                 FILE_NON_DIRECTORY_FILE,
@@ -581,6 +694,9 @@ mod platform {
                 StorageError::new(StorageErrorKind::NotFound)
             }
             Some(ERROR_ACCESS_DENIED) => StorageError::new(StorageErrorKind::AccessDenied),
+            Some(ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL) => {
+                StorageError::new(StorageErrorKind::InsufficientStorage)
+            }
             _ => io_error(),
         }
     }
@@ -674,6 +790,47 @@ mod platform_stub {
         }
 
         pub fn read_all(&self, _handle: &VerifiedHandle) -> Result<Vec<u8>, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn open_verified_writable(
+            &self,
+            _parent: &VerifiedHandle,
+            _name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn file_length(&self, _handle: &VerifiedHandle) -> Result<i64, StorageError> {
+            Err(unsupported())
+        }
+        pub fn read_exact_at(
+            &self,
+            _handle: &VerifiedHandle,
+            _offset: i64,
+            _length: i64,
+        ) -> Result<Vec<u8>, StorageError> {
+            Err(unsupported())
+        }
+        pub fn truncate_file(
+            &self,
+            _handle: &VerifiedHandle,
+            _length: i64,
+        ) -> Result<(), StorageError> {
+            Err(unsupported())
+        }
+        pub fn write_exact_at_and_flush(
+            &self,
+            _handle: &VerifiedHandle,
+            _offset: i64,
+            _bytes: &[u8],
+        ) -> Result<(), StorageError> {
+            Err(unsupported())
+        }
+        pub fn remove_file(&self, _handle: VerifiedHandle) -> Result<(), StorageError> {
+            Err(unsupported())
+        }
+        pub fn available_space(&self) -> Result<i64, StorageError> {
             Err(unsupported())
         }
     }

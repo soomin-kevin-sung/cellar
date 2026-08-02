@@ -263,6 +263,37 @@ fn validate(inspection: RootInspection) -> Result<(), PreflightError> {
     Ok(())
 }
 
+fn validate_existing(inspection: RootInspection) -> Result<(), PreflightError> {
+    let mut existing = inspection;
+    existing.attributes.empty = true;
+    validate(existing)
+}
+
+fn open_existing_with<A: PreflightAdapter>(
+    adapter: &A,
+    root: &Path,
+) -> Result<StorageIdentity<A::RootHandle>, PreflightError> {
+    let (inspection, root_handle) = adapter
+        .inspect(root)
+        .map_err(|_| PreflightError::IoFailed)?;
+    validate_existing(inspection)?;
+    let probe = run_probe(adapter, &root_handle)?;
+    let current = match adapter.current_coordinates(&root_handle) {
+        Ok(current) => current,
+        Err(_) => return fail_after_cleanup(adapter, probe, PreflightError::IoFailed),
+    };
+    if current != inspection.coordinates {
+        return fail_after_cleanup(adapter, probe, PreflightError::IdentityMismatch);
+    }
+    adapter
+        .delete_owned(probe)
+        .map_err(|_| PreflightError::CleanupFailed)?;
+    Ok(StorageIdentity {
+        coordinates: inspection.coordinates,
+        trusted_root: root_handle,
+    })
+}
+
 fn run_probe<A: PreflightAdapter>(
     adapter: &A,
     root: &A::RootHandle,
@@ -898,10 +929,18 @@ mod platform {
     ) -> Result<StorageIdentity<TrustedRootHandle>, PreflightError> {
         preflight_with(&WindowsPreflight, root)
     }
+
+    /// Opens an installed Cellar root while repeating the retained-handle,
+    /// volume, filesystem, and durable mutation probes required at startup.
+    pub fn open_as_service(
+        root: &Path,
+    ) -> Result<StorageIdentity<TrustedRootHandle>, PreflightError> {
+        super::open_existing_with(&WindowsPreflight, root)
+    }
 }
 
 #[cfg(windows)]
-pub use platform::{TrustedRootHandle, run_as_service};
+pub use platform::{TrustedRootHandle, open_as_service, run_as_service};
 
 #[cfg(not(windows))]
 #[derive(Debug)]
@@ -909,6 +948,11 @@ pub struct TrustedRootHandle;
 
 #[cfg(not(windows))]
 pub fn run_as_service(_root: &Path) -> Result<StorageIdentity<TrustedRootHandle>, PreflightError> {
+    Err(PreflightError::UnsupportedPlatform)
+}
+
+#[cfg(not(windows))]
+pub fn open_as_service(_root: &Path) -> Result<StorageIdentity<TrustedRootHandle>, PreflightError> {
     Err(PreflightError::UnsupportedPlatform)
 }
 

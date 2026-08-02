@@ -24,6 +24,7 @@ pub enum StorageErrorKind {
     AccessDenied,
     CleanupFailed,
     WorkerFailed,
+    InsufficientStorage,
     Io,
 }
 
@@ -51,6 +52,7 @@ impl StorageError {
             StorageErrorKind::AccessDenied => "access_denied",
             StorageErrorKind::CleanupFailed => "cleanup_failed",
             StorageErrorKind::WorkerFailed => "worker_failed",
+            StorageErrorKind::InsufficientStorage => "insufficient_storage",
             StorageErrorKind::Io => "io_error",
         }
     }

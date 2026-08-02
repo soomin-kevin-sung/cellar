@@ -304,7 +304,7 @@ async fn shutdown_rejects_new_unsafe_origin_requests_but_allows_safe_drain() {
 }
 
 #[tokio::test]
-async fn startup_gates_clear_only_after_database_has_no_pending_work() {
+async fn startup_gates_reject_only_unresolved_operation_evidence() {
     let directory = tempdir().unwrap();
     let database = directory.path().join("cellar.db");
     let pool = cellar_db::open_pool(
@@ -342,10 +342,9 @@ async fn startup_gates_clear_only_after_database_has_no_pending_work() {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        check_startup_gates(&pool).await.unwrap_err().code(),
-        "startup_reconciliation_failed"
-    );
+    let catalog = check_startup_gates(&pool).await.unwrap();
+    assert!(catalog.recovery_complete);
+    assert!(catalog.reconciliation_complete);
 }
 
 fn available_port() -> u16 {
