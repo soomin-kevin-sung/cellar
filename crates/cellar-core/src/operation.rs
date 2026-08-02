@@ -174,6 +174,13 @@ pub trait UploadFinalizeRepository: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<UploadFinalizeStart, UploadFinalizeRepositoryError>;
 
+    /// Revalidates mutable project and destination-parent publication
+    /// preconditions. Call only while no filesystem publication has occurred.
+    async fn validate_upload_publication(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<(), UploadFinalizeRepositoryError>;
+
     async fn mark_upload_fs_applied(
         &self,
         intent: &UploadCommitIntent,

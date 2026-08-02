@@ -37,6 +37,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
     ) -> Result<Option<UploadFinalizeStart>, UploadFinalizeRepositoryError> {
         let row = sqlx::query(
             "SELECT f.operation_id, f.file_entry_id, f.result_identity,
+                    f.sha256, f.destination_namespace_identity,
                     o.state, o.payload_version, o.payload,
                     u.state AS upload_state
              FROM upload_finalization AS f
@@ -70,6 +71,22 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         let state: String = row.try_get("state").map_err(map_sql)?;
         let upload_state: String = row.try_get("upload_state").map_err(map_sql)?;
         let payload_version: i64 = row.try_get("payload_version").map_err(map_sql)?;
+        let legacy_terminal = payload_version != UPLOAD_COMMIT_PAYLOAD_VERSION
+            || row
+                .try_get::<Option<Vec<u8>>, _>("sha256")
+                .map_err(map_sql)?
+                .is_none()
+            || row
+                .try_get::<Option<Vec<u8>>, _>("destination_namespace_identity")
+                .map_err(map_sql)?
+                .is_none();
+        if legacy_terminal {
+            return match (state.as_str(), upload_state.as_str()) {
+                ("complete", "complete") => Err(UploadFinalizeRepositoryError::Unavailable),
+                ("failed", "failed") => Err(UploadFinalizeRepositoryError::Conflict),
+                _ => Err(UploadFinalizeRepositoryError::Unavailable),
+            };
+        }
         let payload: String = row.try_get("payload").map_err(map_sql)?;
         let intent = decode_upload_commit_payload(operation_id, payload_version, &payload)?;
         if intent.upload_id != upload_id {
@@ -78,7 +95,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         match (state.as_str(), upload_state.as_str()) {
             ("pending" | "fs_applied", "committing") => {
                 let mut transaction = self.pool.begin().await.map_err(map_sql)?;
-                validate_intent_row(&mut transaction, &intent).await?;
+                validate_immutable_intent(&mut transaction, &intent).await?;
                 Ok(Some(UploadFinalizeStart::Intent(intent)))
             }
             ("complete", "complete") => {
@@ -266,6 +283,18 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         Ok(UploadFinalizeStart::Intent(intent))
     }
 
+    async fn validate_upload_publication(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<(), UploadFinalizeRepositoryError> {
+        if intent.result_identity.is_some() {
+            return Err(UploadFinalizeRepositoryError::Conflict);
+        }
+        let mut transaction = self.pool.begin().await.map_err(map_sql)?;
+        validate_immutable_intent(&mut transaction, intent).await?;
+        validate_mutable_publication_preconditions(&mut transaction, intent).await
+    }
+
     async fn mark_upload_fs_applied(
         &self,
         intent: &UploadCommitIntent,
@@ -280,7 +309,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         let payload = encode_upload_commit_payload(&applied)?;
         let expected_payload = encode_upload_commit_payload(intent)?;
         let mut transaction = self.pool.begin().await.map_err(map_sql)?;
-        validate_intent_row(&mut transaction, intent).await?;
+        validate_immutable_intent(&mut transaction, intent).await?;
         let affected = sqlx::query(
             "UPDATE operation SET state = 'fs_applied', payload = ?, updated_at = ?
              WHERE id = ? AND project_id = ? AND kind = 'upload_finalize'
@@ -344,19 +373,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
             return Ok(entry);
         }
         let mut transaction = self.pool.begin().await.map_err(map_sql)?;
-        validate_intent_row(&mut transaction, intent).await?;
-        let parent = parent_facts(
-            &mut transaction,
-            intent.project_id,
-            intent.destination_parent_id,
-        )
-        .await?;
-        if parent.components != intent.destination_components
-            || parent.revision != intent.destination_parent_revision
-            || parent.identity != intent.destination_parent_identity
-        {
-            return Err(UploadFinalizeRepositoryError::Conflict);
-        }
+        validate_immutable_intent(&mut transaction, intent).await?;
         ensure_destination_absent(
             &mut transaction,
             intent.project_id,
@@ -456,7 +473,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
             if intent.project_id != project_id {
                 return Err(UploadFinalizeRepositoryError::Unavailable);
             }
-            validate_intent_row(&mut transaction, &intent).await?;
+            validate_immutable_intent(&mut transaction, &intent).await?;
             intents.push(intent);
         }
         Ok(intents)
@@ -477,10 +494,10 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
             return Err(UploadFinalizeRepositoryError::Unavailable);
         }
         let mut transaction = self.pool.begin().await.map_err(map_sql)?;
-        validate_intent_row(&mut transaction, intent).await?;
+        validate_immutable_intent(&mut transaction, intent).await?;
         let operation = sqlx::query(
             "UPDATE operation SET state = 'failed', error = ?, updated_at = ?
-             WHERE id = ? AND kind = 'upload_finalize' AND state IN ('pending', 'fs_applied')",
+             WHERE id = ? AND kind = 'upload_finalize' AND state = 'pending'",
         )
         .bind(error_code)
         .bind(timestamp(now)?)
@@ -809,7 +826,7 @@ async fn ensure_destination_absent(
     }
 }
 
-async fn validate_intent_row(
+async fn validate_immutable_intent(
     transaction: &mut Transaction<'_, Sqlite>,
     intent: &UploadCommitIntent,
 ) -> Result<(), UploadFinalizeRepositoryError> {
@@ -886,8 +903,13 @@ async fn validate_intent_row(
     let committed_offset: i64 = row.try_get("committed_offset").map_err(map_sql)?;
     let pending_offset: Option<i64> = row.try_get("pending_offset").map_err(map_sql)?;
     let destination_name: String = row.try_get("destination_name").map_err(map_sql)?;
+    let publication_state_matches = match (state.as_str(), intent.result_identity) {
+        ("pending", None) => true,
+        ("fs_applied", Some(identity)) => identity == intent.staging_identity,
+        _ => false,
+    };
     if decoded != *intent
-        || !matches!(state.as_str(), "pending" | "fs_applied")
+        || !publication_state_matches
         || row.try_get::<String, _>("project_id").map_err(map_sql)? != intent.project_id.to_string()
         || row.try_get::<String, _>("upload_id").map_err(map_sql)? != intent.upload_id.to_string()
         || row.try_get::<String, _>("file_entry_id").map_err(map_sql)?
@@ -907,6 +929,13 @@ async fn validate_intent_row(
     {
         return Err(UploadFinalizeRepositoryError::Unavailable);
     }
+    Ok(())
+}
+
+async fn validate_mutable_publication_preconditions(
+    transaction: &mut Transaction<'_, Sqlite>,
+    intent: &UploadCommitIntent,
+) -> Result<(), UploadFinalizeRepositoryError> {
     validate_active_project(transaction, intent.project_id).await?;
     let parent = parent_facts(transaction, intent.project_id, intent.destination_parent_id).await?;
     if parent.components != intent.destination_components

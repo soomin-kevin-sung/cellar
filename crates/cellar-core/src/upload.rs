@@ -827,6 +827,25 @@ impl UploadService {
         verified: Option<crate::VerifiedUpload>,
         now: OffsetDateTime,
     ) -> Result<FileEntry, UploadServiceError> {
+        if intent.result_identity.is_none()
+            && let Err(error) = finalization
+                .repository
+                .validate_upload_publication(&intent)
+                .await
+        {
+            match error {
+                UploadFinalizeRepositoryError::Conflict
+                | UploadFinalizeRepositoryError::NotFound => {
+                    finalization
+                        .repository
+                        .fail_upload_commit(&intent, "publication_precondition_changed", now)
+                        .await
+                        .map_err(map_finalize_repository)?;
+                    return Err(map_finalize_repository(error));
+                }
+                error => return Err(map_finalize_repository(error)),
+            }
+        }
         let published = if let Some(verified) = verified {
             self.publish_verified(finalization, &intent, verified, now)
                 .await?

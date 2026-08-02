@@ -1,6 +1,7 @@
 use std::{cmp::Ordering, path::PathBuf};
 
-use cellar_db::{DbError, FilenameCollation, migrate, open_pool};
+use cellar_core::{UploadFinalizeRepository, UploadFinalizeRepositoryError, UploadId};
+use cellar_db::{DbError, FilenameCollation, SqliteOperationRepository, migrate, open_pool};
 use sqlx::{Executor, Row, SqlitePool};
 use tempfile::TempDir;
 
@@ -361,22 +362,7 @@ async fn expand_only_upload_finalization_journal_is_v2_compatible_and_tamper_evi
 #[tokio::test]
 async fn upload_finalization_v1_extension_upgrades_expand_only_without_v3_history() {
     let (_db, pool) = migrated_db().await;
-    sqlx::raw_sql(
-        "DROP TABLE upload_finalization;
-         CREATE TABLE upload_finalization (
-           upload_id TEXT PRIMARY KEY NOT NULL,
-           operation_id TEXT NOT NULL UNIQUE,
-           file_entry_id TEXT NOT NULL UNIQUE,
-           result_identity BLOB CHECK (
-             result_identity IS NULL OR length(result_identity) = 24
-           ),
-           FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
-           FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
-         );",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    recreate_v1_upload_finalization(&pool).await;
 
     migrate(&pool).await.unwrap();
     assert!(previous_release_v2_accepts_schema_history(&pool).await);
@@ -392,6 +378,158 @@ async fn upload_finalization_v1_extension_upgrades_expand_only_without_v3_histor
     );
     assert!(columns.iter().any(|column| column == "sha256"));
     pool.close().await;
+}
+
+#[tokio::test]
+async fn row_bearing_v1_nonterminal_finalization_rolls_back_before_any_alter() {
+    for operation_state in ["pending", "fs_applied"] {
+        let (_db, pool) = migrated_db().await;
+        recreate_v1_upload_finalization(&pool).await;
+        insert_v1_finalization(&pool, operation_state).await;
+
+        assert!(matches!(migrate(&pool).await, Err(DbError::SchemaVersion)));
+        assert_v1_finalization_unchanged(&pool).await;
+        let state: String = sqlx::query_scalar("SELECT state FROM operation")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, operation_state);
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn row_bearing_v1_terminal_finalization_upgrades_with_null_snapshots() {
+    for operation_state in ["complete", "failed"] {
+        let (_db, pool) = migrated_db().await;
+        recreate_v1_upload_finalization(&pool).await;
+        insert_v1_finalization(&pool, operation_state).await;
+
+        migrate(&pool).await.unwrap();
+        assert!(previous_release_v2_accepts_schema_history(&pool).await);
+        let snapshots: (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT sha256, destination_namespace_identity FROM upload_finalization",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshots, (None, None));
+        let state: String = sqlx::query_scalar("SELECT state FROM operation")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, operation_state);
+        let upload_id: String = sqlx::query_scalar("SELECT upload_id FROM upload_finalization")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let result = SqliteOperationRepository::new(pool.clone())
+            .upload_commit(upload_id.parse::<UploadId>().unwrap())
+            .await;
+        assert_eq!(
+            result.unwrap_err(),
+            if operation_state == "failed" {
+                UploadFinalizeRepositoryError::Conflict
+            } else {
+                UploadFinalizeRepositoryError::Unavailable
+            }
+        );
+        pool.close().await;
+    }
+}
+
+async fn recreate_v1_upload_finalization(pool: &SqlitePool) {
+    sqlx::raw_sql(
+        "DROP TABLE upload_finalization;
+         CREATE TABLE upload_finalization (
+           upload_id TEXT PRIMARY KEY NOT NULL,
+           operation_id TEXT NOT NULL UNIQUE,
+           file_entry_id TEXT NOT NULL UNIQUE,
+           result_identity BLOB CHECK (
+             result_identity IS NULL OR length(result_identity) = 24
+           ),
+           FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
+           FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
+         );",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_v1_finalization(pool: &SqlitePool, operation_state: &str) {
+    let project_id = cellar_core::ProjectId::new().to_string();
+    let upload_id = cellar_core::UploadId::new().to_string();
+    let operation_id = cellar_core::OperationId::new().to_string();
+    let file_entry_id = cellar_core::FileEntryId::new().to_string();
+    insert_project(pool, &project_id).await;
+    let upload_state = if matches!(operation_state, "complete" | "failed") {
+        operation_state
+    } else {
+        "committing"
+    };
+    insert_upload(
+        pool,
+        &upload_id,
+        &project_id,
+        None,
+        "legacy.bin",
+        upload_state,
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO operation
+         (id, project_id, kind, state, payload_version, payload, error, created_at, updated_at)
+         VALUES (?, ?, 'upload_finalize', ?, 1, '{}', NULL,
+                 '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+    )
+    .bind(&operation_id)
+    .bind(&project_id)
+    .bind(operation_state)
+    .execute(pool)
+    .await
+    .unwrap();
+    let result_identity =
+        matches!(operation_state, "fs_applied" | "complete").then(|| vec![9_u8; 24]);
+    sqlx::query(
+        "INSERT INTO upload_finalization
+         (upload_id, operation_id, file_entry_id, result_identity)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(upload_id)
+    .bind(operation_id)
+    .bind(file_entry_id)
+    .bind(result_identity)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn assert_v1_finalization_unchanged(pool: &SqlitePool) {
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('upload_finalization') ORDER BY cid",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            "upload_id",
+            "operation_id",
+            "file_entry_id",
+            "result_identity"
+        ]
+    );
+    let marker: String = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension WHERE name = 'upload_finalization'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(marker, "cellar-upload-finalization-v1");
+    assert!(previous_release_v2_accepts_schema_history(pool).await);
 }
 
 #[tokio::test]

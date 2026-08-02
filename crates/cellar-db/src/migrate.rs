@@ -284,6 +284,18 @@ async fn upgrade_upload_finalization_extension(
         return Err(DbError::SchemaVersion);
     };
     if sql_eq(&definition, UPLOAD_FINALIZATION_TABLE_V1_SQL) {
+        let unsafe_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+             FROM upload_finalization AS f
+             JOIN operation AS o ON o.id = f.operation_id
+             WHERE o.state NOT IN ('complete', 'failed')",
+        )
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(DbError::Migration)?;
+        if unsafe_rows != 0 {
+            return Err(DbError::SchemaVersion);
+        }
         transaction
             .execute(
                 "ALTER TABLE upload_finalization ADD COLUMN sha256 BLOB

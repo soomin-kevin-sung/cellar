@@ -353,13 +353,17 @@ impl Harness {
         )
     }
 
-    async fn uploaded(&self, name: &str) -> UploadId {
+    async fn uploaded_at(
+        &self,
+        destination_parent_id: Option<cellar_core::FileEntryId>,
+        name: &str,
+    ) -> UploadId {
         let service = self.service();
         let session = service
             .create(
                 NewUpload {
                     project_id: self.project_id,
-                    destination_parent_id: None,
+                    destination_parent_id,
                     destination_name: name.to_owned(),
                     expected_size: 3,
                     expected_hash: Some(Sha256::digest(b"abc").into()),
@@ -379,6 +383,38 @@ impl Harness {
             .await
             .unwrap();
         session.id
+    }
+
+    async fn uploaded(&self, name: &str) -> UploadId {
+        self.uploaded_at(None, name).await
+    }
+
+    async fn fs_applied(&self, id: UploadId) -> UploadCommitIntent {
+        let operations = SqliteOperationRepository::new(self.pool.clone());
+        let target = operations.upload_finalize_target(id).await.unwrap();
+        let verified = self
+            .namespace
+            .verify_and_retain(id, &target, 3)
+            .await
+            .unwrap();
+        let facts = verified.facts();
+        let intent = match operations
+            .prepare_upload_commit(id, &target, facts, self.now)
+            .await
+            .unwrap()
+        {
+            UploadFinalizeStart::Intent(intent) => intent,
+            UploadFinalizeStart::Completed(_) => panic!("new upload unexpectedly complete"),
+        };
+        let published = self
+            .namespace
+            .publish_no_replace(&intent, verified)
+            .await
+            .unwrap();
+        operations
+            .mark_upload_fs_applied(&intent, published, self.now)
+            .await
+            .unwrap()
     }
 }
 
@@ -452,4 +488,127 @@ async fn process_restart_at_each_finalize_fault_point_never_duplicates_or_expose
         assert_eq!(counts, (1, 1, 1, 0));
         harness.pool.close().await;
     }
+}
+
+#[tokio::test]
+async fn fs_applied_restart_completes_after_project_is_archived() {
+    let harness = Harness::new().await;
+    let id = harness.uploaded("archived-after-publish.bin").await;
+    let applied = harness.fs_applied(id).await;
+    sqlx::query("UPDATE project SET status = 'archived', version = version + 1 WHERE id = ?")
+        .bind(harness.project_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    let restarted = harness.service();
+    restarted.initialize(harness.now).await.unwrap();
+    let entry = restarted.finalize(id, harness.now).await.unwrap();
+    assert_eq!(entry.id, applied.file_entry_id);
+    assert_eq!(entry.exact_name.as_str(), "archived-after-publish.bin");
+    assert_terminal_exact_once(&harness, id, 1).await;
+}
+
+#[tokio::test]
+async fn fs_applied_restart_completes_after_parent_revision_name_and_state_change() {
+    let harness = Harness::new().await;
+    let parent_id = cellar_core::FileEntryId::new();
+    sqlx::query(
+        "INSERT INTO file_entry
+         (id, project_id, parent_id, exact_name, kind, platform_kind,
+          volume_serial, filesystem_file_id, size, mtime_filetime_100ns,
+          hash, hash_state, state, revision, scan_generation, observed_at)
+         VALUES (?, ?, NULL, 'before', 'directory', 'windows_file_id', ?, ?,
+                 0, 1, NULL, 'unknown', 'live', 1, 0,
+                 '1970-01-01T00:00:00.000000000Z')",
+    )
+    .bind(parent_id.to_string())
+    .bind(harness.project_id.to_string())
+    .bind(vec![1_u8; 8])
+    .bind(vec![2_u8; 16])
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+    let id = harness
+        .uploaded_at(Some(parent_id), "parent-changed.bin")
+        .await;
+    let applied = harness.fs_applied(id).await;
+    sqlx::query(
+        "UPDATE file_entry SET exact_name = 'after', revision = revision + 1, state = 'missing'
+         WHERE id = ?",
+    )
+    .bind(parent_id.to_string())
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+
+    let restarted = harness.service();
+    restarted.initialize(harness.now).await.unwrap();
+    let entry = restarted.finalize(id, harness.now).await.unwrap();
+    assert_eq!(entry.id, applied.file_entry_id);
+    assert_eq!(entry.parent_id, Some(parent_id));
+    assert_terminal_exact_once(&harness, id, 2).await;
+}
+
+#[tokio::test]
+async fn pending_restart_terminalizes_changed_mutable_preconditions_without_publishing() {
+    let harness = Harness::new().await;
+    let id = harness.uploaded("must-not-publish.bin").await;
+    let operations = SqliteOperationRepository::new(harness.pool.clone());
+    let target = operations.upload_finalize_target(id).await.unwrap();
+    let verified = harness
+        .namespace
+        .verify_and_retain(id, &target, 3)
+        .await
+        .unwrap();
+    let facts = verified.facts();
+    match operations
+        .prepare_upload_commit(id, &target, facts, harness.now)
+        .await
+        .unwrap()
+    {
+        UploadFinalizeStart::Intent(_) => {}
+        UploadFinalizeStart::Completed(_) => panic!("new upload unexpectedly complete"),
+    }
+    drop(verified);
+    sqlx::query("UPDATE project SET status = 'archived', version = version + 1 WHERE id = ?")
+        .bind(harness.project_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    assert!(harness.service().initialize(harness.now).await.is_err());
+    let states: (String, String) = sqlx::query_as(
+        "SELECT u.state, o.state
+         FROM upload_session AS u
+         JOIN upload_finalization AS f ON f.upload_id = u.id
+         JOIN operation AS o ON o.id = f.operation_id
+         WHERE u.id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(states, ("failed".into(), "failed".into()));
+    assert!(harness.namespace.destinations.lock().unwrap().is_empty());
+
+    harness.service().initialize(harness.now).await.unwrap();
+    assert!(!harness.namespace.staging.lock().unwrap().contains_key(&id));
+}
+
+async fn assert_terminal_exact_once(harness: &Harness, id: UploadId, file_entries: i64) {
+    let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM file_entry),
+                (SELECT count(*) FROM operation WHERE state = 'complete'),
+                (SELECT count(*) FROM upload_session WHERE id = ? AND state = 'complete'),
+                (SELECT count(*) FROM operation WHERE state IN ('pending', 'fs_applied')),
+                (SELECT count(*) FROM upload_finalization WHERE upload_id = ?)",
+    )
+    .bind(id.to_string())
+    .bind(id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, (file_entries, 1, 1, 0, 1));
+    assert_eq!(harness.namespace.destinations.lock().unwrap().len(), 1);
 }
