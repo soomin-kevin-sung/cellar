@@ -39,13 +39,40 @@ const UPLOAD_IDENTITY_EXTENSION_FINGERPRINT: &str = "cellar-upload-staging-ident
 const UPLOAD_FINALIZATION_EXTENSION_SQL: &str =
     include_str!("../../../migrations/expand_upload_finalization.sql");
 const UPLOAD_FINALIZATION_EXTENSION_FINGERPRINT: &str = "cellar-upload-finalization-v1";
-const UPLOAD_FINALIZATION_TABLE_SQL: &str = "
+const UPLOAD_FINALIZATION_TABLE_V1_SQL: &str = "
     CREATE TABLE upload_finalization (
       upload_id TEXT PRIMARY KEY NOT NULL,
       operation_id TEXT NOT NULL UNIQUE,
       file_entry_id TEXT NOT NULL UNIQUE,
       result_identity BLOB CHECK (
         result_identity IS NULL OR length(result_identity) = 24
+      ),
+      FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
+      FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
+    )";
+const UPLOAD_FINALIZATION_TABLE_SHA_SQL: &str = "
+    CREATE TABLE upload_finalization (
+      upload_id TEXT PRIMARY KEY NOT NULL,
+      operation_id TEXT NOT NULL UNIQUE,
+      file_entry_id TEXT NOT NULL UNIQUE,
+      result_identity BLOB CHECK (
+        result_identity IS NULL OR length(result_identity) = 24
+      ),
+      sha256 BLOB CHECK (sha256 IS NULL OR length(sha256) = 32),
+      FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
+      FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
+    )";
+const UPLOAD_FINALIZATION_TABLE_CURRENT_SQL: &str = "
+    CREATE TABLE upload_finalization (
+      upload_id TEXT PRIMARY KEY NOT NULL,
+      operation_id TEXT NOT NULL UNIQUE,
+      file_entry_id TEXT NOT NULL UNIQUE,
+      result_identity BLOB CHECK (
+        result_identity IS NULL OR length(result_identity) = 24
+      ),
+      sha256 BLOB CHECK (sha256 IS NULL OR length(sha256) = 32),
+      destination_namespace_identity BLOB CHECK (
+        destination_namespace_identity IS NULL OR length(destination_namespace_identity) = 24
       ),
       FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
       FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
@@ -198,6 +225,7 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
             .await
             .map_err(DbError::Migration)?;
     }
+    upgrade_upload_finalization_extension(transaction).await?;
     validate_upload_finalization_extension(transaction).await?;
 
     let metadata: Vec<(String, String)> = sqlx::query_as(
@@ -236,7 +264,56 @@ async fn validate_upload_finalization_extension(
     .fetch_optional(&mut **transaction)
     .await
     .map_err(DbError::Migration)?;
-    if !definition.is_some_and(|sql| sql_eq(&sql, UPLOAD_FINALIZATION_TABLE_SQL)) {
+    if !definition.is_some_and(|sql| sql_eq(&sql, UPLOAD_FINALIZATION_TABLE_CURRENT_SQL)) {
+        return Err(DbError::SchemaVersion);
+    }
+    Ok(())
+}
+
+async fn upgrade_upload_finalization_extension(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DbError> {
+    let definition: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'upload_finalization'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    let Some(definition) = definition else {
+        return Err(DbError::SchemaVersion);
+    };
+    if sql_eq(&definition, UPLOAD_FINALIZATION_TABLE_V1_SQL) {
+        transaction
+            .execute(
+                "ALTER TABLE upload_finalization ADD COLUMN sha256 BLOB
+                 CHECK (sha256 IS NULL OR length(sha256) = 32)",
+            )
+            .await
+            .map_err(DbError::Migration)?;
+    } else if !sql_eq(&definition, UPLOAD_FINALIZATION_TABLE_SHA_SQL)
+        && !sql_eq(&definition, UPLOAD_FINALIZATION_TABLE_CURRENT_SQL)
+    {
+        return Err(DbError::SchemaVersion);
+    }
+    let definition: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'upload_finalization'",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if sql_eq(&definition, UPLOAD_FINALIZATION_TABLE_SHA_SQL) {
+        transaction
+            .execute(
+                "ALTER TABLE upload_finalization
+                 ADD COLUMN destination_namespace_identity BLOB
+                 CHECK (destination_namespace_identity IS NULL
+                        OR length(destination_namespace_identity) = 24)",
+            )
+            .await
+            .map_err(DbError::Migration)?;
+    } else if !sql_eq(&definition, UPLOAD_FINALIZATION_TABLE_CURRENT_SQL) {
         return Err(DbError::SchemaVersion);
     }
     Ok(())

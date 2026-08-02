@@ -6,7 +6,7 @@ use cellar_core::{
     MAX_UPLOAD_COMMIT_COMPONENTS, MAX_UPLOAD_COMMIT_PAYLOAD_BYTES, OperationId, PlatformIdentity,
     ProjectId, PublishedUpload, StagingIdentity, UPLOAD_COMMIT_PAYLOAD_VERSION, UploadCommitIntent,
     UploadCommitPayload, UploadFinalizeRepository, UploadFinalizeRepositoryError,
-    UploadFinalizeStart, UploadId, VerifiedUpload, is_safe_upload_name,
+    UploadFinalizeStart, UploadFinalizeTarget, UploadId, VerifiedUploadFacts, is_safe_upload_name,
 };
 use serde_json::Value;
 use sqlx::sqlite::SqliteRow;
@@ -77,6 +77,8 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         }
         match (state.as_str(), upload_state.as_str()) {
             ("pending" | "fs_applied", "committing") => {
+                let mut transaction = self.pool.begin().await.map_err(map_sql)?;
+                validate_intent_row(&mut transaction, &intent).await?;
                 Ok(Some(UploadFinalizeStart::Intent(intent)))
             }
             ("complete", "complete") => {
@@ -110,10 +112,19 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         }
     }
 
+    async fn upload_finalize_target(
+        &self,
+        upload_id: UploadId,
+    ) -> Result<UploadFinalizeTarget, UploadFinalizeRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(map_sql)?;
+        load_finalize_target(&mut transaction, upload_id).await
+    }
+
     async fn prepare_upload_commit(
         &self,
         upload_id: UploadId,
-        verified: VerifiedUpload,
+        target: &UploadFinalizeTarget,
+        verified: VerifiedUploadFacts,
         now: OffsetDateTime,
     ) -> Result<UploadFinalizeStart, UploadFinalizeRepositoryError> {
         if verified.size < 0 {
@@ -174,6 +185,21 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         let parent = parent_facts(&mut transaction, project_id, parent_id).await?;
         ensure_destination_absent(&mut transaction, project_id, parent_id, &destination_name)
             .await?;
+        let authoritative_target = UploadFinalizeTarget {
+            project_id,
+            destination_parent_id: parent_id,
+            destination_parent_revision: parent.revision,
+            destination_parent_identity: parent.identity,
+            destination_components: parent.components.clone(),
+            destination_name: destination_name.clone(),
+        };
+        if authoritative_target != *target
+            || target
+                .destination_parent_identity
+                .is_some_and(|identity| identity != verified.destination_namespace_identity)
+        {
+            return Err(UploadFinalizeRepositoryError::Conflict);
+        }
 
         let operation_id = OperationId::new();
         let file_entry_id = FileEntryId::new();
@@ -184,6 +210,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
             destination_parent_id: parent_id,
             destination_parent_revision: parent.revision,
             destination_parent_identity: parent.identity,
+            destination_namespace_identity: verified.destination_namespace_identity,
             destination_components: parent.components,
             destination_name,
             file_entry_id,
@@ -210,12 +237,15 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         .map_err(map_constraint)?;
         sqlx::query(
             "INSERT INTO upload_finalization
-             (upload_id, operation_id, file_entry_id, result_identity)
-             VALUES (?, ?, ?, NULL)",
+             (upload_id, operation_id, file_entry_id, result_identity, sha256,
+              destination_namespace_identity)
+             VALUES (?, ?, ?, NULL, ?, ?)",
         )
         .bind(upload_id.to_string())
         .bind(operation_id.to_string())
         .bind(file_entry_id.to_string())
+        .bind(verified.sha256.to_vec())
+        .bind(verified.destination_namespace_identity.as_bytes().to_vec())
         .execute(&mut *transaction)
         .await
         .map_err(map_constraint)?;
@@ -248,25 +278,51 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
         let mut applied = intent.clone();
         applied.result_identity = Some(published.identity);
         let payload = encode_upload_commit_payload(&applied)?;
+        let expected_payload = encode_upload_commit_payload(intent)?;
+        let mut transaction = self.pool.begin().await.map_err(map_sql)?;
+        validate_intent_row(&mut transaction, intent).await?;
         let affected = sqlx::query(
             "UPDATE operation SET state = 'fs_applied', payload = ?, updated_at = ?
-             WHERE id = ? AND kind = 'upload_finalize' AND state IN ('pending', 'fs_applied')",
+             WHERE id = ? AND project_id = ? AND kind = 'upload_finalize'
+               AND state IN ('pending', 'fs_applied')
+               AND payload_version = ? AND payload = ?",
         )
         .bind(payload)
         .bind(timestamp(now)?)
         .bind(intent.operation_id.to_string())
-        .execute(&self.pool)
+        .bind(intent.project_id.to_string())
+        .bind(UPLOAD_COMMIT_PAYLOAD_VERSION)
+        .bind(expected_payload)
+        .execute(&mut *transaction)
         .await
         .map_err(map_sql)?
         .rows_affected();
-        if affected == 1 {
-            Ok(applied)
-        } else {
-            match self.upload_commit(intent.upload_id).await? {
-                Some(UploadFinalizeStart::Completed(_)) => Ok(applied),
-                _ => Err(UploadFinalizeRepositoryError::Unavailable),
-            }
+        let mapping = sqlx::query(
+            "UPDATE upload_finalization SET result_identity = ?
+             WHERE upload_id = ? AND operation_id = ? AND file_entry_id = ?
+               AND sha256 = ? AND destination_namespace_identity = ?
+               AND result_identity IS ?",
+        )
+        .bind(published.identity.as_bytes().to_vec())
+        .bind(intent.upload_id.to_string())
+        .bind(intent.operation_id.to_string())
+        .bind(intent.file_entry_id.to_string())
+        .bind(intent.sha256.to_vec())
+        .bind(intent.destination_namespace_identity.as_bytes().to_vec())
+        .bind(
+            intent
+                .result_identity
+                .map(|identity| identity.as_bytes().to_vec()),
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_sql)?
+        .rows_affected();
+        if affected != 1 || mapping != 1 {
+            return Err(UploadFinalizeRepositoryError::Unavailable);
         }
+        transaction.commit().await.map_err(map_sql)?;
+        Ok(applied)
     }
 
     async fn complete_upload_commit(
@@ -374,6 +430,7 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
     async fn pending_upload_commits(
         &self,
     ) -> Result<Vec<UploadCommitIntent>, UploadFinalizeRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(map_sql)?;
         let rows = sqlx::query(
             "SELECT o.id, o.project_id, o.payload_version, o.payload
              FROM operation AS o
@@ -381,27 +438,28 @@ impl UploadFinalizeRepository for SqliteOperationRepository {
              WHERE o.kind = 'upload_finalize' AND o.state IN ('pending', 'fs_applied')
              ORDER BY o.id COLLATE BINARY",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *transaction)
         .await
         .map_err(map_sql)?;
-        rows.into_iter()
-            .map(|row| {
-                let operation_id =
-                    canonical_id::<OperationId>(&row.try_get::<String, _>("id").map_err(map_sql)?)?;
-                let project_id = canonical_id::<ProjectId>(
-                    &row.try_get::<String, _>("project_id").map_err(map_sql)?,
-                )?;
-                let intent = decode_upload_commit_payload(
-                    operation_id,
-                    row.try_get("payload_version").map_err(map_sql)?,
-                    &row.try_get::<String, _>("payload").map_err(map_sql)?,
-                )?;
-                if intent.project_id != project_id {
-                    return Err(UploadFinalizeRepositoryError::Unavailable);
-                }
-                Ok(intent)
-            })
-            .collect()
+        let mut intents = Vec::with_capacity(rows.len());
+        for row in rows {
+            let operation_id =
+                canonical_id::<OperationId>(&row.try_get::<String, _>("id").map_err(map_sql)?)?;
+            let project_id = canonical_id::<ProjectId>(
+                &row.try_get::<String, _>("project_id").map_err(map_sql)?,
+            )?;
+            let intent = decode_upload_commit_payload(
+                operation_id,
+                row.try_get("payload_version").map_err(map_sql)?,
+                &row.try_get::<String, _>("payload").map_err(map_sql)?,
+            )?;
+            if intent.project_id != project_id {
+                return Err(UploadFinalizeRepositoryError::Unavailable);
+            }
+            validate_intent_row(&mut transaction, &intent).await?;
+            intents.push(intent);
+        }
+        Ok(intents)
     }
 
     async fn fail_upload_commit(
@@ -466,6 +524,7 @@ fn encode_upload_commit_payload(
         destination_parent_identity: intent
             .destination_parent_identity
             .map(|identity| hex(&identity.as_bytes())),
+        destination_namespace_identity: hex(&intent.destination_namespace_identity.as_bytes()),
         destination_components: intent.destination_components.clone(),
         destination_name: intent.destination_name.clone(),
         file_entry_id: intent.file_entry_id.to_string(),
@@ -535,6 +594,9 @@ pub fn decode_upload_commit_payload(
             .map(decode_hex::<24>)
             .transpose()?
             .map(StagingIdentity::new),
+        destination_namespace_identity: StagingIdentity::new(decode_hex::<24>(
+            &payload.destination_namespace_identity,
+        )?),
         destination_components: payload.destination_components,
         destination_name: payload.destination_name,
         file_entry_id: canonical_id::<FileEntryId>(&payload.file_entry_id)?,
@@ -547,6 +609,55 @@ pub fn decode_upload_commit_payload(
             .map(decode_hex::<24>)
             .transpose()?
             .map(StagingIdentity::new),
+    })
+}
+
+async fn load_finalize_target(
+    transaction: &mut Transaction<'_, Sqlite>,
+    upload_id: UploadId,
+) -> Result<UploadFinalizeTarget, UploadFinalizeRepositoryError> {
+    let row = sqlx::query(
+        "SELECT project_id, destination_parent_id, destination_name, state
+         FROM upload_session WHERE id = ?",
+    )
+    .bind(upload_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(map_sql)?
+    .ok_or(UploadFinalizeRepositoryError::NotFound)?;
+    let state: String = row.try_get("state").map_err(map_sql)?;
+    if !matches!(state.as_str(), "created" | "uploading" | "verifying") {
+        return Err(UploadFinalizeRepositoryError::Conflict);
+    }
+    let project_id =
+        canonical_id::<ProjectId>(&row.try_get::<String, _>("project_id").map_err(map_sql)?)?;
+    let destination_parent_id = row
+        .try_get::<Option<String>, _>("destination_parent_id")
+        .map_err(map_sql)?
+        .map(|value| canonical_id::<FileEntryId>(&value))
+        .transpose()?;
+    let destination_name: String = row.try_get("destination_name").map_err(map_sql)?;
+    FileExactName::parse(destination_name.clone())
+        .map_err(|_| UploadFinalizeRepositoryError::Conflict)?;
+    if !is_safe_upload_name(&destination_name) {
+        return Err(UploadFinalizeRepositoryError::Conflict);
+    }
+    validate_active_project(transaction, project_id).await?;
+    let parent = parent_facts(transaction, project_id, destination_parent_id).await?;
+    ensure_destination_absent(
+        transaction,
+        project_id,
+        destination_parent_id,
+        &destination_name,
+    )
+    .await?;
+    Ok(UploadFinalizeTarget {
+        project_id,
+        destination_parent_id,
+        destination_parent_revision: parent.revision,
+        destination_parent_identity: parent.identity,
+        destination_components: parent.components,
+        destination_name,
     })
 }
 
@@ -704,8 +815,18 @@ async fn validate_intent_row(
 ) -> Result<(), UploadFinalizeRepositoryError> {
     let row = sqlx::query(
         "SELECT o.project_id, o.payload_version, o.payload, o.state,
-                f.upload_id, f.file_entry_id
-         FROM operation AS o JOIN upload_finalization AS f ON f.operation_id = o.id
+                f.upload_id, f.file_entry_id, f.result_identity AS finalized_result_identity,
+                f.sha256 AS finalized_sha256,
+                f.destination_namespace_identity AS finalized_namespace_identity,
+                u.project_id AS upload_project_id,
+                u.destination_parent_id, u.destination_name,
+                u.expected_size, u.committed_offset, u.expected_hash,
+                u.pending_offset, u.state AS upload_state,
+                s.platform_identity AS staging_identity
+         FROM operation AS o
+         JOIN upload_finalization AS f ON f.operation_id = o.id
+         JOIN upload_session AS u ON u.id = f.upload_id
+         JOIN upload_staging_identity AS s ON s.upload_id = f.upload_id
          WHERE o.id = ? AND o.kind = 'upload_finalize'",
     )
     .bind(intent.operation_id.to_string())
@@ -719,12 +840,78 @@ async fn validate_intent_row(
         &row.try_get::<String, _>("payload").map_err(map_sql)?,
     )?;
     let state: String = row.try_get("state").map_err(map_sql)?;
+    let upload_project_id = canonical_id::<ProjectId>(
+        &row.try_get::<String, _>("upload_project_id")
+            .map_err(map_sql)?,
+    )?;
+    let upload_parent_id = row
+        .try_get::<Option<String>, _>("destination_parent_id")
+        .map_err(map_sql)?
+        .map(|value| canonical_id::<FileEntryId>(&value))
+        .transpose()?;
+    let expected_hash = digest(
+        row.try_get::<Option<Vec<u8>>, _>("expected_hash")
+            .map_err(map_sql)?,
+    )?;
+    let finalized_sha256 = digest(
+        row.try_get::<Option<Vec<u8>>, _>("finalized_sha256")
+            .map_err(map_sql)?,
+    )?
+    .ok_or(UploadFinalizeRepositoryError::Unavailable)?;
+    let finalized_result_identity = row
+        .try_get::<Option<Vec<u8>>, _>("finalized_result_identity")
+        .map_err(map_sql)?
+        .map(|bytes| {
+            bytes
+                .try_into()
+                .map(StagingIdentity::new)
+                .map_err(|_| UploadFinalizeRepositoryError::Unavailable)
+        })
+        .transpose()?;
+    let finalized_namespace_identity = row
+        .try_get::<Option<Vec<u8>>, _>("finalized_namespace_identity")
+        .map_err(map_sql)?
+        .ok_or(UploadFinalizeRepositoryError::Unavailable)?
+        .try_into()
+        .map(StagingIdentity::new)
+        .map_err(|_| UploadFinalizeRepositoryError::Unavailable)?;
+    let staging_identity = row
+        .try_get::<Vec<u8>, _>("staging_identity")
+        .map_err(map_sql)?
+        .try_into()
+        .map(StagingIdentity::new)
+        .map_err(|_| UploadFinalizeRepositoryError::Unavailable)?;
+    let upload_state: String = row.try_get("upload_state").map_err(map_sql)?;
+    let expected_size: i64 = row.try_get("expected_size").map_err(map_sql)?;
+    let committed_offset: i64 = row.try_get("committed_offset").map_err(map_sql)?;
+    let pending_offset: Option<i64> = row.try_get("pending_offset").map_err(map_sql)?;
+    let destination_name: String = row.try_get("destination_name").map_err(map_sql)?;
     if decoded != *intent
         || !matches!(state.as_str(), "pending" | "fs_applied")
         || row.try_get::<String, _>("project_id").map_err(map_sql)? != intent.project_id.to_string()
         || row.try_get::<String, _>("upload_id").map_err(map_sql)? != intent.upload_id.to_string()
         || row.try_get::<String, _>("file_entry_id").map_err(map_sql)?
             != intent.file_entry_id.to_string()
+        || upload_project_id != intent.project_id
+        || upload_parent_id != intent.destination_parent_id
+        || destination_name != intent.destination_name
+        || expected_size != intent.expected_size
+        || committed_offset != intent.expected_size
+        || pending_offset.is_some()
+        || upload_state != "committing"
+        || expected_hash.is_some_and(|hash| hash != intent.sha256)
+        || finalized_sha256 != intent.sha256
+        || finalized_result_identity != intent.result_identity
+        || finalized_namespace_identity != intent.destination_namespace_identity
+        || staging_identity != intent.staging_identity
+    {
+        return Err(UploadFinalizeRepositoryError::Unavailable);
+    }
+    validate_active_project(transaction, intent.project_id).await?;
+    let parent = parent_facts(transaction, intent.project_id, intent.destination_parent_id).await?;
+    if parent.components != intent.destination_components
+        || parent.revision != intent.destination_parent_revision
+        || parent.identity != intent.destination_parent_identity
     {
         return Err(UploadFinalizeRepositoryError::Unavailable);
     }

@@ -173,6 +173,22 @@ mod platform {
             Ok(bytes)
         }
 
+        /// Opens a stable publication source with read/delete access while
+        /// denying all concurrent write and delete opens.
+        pub fn open_verified_for_publication(
+            &self,
+            parent: &VerifiedHandle,
+            name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            self.verify_parent(parent)?;
+            let file = open_relative(
+                parent.file.as_raw_handle(),
+                name,
+                OpenMode::ExistingPublication,
+            )?;
+            self.verify_new_handle(file)
+        }
+
         pub fn create_file_no_replace(
             &self,
             parent: &VerifiedHandle,
@@ -612,6 +628,7 @@ mod platform {
         Existing,
         ExistingWritable,
         DownloadExisting,
+        ExistingPublication,
         CreateFile,
         CreateExclusiveFile,
         CreateDirectory,
@@ -720,6 +737,12 @@ mod platform {
                 FILE_OPEN,
                 FILE_NON_DIRECTORY_FILE,
                 FILE_GENERIC_READ,
+                FILE_SHARE_READ,
+            ),
+            OpenMode::ExistingPublication => (
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                FILE_GENERIC_READ | DELETE,
                 FILE_SHARE_READ,
             ),
             OpenMode::CreateFile => (
@@ -966,6 +989,14 @@ mod platform_stub {
         }
 
         pub fn open_verified_writable(
+            &self,
+            _parent: &VerifiedHandle,
+            _name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn open_verified_for_publication(
             &self,
             _parent: &VerifiedHandle,
             _name: &WindowsName,

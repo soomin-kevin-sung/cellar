@@ -14,9 +14,11 @@ use cellar_auth::{
     EnrollmentStore, EnrollmentStoreError,
 };
 use cellar_core::{
-    PublicationPresence, PublishedUpload, StagingIdentity, UploadCommitIntent, UploadId,
-    UploadLimits, UploadPublicationError, UploadPublicationObservation, UploadPublisher,
-    UploadService, UploadStagingError, UploadStagingStore, VerifiedUpload,
+    FileEntryId, PublicationPresence, PublishedUpload, StagingIdentity, UploadCommitIntent,
+    UploadFinalizeRepository, UploadFinalizeRepositoryError, UploadFinalizeStart,
+    UploadFinalizeTarget, UploadId, UploadLimits, UploadPublicationError,
+    UploadPublicationObservation, UploadPublisher, UploadService, UploadStagingError,
+    UploadStagingStore, VerifiedUpload, VerifiedUploadFacts,
 };
 use cellar_db::{
     FilenameCollation, SqliteOperationRepository, SqliteUploadRepository, migrate, open_pool,
@@ -67,11 +69,18 @@ struct Destination {
     bytes: Vec<u8>,
 }
 
+struct MemoryVerifiedUpload {
+    upload_id: UploadId,
+    identity: StagingIdentity,
+    bytes: Vec<u8>,
+}
+
 #[derive(Default)]
 struct MemoryPublication {
     staging: Mutex<HashMap<UploadId, (StagingIdentity, Vec<u8>)>>,
     destinations: Mutex<HashMap<String, Destination>>,
     available: AtomicI64,
+    publication_actions: AtomicI64,
     fail_after_publish: AtomicBool,
     race_before_publish: AtomicBool,
 }
@@ -191,28 +200,67 @@ impl UploadStagingStore for MemoryPublication {
 
 #[async_trait]
 impl UploadPublisher for MemoryPublication {
-    async fn verify_and_close(
+    async fn verify_and_retain(
         &self,
         id: UploadId,
+        target: &UploadFinalizeTarget,
         expected_size: i64,
     ) -> Result<VerifiedUpload, UploadPublicationError> {
+        self.publication_actions.fetch_add(1, Ordering::SeqCst);
         let staging = self.staging.lock().unwrap();
         let (identity, bytes) = staging.get(&id).ok_or(UploadPublicationError::NotFound)?;
         let size = i64::try_from(bytes.len()).map_err(|_| UploadPublicationError::Unavailable)?;
         if size != expected_size {
             return Err(UploadPublicationError::Conflict);
         }
-        Ok(VerifiedUpload {
+        let facts = VerifiedUploadFacts {
             size,
             sha256: Sha256::digest(bytes).into(),
             staging_identity: *identity,
-        })
+            destination_namespace_identity: target
+                .destination_parent_identity
+                .unwrap_or(StagingIdentity::new([42; 24])),
+        };
+        Ok(VerifiedUpload::new(
+            facts,
+            MemoryVerifiedUpload {
+                upload_id: id,
+                identity: *identity,
+                bytes: bytes.clone(),
+            },
+        ))
+    }
+
+    async fn resume_and_retain(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<VerifiedUpload, UploadPublicationError> {
+        let target = UploadFinalizeTarget {
+            project_id: intent.project_id,
+            destination_parent_id: intent.destination_parent_id,
+            destination_parent_revision: intent.destination_parent_revision,
+            destination_parent_identity: intent.destination_parent_identity,
+            destination_components: intent.destination_components.clone(),
+            destination_name: intent.destination_name.clone(),
+        };
+        let verified = self
+            .verify_and_retain(intent.upload_id, &target, intent.expected_size)
+            .await?;
+        let facts = verified.facts();
+        if facts.sha256 != intent.sha256
+            || facts.staging_identity != intent.staging_identity
+            || facts.destination_namespace_identity != intent.destination_namespace_identity
+        {
+            return Err(UploadPublicationError::Conflict);
+        }
+        Ok(verified)
     }
 
     async fn observe(
         &self,
         intent: &UploadCommitIntent,
     ) -> Result<UploadPublicationObservation, UploadPublicationError> {
+        self.publication_actions.fetch_add(1, Ordering::SeqCst);
         let staging = self.staging.lock().unwrap();
         let source =
             staging
@@ -245,7 +293,9 @@ impl UploadPublisher for MemoryPublication {
     async fn publish_no_replace(
         &self,
         intent: &UploadCommitIntent,
+        verified: VerifiedUpload,
     ) -> Result<PublishedUpload, UploadPublicationError> {
+        self.publication_actions.fetch_add(1, Ordering::SeqCst);
         let mut destinations = self.destinations.lock().unwrap();
         let key = Self::key(intent);
         if self.race_before_publish.swap(false, Ordering::SeqCst) {
@@ -260,17 +310,33 @@ impl UploadPublisher for MemoryPublication {
         if destinations.contains_key(&key) {
             return Err(UploadPublicationError::Conflict);
         }
-        let (identity, bytes) = self
+        let token = verified
+            .into_token::<MemoryVerifiedUpload>()
+            .ok_or(UploadPublicationError::Unavailable)?;
+        if token.upload_id != intent.upload_id {
+            return Err(UploadPublicationError::Conflict);
+        }
+        let (identity, current_bytes) = self
             .staging
             .lock()
             .unwrap()
             .remove(&intent.upload_id)
             .ok_or(UploadPublicationError::NotFound)?;
-        if identity != intent.staging_identity {
+        if identity != intent.staging_identity
+            || identity != token.identity
+            || current_bytes != token.bytes
+        {
             return Err(UploadPublicationError::Conflict);
         }
-        let size = i64::try_from(bytes.len()).map_err(|_| UploadPublicationError::Unavailable)?;
-        destinations.insert(key, Destination { identity, bytes });
+        let size =
+            i64::try_from(token.bytes.len()).map_err(|_| UploadPublicationError::Unavailable)?;
+        destinations.insert(
+            key,
+            Destination {
+                identity,
+                bytes: token.bytes,
+            },
+        );
         if self.fail_after_publish.swap(false, Ordering::SeqCst) {
             return Err(UploadPublicationError::Unavailable);
         }
@@ -285,6 +351,7 @@ impl UploadPublisher for MemoryPublication {
         &self,
         intent: &UploadCommitIntent,
     ) -> Result<PublishedUpload, UploadPublicationError> {
+        self.publication_actions.fetch_add(1, Ordering::SeqCst);
         let destinations = self.destinations.lock().unwrap();
         let destination = destinations
             .get(&Self::key(intent))
@@ -529,6 +596,81 @@ async fn finalizes_once_and_replays_the_same_catalog_entry() {
 }
 
 #[tokio::test]
+async fn child_destination_retains_catalog_parent_revision_and_identity_binding() {
+    let harness = harness().await;
+    let token = csrf(&harness.app).await;
+    let parent_id = FileEntryId::new();
+    sqlx::query(
+        "INSERT INTO file_entry
+         (id, project_id, parent_id, exact_name, kind, platform_kind,
+          volume_serial, filesystem_file_id, size, mtime_filetime_100ns,
+          hash, hash_state, state, revision, scan_generation, observed_at)
+         VALUES (?, ?, NULL, 'folder', 'directory', 'windows_file_id',
+                 ?, ?, 0, 1, NULL, 'unknown', 'live', 7, 0,
+                 '1970-01-01T00:00:00.000000000Z')",
+    )
+    .bind(parent_id.to_string())
+    .bind(harness.project_id.to_string())
+    .bind(vec![1_u8; 8])
+    .bind(vec![2_u8; 16])
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+    let mut request = request(
+        "POST",
+        "/api/v1/uploads",
+        Body::from(
+            json!({
+                "projectId": harness.project_id.to_string(),
+                "destinationParentId": parent_id.to_string(),
+                "destinationName": "child.bin",
+                "expectedSize": "3"
+            })
+            .to_string(),
+        ),
+    );
+    request
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    authorize(&mut request, &token);
+    let response = harness.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let id: UploadId = json_body(response).await["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    upload_bytes(&harness, &token, id, b"abc").await;
+    assert_eq!(
+        finalize(&harness.app, &token, id).await.status(),
+        StatusCode::OK
+    );
+
+    let (payload, catalog_parent): (String, Option<String>) = sqlx::query_as(
+        "SELECT o.payload, e.parent_id
+         FROM operation AS o
+         JOIN upload_finalization AS f ON f.operation_id = o.id
+         JOIN file_entry AS e ON e.id = f.file_entry_id",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["destinationParentId"], parent_id.to_string());
+    assert_eq!(payload["destinationParentRevision"], "7");
+    assert_eq!(
+        payload["destinationParentIdentity"],
+        format!("{}{}", "01".repeat(8), "02".repeat(16))
+    );
+    assert_eq!(
+        payload["destinationNamespaceIdentity"],
+        payload["destinationParentIdentity"]
+    );
+    let parent_id = parent_id.to_string();
+    assert_eq!(catalog_parent.as_deref(), Some(parent_id.as_str()));
+}
+
+#[tokio::test]
 async fn hash_mismatch_and_incomplete_upload_never_create_an_intent() {
     let harness = harness().await;
     let token = csrf(&harness.app).await;
@@ -553,6 +695,50 @@ async fn hash_mismatch_and_incomplete_upload_never_create_an_intent() {
         .unwrap();
     assert_eq!(operations, 0);
     harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn same_identity_same_length_mutation_before_verification_never_creates_an_intent() {
+    let harness = harness().await;
+    let token = csrf(&harness.app).await;
+    let id = create_upload(
+        &harness,
+        &token,
+        "mutated.bin",
+        Some(Sha256::digest(b"abc").into()),
+    )
+    .await;
+    upload_bytes(&harness, &token, id, b"abc").await;
+    let original_identity = {
+        let mut staging = harness.publication.staging.lock().unwrap();
+        let (identity, bytes) = staging.get_mut(&id).unwrap();
+        let identity = *identity;
+        bytes.copy_from_slice(b"xyz");
+        identity
+    };
+    assert_eq!(
+        harness
+            .publication
+            .staging
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|(identity, bytes)| (*identity, bytes.len())),
+        Some((original_identity, 3))
+    );
+
+    assert_error(
+        finalize(&harness.app, &token, id).await,
+        StatusCode::CONFLICT,
+        "upload_conflict",
+    )
+    .await;
+    let operations: i64 = sqlx::query_scalar("SELECT count(*) FROM operation")
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(operations, 0);
+    assert!(harness.publication.destinations.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -851,4 +1037,241 @@ async fn a_destination_race_after_intent_is_preserved_and_terminally_reconciled(
             .contains_key(&id)
     );
     harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_each_valid_but_cross_row_operation_payload_mapping() {
+    for (field, replacement) in [
+        ("fileEntryId", Value::String(FileEntryId::new().to_string())),
+        ("destinationName", Value::String("redirected.bin".into())),
+        ("sha256", Value::String("00".repeat(32))),
+        ("stagingIdentity", Value::String("11".repeat(24))),
+    ] {
+        let harness = harness().await;
+        let token = csrf(&harness.app).await;
+        let id = create_upload(
+            &harness,
+            &token,
+            "binding.bin",
+            Some(Sha256::digest(b"abc").into()),
+        )
+        .await;
+        upload_bytes(&harness, &token, id, b"abc").await;
+        let operations = SqliteOperationRepository::new(harness.pool.clone());
+        let target = operations.upload_finalize_target(id).await.unwrap();
+        let verified = harness
+            .publication
+            .verify_and_retain(id, &target, 3)
+            .await
+            .unwrap();
+        let facts = verified.facts();
+        let intent = match operations
+            .prepare_upload_commit(
+                id,
+                &target,
+                facts,
+                OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+            )
+            .await
+            .unwrap()
+        {
+            UploadFinalizeStart::Intent(intent) => intent,
+            UploadFinalizeStart::Completed(_) => panic!("new upload unexpectedly complete"),
+        };
+        let payload: String = sqlx::query_scalar("SELECT payload FROM operation WHERE id = ?")
+            .bind(intent.operation_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+        let mut payload: Value = serde_json::from_str(&payload).unwrap();
+        payload[field] = replacement;
+        sqlx::query("UPDATE operation SET payload = ? WHERE id = ?")
+            .bind(payload.to_string())
+            .bind(intent.operation_id.to_string())
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            operations.pending_upload_commits().await.unwrap_err(),
+            UploadFinalizeRepositoryError::Unavailable,
+            "payload field {field} was trusted before authoritative validation"
+        );
+        harness
+            .publication
+            .publication_actions
+            .store(0, Ordering::SeqCst);
+        let restarted = app(&harness.pool, harness.publication.clone());
+        let restarted_token = csrf(&restarted).await;
+        assert_error(
+            finalize(&restarted, &restarted_token, id).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upload_unavailable",
+        )
+        .await;
+        assert_eq!(
+            harness
+                .publication
+                .publication_actions
+                .load(Ordering::SeqCst),
+            0,
+            "payload field {field} reached the filesystem publisher"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_rejects_mutated_actual_hash_without_a_client_expected_hash() {
+    let harness = harness().await;
+    let token = csrf(&harness.app).await;
+    let id = create_upload(&harness, &token, "actual-hash.bin", None).await;
+    upload_bytes(&harness, &token, id, b"abc").await;
+    let operations = SqliteOperationRepository::new(harness.pool.clone());
+    let target = operations.upload_finalize_target(id).await.unwrap();
+    let verified = harness
+        .publication
+        .verify_and_retain(id, &target, 3)
+        .await
+        .unwrap();
+    let facts = verified.facts();
+    let intent = match operations
+        .prepare_upload_commit(
+            id,
+            &target,
+            facts,
+            OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+        )
+        .await
+        .unwrap()
+    {
+        UploadFinalizeStart::Intent(intent) => intent,
+        UploadFinalizeStart::Completed(_) => panic!("new upload unexpectedly complete"),
+    };
+    let payload: String = sqlx::query_scalar("SELECT payload FROM operation WHERE id = ?")
+        .bind(intent.operation_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    payload["sha256"] = Value::String("22".repeat(32));
+    sqlx::query("UPDATE operation SET payload = ? WHERE id = ?")
+        .bind(payload.to_string())
+        .bind(intent.operation_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        operations.pending_upload_commits().await.unwrap_err(),
+        UploadFinalizeRepositoryError::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn fs_applied_cas_rejects_each_changed_authoritative_mapping() {
+    for mutation in [
+        "file_entry_id",
+        "sha256",
+        "namespace_identity",
+        "destination_name",
+        "staging_identity",
+    ] {
+        let harness = harness().await;
+        let token = csrf(&harness.app).await;
+        let id = create_upload(&harness, &token, "cas.bin", None).await;
+        upload_bytes(&harness, &token, id, b"abc").await;
+        let operations = SqliteOperationRepository::new(harness.pool.clone());
+        let target = operations.upload_finalize_target(id).await.unwrap();
+        let verified = harness
+            .publication
+            .verify_and_retain(id, &target, 3)
+            .await
+            .unwrap();
+        let facts = verified.facts();
+        let intent = match operations
+            .prepare_upload_commit(
+                id,
+                &target,
+                facts,
+                OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+            )
+            .await
+            .unwrap()
+        {
+            UploadFinalizeStart::Intent(intent) => intent,
+            UploadFinalizeStart::Completed(_) => panic!("new upload unexpectedly complete"),
+        };
+        match mutation {
+            "file_entry_id" => {
+                sqlx::query("UPDATE upload_finalization SET file_entry_id = ? WHERE upload_id = ?")
+                    .bind(FileEntryId::new().to_string())
+                    .bind(id.to_string())
+                    .execute(&harness.pool)
+                    .await
+                    .unwrap();
+            }
+            "sha256" => {
+                sqlx::query("UPDATE upload_finalization SET sha256 = ? WHERE upload_id = ?")
+                    .bind(vec![3_u8; 32])
+                    .bind(id.to_string())
+                    .execute(&harness.pool)
+                    .await
+                    .unwrap();
+            }
+            "namespace_identity" => {
+                sqlx::query(
+                    "UPDATE upload_finalization SET destination_namespace_identity = ?
+                     WHERE upload_id = ?",
+                )
+                .bind(vec![4_u8; 24])
+                .bind(id.to_string())
+                .execute(&harness.pool)
+                .await
+                .unwrap();
+            }
+            "destination_name" => {
+                sqlx::query(
+                    "UPDATE upload_session SET destination_name = 'other.bin' WHERE id = ?",
+                )
+                .bind(id.to_string())
+                .execute(&harness.pool)
+                .await
+                .unwrap();
+            }
+            "staging_identity" => {
+                sqlx::query(
+                    "UPDATE upload_staging_identity SET platform_identity = ? WHERE upload_id = ?",
+                )
+                .bind(vec![5_u8; 24])
+                .bind(id.to_string())
+                .execute(&harness.pool)
+                .await
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        assert_eq!(
+            operations
+                .mark_upload_fs_applied(
+                    &intent,
+                    PublishedUpload {
+                        identity: intent.staging_identity,
+                        size: intent.expected_size,
+                        mtime_filetime_100ns: 123,
+                    },
+                    OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            UploadFinalizeRepositoryError::Unavailable,
+            "changed {mutation} mapping was not part of the fs-applied CAS"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM operation WHERE id = ?")
+            .bind(intent.operation_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
 }

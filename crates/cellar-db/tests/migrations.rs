@@ -323,6 +323,23 @@ async fn expand_only_upload_finalization_journal_is_v2_compatible_and_tamper_evi
     .await
     .unwrap();
     assert_eq!(table, 1);
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('upload_finalization') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            "upload_id",
+            "operation_id",
+            "file_entry_id",
+            "result_identity",
+            "sha256",
+            "destination_namespace_identity",
+        ]
+    );
     pool.close().await;
 
     let (_tampered_db, tampered_pool) = migrated_db().await;
@@ -339,6 +356,42 @@ async fn expand_only_upload_finalization_journal_is_v2_compatible_and_tamper_evi
     ));
     assert!(previous_release_v2_accepts_schema_history(&tampered_pool).await);
     tampered_pool.close().await;
+}
+
+#[tokio::test]
+async fn upload_finalization_v1_extension_upgrades_expand_only_without_v3_history() {
+    let (_db, pool) = migrated_db().await;
+    sqlx::raw_sql(
+        "DROP TABLE upload_finalization;
+         CREATE TABLE upload_finalization (
+           upload_id TEXT PRIMARY KEY NOT NULL,
+           operation_id TEXT NOT NULL UNIQUE,
+           file_entry_id TEXT NOT NULL UNIQUE,
+           result_identity BLOB CHECK (
+             result_identity IS NULL OR length(result_identity) = 24
+           ),
+           FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE,
+           FOREIGN KEY (operation_id) REFERENCES operation(id) ON DELETE CASCADE
+         );",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrate(&pool).await.unwrap();
+    assert!(previous_release_v2_accepts_schema_history(&pool).await);
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('upload_finalization') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns.last().map(String::as_str),
+        Some("destination_namespace_identity")
+    );
+    assert!(columns.iter().any(|column| column == "sha256"));
+    pool.close().await;
 }
 
 #[tokio::test]

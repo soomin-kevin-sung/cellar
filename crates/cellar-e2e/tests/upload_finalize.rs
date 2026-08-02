@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cellar_core::{
     NewUpload, PublicationPresence, PublishedUpload, StagingIdentity, UploadCommitIntent,
-    UploadFinalizeRepository, UploadFinalizeStart, UploadId, UploadLimits, UploadPublicationError,
-    UploadPublicationObservation, UploadPublisher, UploadService, UploadStagingError,
-    UploadStagingStore, VerifiedUpload,
+    UploadFinalizeRepository, UploadFinalizeStart, UploadFinalizeTarget, UploadId, UploadLimits,
+    UploadPublicationError, UploadPublicationObservation, UploadPublisher, UploadService,
+    UploadStagingError, UploadStagingStore, VerifiedUpload, VerifiedUploadFacts,
 };
 use cellar_db::{
     FilenameCollation, SqliteOperationRepository, SqliteUploadRepository, migrate, open_pool,
@@ -24,6 +24,12 @@ enum FaultPoint {
 
 #[derive(Clone)]
 struct Destination {
+    identity: StagingIdentity,
+    bytes: Vec<u8>,
+}
+
+struct DurableVerifiedUpload {
+    upload_id: UploadId,
     identity: StagingIdentity,
     bytes: Vec<u8>,
 }
@@ -147,9 +153,10 @@ impl UploadStagingStore for DurableNamespace {
 
 #[async_trait]
 impl UploadPublisher for DurableNamespace {
-    async fn verify_and_close(
+    async fn verify_and_retain(
         &self,
         id: UploadId,
+        target: &UploadFinalizeTarget,
         expected_size: i64,
     ) -> Result<VerifiedUpload, UploadPublicationError> {
         let staging = self.staging.lock().unwrap();
@@ -158,11 +165,47 @@ impl UploadPublisher for DurableNamespace {
         if size != expected_size {
             return Err(UploadPublicationError::Conflict);
         }
-        Ok(VerifiedUpload {
+        let facts = VerifiedUploadFacts {
             size,
             sha256: Sha256::digest(bytes).into(),
             staging_identity: *identity,
-        })
+            destination_namespace_identity: target
+                .destination_parent_identity
+                .unwrap_or(StagingIdentity::new([42; 24])),
+        };
+        Ok(VerifiedUpload::new(
+            facts,
+            DurableVerifiedUpload {
+                upload_id: id,
+                identity: *identity,
+                bytes: bytes.clone(),
+            },
+        ))
+    }
+
+    async fn resume_and_retain(
+        &self,
+        intent: &UploadCommitIntent,
+    ) -> Result<VerifiedUpload, UploadPublicationError> {
+        let target = UploadFinalizeTarget {
+            project_id: intent.project_id,
+            destination_parent_id: intent.destination_parent_id,
+            destination_parent_revision: intent.destination_parent_revision,
+            destination_parent_identity: intent.destination_parent_identity,
+            destination_components: intent.destination_components.clone(),
+            destination_name: intent.destination_name.clone(),
+        };
+        let verified = self
+            .verify_and_retain(intent.upload_id, &target, intent.expected_size)
+            .await?;
+        let facts = verified.facts();
+        if facts.sha256 != intent.sha256
+            || facts.staging_identity != intent.staging_identity
+            || facts.destination_namespace_identity != intent.destination_namespace_identity
+        {
+            return Err(UploadPublicationError::Conflict);
+        }
+        Ok(verified)
     }
 
     async fn observe(
@@ -200,20 +243,37 @@ impl UploadPublisher for DurableNamespace {
     async fn publish_no_replace(
         &self,
         intent: &UploadCommitIntent,
+        verified: VerifiedUpload,
     ) -> Result<PublishedUpload, UploadPublicationError> {
         let mut destinations = self.destinations.lock().unwrap();
         let key = Self::key(intent);
         if destinations.contains_key(&key) {
             return Err(UploadPublicationError::Conflict);
         }
-        let (identity, bytes) = self
+        let token = verified
+            .into_token::<DurableVerifiedUpload>()
+            .ok_or(UploadPublicationError::Unavailable)?;
+        if token.upload_id != intent.upload_id {
+            return Err(UploadPublicationError::Conflict);
+        }
+        let (identity, current_bytes) = self
             .staging
             .lock()
             .unwrap()
             .remove(&intent.upload_id)
             .ok_or(UploadPublicationError::NotFound)?;
-        let size = i64::try_from(bytes.len()).map_err(|_| UploadPublicationError::Unavailable)?;
-        destinations.insert(key, Destination { identity, bytes });
+        if identity != token.identity || current_bytes != token.bytes {
+            return Err(UploadPublicationError::Conflict);
+        }
+        let size =
+            i64::try_from(token.bytes.len()).map_err(|_| UploadPublicationError::Unavailable)?;
+        destinations.insert(
+            key,
+            Destination {
+                identity,
+                bytes: token.bytes,
+            },
+        );
         Ok(PublishedUpload {
             identity,
             size,
@@ -332,9 +392,15 @@ async fn process_restart_at_each_finalize_fault_point_never_duplicates_or_expose
         let harness = Harness::new().await;
         let id = harness.uploaded(&format!("{point:?}.bin")).await;
         let operations = SqliteOperationRepository::new(harness.pool.clone());
-        let verified = harness.namespace.verify_and_close(id, 3).await.unwrap();
+        let target = operations.upload_finalize_target(id).await.unwrap();
+        let verified = harness
+            .namespace
+            .verify_and_retain(id, &target, 3)
+            .await
+            .unwrap();
+        let facts = verified.facts();
         let intent = match operations
-            .prepare_upload_commit(id, verified, harness.now)
+            .prepare_upload_commit(id, &target, facts, harness.now)
             .await
             .unwrap()
         {
@@ -343,12 +409,20 @@ async fn process_restart_at_each_finalize_fault_point_never_duplicates_or_expose
         };
 
         match point {
-            FaultPoint::Intent => {}
+            FaultPoint::Intent => drop(verified),
             FaultPoint::Rename => {
-                harness.namespace.publish_no_replace(&intent).await.unwrap();
+                harness
+                    .namespace
+                    .publish_no_replace(&intent, verified)
+                    .await
+                    .unwrap();
             }
             FaultPoint::CatalogCommit => {
-                let published = harness.namespace.publish_no_replace(&intent).await.unwrap();
+                let published = harness
+                    .namespace
+                    .publish_no_replace(&intent, verified)
+                    .await
+                    .unwrap();
                 let applied = operations
                     .mark_upload_fs_applied(&intent, published, harness.now)
                     .await

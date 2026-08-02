@@ -18,8 +18,9 @@ pub use operation::{
     MAX_UPLOAD_COMMIT_COMPONENTS, MAX_UPLOAD_COMMIT_PAYLOAD_BYTES, PublicationPresence,
     PublishedUpload, RecoveryDecision, UPLOAD_COMMIT_PAYLOAD_VERSION, UploadCommitIntent,
     UploadCommitPayload, UploadFinalizeRepository, UploadFinalizeRepositoryError,
-    UploadFinalizeStart, UploadPublicationError, UploadPublicationObservation, UploadPublisher,
-    VerifiedUpload, decide_upload_recovery,
+    UploadFinalizeStart, UploadFinalizeTarget, UploadPublicationError,
+    UploadPublicationObservation, UploadPublisher, VerifiedUpload, VerifiedUploadFacts,
+    decide_upload_recovery,
 };
 pub use project::{
     CreateProjectResult, DirectoryStoreError, MAX_PROJECT_DESCRIPTION_BYTES,

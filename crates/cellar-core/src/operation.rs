@@ -1,10 +1,12 @@
+use std::any::Any;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{FileEntry, FileEntryId, OperationId, ProjectId, StagingIdentity, UploadId};
 
-pub const UPLOAD_COMMIT_PAYLOAD_VERSION: i64 = 1;
+pub const UPLOAD_COMMIT_PAYLOAD_VERSION: i64 = 2;
 pub const MAX_UPLOAD_COMMIT_COMPONENTS: usize = 256;
 pub const MAX_UPLOAD_COMMIT_PAYLOAD_BYTES: usize = 128 * 1024;
 
@@ -48,6 +50,7 @@ pub struct UploadCommitPayload {
     pub destination_parent_id: Option<String>,
     pub destination_parent_revision: Option<String>,
     pub destination_parent_identity: Option<String>,
+    pub destination_namespace_identity: String,
     pub destination_components: Vec<String>,
     pub destination_name: String,
     pub file_entry_id: String,
@@ -65,6 +68,9 @@ pub struct UploadCommitIntent {
     pub destination_parent_id: Option<FileEntryId>,
     pub destination_parent_revision: Option<i64>,
     pub destination_parent_identity: Option<StagingIdentity>,
+    /// Identity of the actual directory handle receiving the rename. This is
+    /// present for root-level and child destinations alike.
+    pub destination_namespace_identity: StagingIdentity,
     /// Exact, validated path components below `projects/<id>/files`.
     pub destination_components: Vec<String>,
     pub destination_name: String,
@@ -75,11 +81,56 @@ pub struct UploadCommitIntent {
     pub result_identity: Option<StagingIdentity>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UploadFinalizeTarget {
+    pub project_id: ProjectId,
+    pub destination_parent_id: Option<FileEntryId>,
+    pub destination_parent_revision: Option<i64>,
+    pub destination_parent_identity: Option<StagingIdentity>,
+    pub destination_components: Vec<String>,
+    pub destination_name: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VerifiedUpload {
+pub struct VerifiedUploadFacts {
     pub size: i64,
     pub sha256: [u8; 32],
     pub staging_identity: StagingIdentity,
+    pub destination_namespace_identity: StagingIdentity,
+}
+
+pub struct VerifiedUpload {
+    facts: VerifiedUploadFacts,
+    token: Box<dyn Any + Send>,
+}
+
+impl VerifiedUpload {
+    #[must_use]
+    pub fn new<T: Any + Send>(facts: VerifiedUploadFacts, token: T) -> Self {
+        Self {
+            facts,
+            token: Box::new(token),
+        }
+    }
+
+    #[must_use]
+    pub const fn facts(&self) -> VerifiedUploadFacts {
+        self.facts
+    }
+
+    #[must_use]
+    pub fn into_token<T: Any + Send>(self) -> Option<T> {
+        self.token.downcast::<T>().ok().map(|token| *token)
+    }
+}
+
+impl std::fmt::Debug for VerifiedUpload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedUpload")
+            .field("facts", &self.facts)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,10 +161,16 @@ pub trait UploadFinalizeRepository: Send + Sync {
         upload_id: UploadId,
     ) -> Result<Option<UploadFinalizeStart>, UploadFinalizeRepositoryError>;
 
+    async fn upload_finalize_target(
+        &self,
+        upload_id: UploadId,
+    ) -> Result<UploadFinalizeTarget, UploadFinalizeRepositoryError>;
+
     async fn prepare_upload_commit(
         &self,
         upload_id: UploadId,
-        verified: VerifiedUpload,
+        target: &UploadFinalizeTarget,
+        verified: VerifiedUploadFacts,
         now: OffsetDateTime,
     ) -> Result<UploadFinalizeStart, UploadFinalizeRepositoryError>;
 
@@ -153,11 +210,20 @@ pub enum UploadPublicationError {
 
 #[async_trait]
 pub trait UploadPublisher: Send + Sync {
-    /// Verifies the complete durable staging file and closes all writer handles.
-    async fn verify_and_close(
+    /// Verifies the durable staging bytes and retains the exact source and
+    /// destination namespace handles until publication or cancellation.
+    async fn verify_and_retain(
         &self,
         upload_id: UploadId,
+        target: &UploadFinalizeTarget,
         expected_size: i64,
+    ) -> Result<VerifiedUpload, UploadPublicationError>;
+
+    /// Reopens a crash-recovery source with exclusive write/delete sharing,
+    /// revalidates every persisted fact, and retains that exact handle.
+    async fn resume_and_retain(
+        &self,
+        intent: &UploadCommitIntent,
     ) -> Result<VerifiedUpload, UploadPublicationError>;
 
     async fn observe(
@@ -169,6 +235,7 @@ pub trait UploadPublisher: Send + Sync {
     async fn publish_no_replace(
         &self,
         intent: &UploadCommitIntent,
+        verified: VerifiedUpload,
     ) -> Result<PublishedUpload, UploadPublicationError>;
 
     async fn inspect_destination(
