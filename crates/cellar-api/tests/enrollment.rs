@@ -419,6 +419,24 @@ fn http_request(method: &str, uri: &str, body: Body, authenticated: bool) -> Req
     request
 }
 
+async fn assert_shared_error(response: axum::response::Response, status: StatusCode, code: &str) {
+    assert_eq!(response.status(), status);
+    let request_id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let error: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(error["code"], code);
+    assert_eq!(error["requestId"], request_id);
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(error["details"], serde_json::json!({}));
+}
+
 #[tokio::test]
 async fn http_claim_requires_auth_and_is_the_csrf_exemption_then_disappears() {
     let service = EnrollmentService::new(Arc::new(MemoryStore::unenrolled()));
@@ -434,19 +452,13 @@ async fn http_claim_requires_auth_and_is_the_csrf_exemption_then_disappears() {
         .headers_mut()
         .insert(header::ORIGIN, ORIGIN.parse().unwrap());
     let response = app.clone().oneshot(missing_auth).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(
         response
             .headers()
             .get("access-control-allow-origin")
             .is_none()
     );
-    let error: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(
-        error,
-        serde_json::json!({"error": "missing_authentication"})
-    );
+    assert_shared_error(response, StatusCode::UNAUTHORIZED, "missing_authentication").await;
 
     let mut claim = http_request("POST", "/owner/claim", body(), true);
     claim
@@ -468,10 +480,7 @@ async fn http_claim_requires_auth_and_is_the_csrf_exemption_then_disappears() {
         .headers_mut()
         .insert(header::ORIGIN, ORIGIN.parse().unwrap());
     let response = app.oneshot(reused).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let error: Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(error, serde_json::json!({"error": "claim_not_found"}));
+    assert_shared_error(response, StatusCode::NOT_FOUND, "claim_not_found").await;
 }
 
 #[tokio::test]

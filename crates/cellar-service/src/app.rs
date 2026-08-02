@@ -8,15 +8,17 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, Method, StatusCode};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use cellar_api::health::{Readiness, health_router};
-use cellar_api::routes::session::session_router;
+use cellar_api::routes::session::{
+    RequestId, prepare_request_id, session_router, shared_error_response,
+};
 use cellar_auth::{
     AccessClaims, AccessValidator, AccessValidatorConfig, AuthError, CsrfManager,
     EnrollmentService, FileEnrollmentStore, JwksFetchError, JwksFetcher, JwksResponse, OwnerMode,
@@ -233,11 +235,6 @@ struct OriginAuthState {
     readiness: Readiness,
 }
 
-#[derive(serde::Serialize)]
-struct OriginErrorBody {
-    error: &'static str,
-}
-
 pub fn origin_router_with_authenticator(
     config_path: &std::path::Path,
     authenticator: Arc<dyn OriginAuthenticator>,
@@ -269,6 +266,10 @@ async fn access_boundary(
     mut request: Request,
     next: Next,
 ) -> Response {
+    let (request_id, _) = match prepare_request_id(&mut request) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
     let token = match select_access_jwt_header(
         request
             .headers()
@@ -278,11 +279,11 @@ async fn access_boundary(
         state.authenticator.max_token_len(),
     ) {
         Ok(token) => token,
-        Err(error) => return origin_auth_error(error.code()),
+        Err(error) => return origin_auth_error(error.code(), request_id),
     };
     let persisted = match cellar_config::load_config(&state.config_path) {
         Ok(persisted) => persisted,
-        Err(_) => return origin_auth_error("authentication_unavailable"),
+        Err(_) => return origin_auth_error("authentication_unavailable", request_id),
     };
     let owner_mode = match (
         persisted.config.bootstrap_owner_email.as_deref(),
@@ -294,11 +295,11 @@ async fn access_boundary(
         (None, Some(subject)) => OwnerMode::Enrolled {
             owner_subject: subject,
         },
-        _ => return origin_auth_error("authentication_unavailable"),
+        _ => return origin_auth_error("authentication_unavailable", request_id),
     };
     let claims = match state.authenticator.validate(token, owner_mode).await {
         Ok(claims) => claims,
-        Err(error) => return origin_auth_error(error.code()),
+        Err(error) => return origin_auth_error(error.code(), request_id),
     };
     request.extensions_mut().insert(claims);
     let response = next.run(request).await;
@@ -313,27 +314,31 @@ async fn access_boundary(
     response
 }
 
-fn origin_auth_error(code: &'static str) -> Response {
-    (
+fn origin_auth_error(code: &'static str, request_id: RequestId) -> Response {
+    shared_error_response(
         StatusCode::UNAUTHORIZED,
-        Json(OriginErrorBody { error: code }),
+        code,
+        "Authentication could not be completed.",
+        request_id,
     )
-        .into_response()
 }
 
 async fn mutation_shutdown_boundary(
     State(shutdown): State<Shutdown>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    let (request_id, _) = match prepare_request_id(&mut request) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
     if is_unsafe_method(request.method()) && !shutdown.accepting_mutations() {
-        return (
+        return shared_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(OriginErrorBody {
-                error: "service_stopping",
-            }),
-        )
-            .into_response();
+            "service_stopping",
+            "The service is stopping and cannot accept mutations.",
+            request_id,
+        );
     }
     next.run(request).await
 }

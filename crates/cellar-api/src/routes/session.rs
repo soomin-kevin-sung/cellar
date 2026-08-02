@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Request, State};
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -14,11 +15,17 @@ use cellar_auth::{
     AccessClaims, ClaimRequest, CsrfError, CsrfManager, EnrollmentError, EnrollmentMode,
     EnrollmentService, EnrollmentStore, MutationHeaders, RouteAccess, route_access,
 };
+use cellar_core::OperationId;
 use serde::{Deserialize, Serialize};
 
 const CSRF_HEADER: HeaderName = HeaderName::from_static("x-cellar-csrf");
 const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
+const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 const MAX_CLAIM_BODY_BYTES: usize = 4 * 1024;
+const MAX_REQUEST_ID_BYTES: usize = 128;
+
+#[derive(Clone)]
+pub struct RequestId(String);
 
 #[must_use]
 pub const fn claim_status(error: &EnrollmentError) -> StatusCode {
@@ -241,26 +248,40 @@ where
 
 async fn security_boundary<S: EnrollmentStore + 'static>(
     State(state): State<SessionState<S>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    let (request_id, request_id_header) = match prepare_request_id(&mut request) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let request_id = request_id.0;
     let Some(claims) = request.extensions().get::<AccessClaims>().cloned() else {
-        return ApiError::new(StatusCode::UNAUTHORIZED, "missing_authentication").into_response();
+        return ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "missing_authentication",
+            "Authentication is required.",
+            request_id,
+        )
+        .into_response();
     };
     let path = request.uri().path();
     let mode = match state.enrollment.mode() {
         Ok(mode) => mode,
-        Err(error) => return ApiError::from_enrollment(error).into_response(),
+        Err(error) => return ApiError::from_enrollment(error, request_id).into_response(),
     };
     let access = route_access(mode, path);
     let authorization = match state.enrollment.authorize(access, &claims) {
         Ok(authorization) => authorization,
-        Err(error) => return ApiError::from_enrollment(error).into_response(),
+        Err(error) => return ApiError::from_enrollment(error, request_id).into_response(),
     };
     if path != "/owner/claim" {
         let owner_subject = match authorization.owner_subject() {
             Some(subject) => subject,
-            None => return ApiError::from_enrollment(EnrollmentError::Forbidden).into_response(),
+            None => {
+                return ApiError::from_enrollment(EnrollmentError::Forbidden, request_id)
+                    .into_response();
+            }
         };
         let headers = request.headers();
         let mutation_headers = MutationHeaders {
@@ -276,10 +297,72 @@ async fn security_boundary<S: EnrollmentStore + 'static>(
             authorization.canonical_origin(),
             (state.clock)(),
         ) {
-            return ApiError::from_csrf(error).into_response();
+            return ApiError::from_csrf(error, request_id).into_response();
         }
     }
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(REQUEST_ID, request_id_header);
+    response
+}
+
+pub fn prepare_request_id(request: &mut Request) -> Result<(RequestId, HeaderValue), ApiError> {
+    let request_id = match resolve_request_id(request.headers()) {
+        Ok(request_id) => request_id,
+        Err(fallback) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_id",
+                "The request ID is invalid.",
+                fallback,
+            ));
+        }
+    };
+    let request_id_header = match HeaderValue::from_str(&request_id) {
+        Ok(value) => value,
+        Err(_) => {
+            let fallback = OperationId::new().to_string();
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_id",
+                "The request ID is invalid.",
+                fallback,
+            ));
+        }
+    };
+    request
+        .headers_mut()
+        .insert(REQUEST_ID.clone(), request_id_header.clone());
+    let request_id = RequestId(request_id);
+    request.extensions_mut().insert(request_id.clone());
+    Ok((request_id, request_id_header))
+}
+
+pub fn shared_error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+    request_id: RequestId,
+) -> Response {
+    ApiError::new(status, code, message, request_id.0).into_response()
+}
+
+fn resolve_request_id(headers: &HeaderMap) -> Result<String, String> {
+    let fallback = || OperationId::new().to_string();
+    let values: Vec<_> = headers.get_all(&REQUEST_ID).iter().collect();
+    if values.is_empty() {
+        return Ok(fallback());
+    }
+    if values.len() != 1 {
+        return Err(fallback());
+    }
+    let value = values[0].to_str().map_err(|_| fallback())?;
+    if value.is_empty()
+        || value.len() > MAX_REQUEST_ID_BYTES
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(fallback());
+    }
+    Ok(value.to_owned())
 }
 
 fn header_values<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Vec<&'a [u8]> {
@@ -300,20 +383,24 @@ struct ClaimBody {
 async fn claim_handler<S: EnrollmentStore + 'static>(
     State(state): State<SessionState<S>>,
     Extension(claims): Extension<AccessClaims>,
+    Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     if body.len() > MAX_CLAIM_BODY_BYTES {
-        return Err(ApiError::from_claim(ClaimRouteError::InvalidRequest));
+        return Err(ApiError::from_claim(
+            ClaimRouteError::InvalidRequest,
+            request_id.0,
+        ));
     }
     let input: ClaimBody = serde_json::from_slice(&body)
-        .map_err(|_| ApiError::from_claim(ClaimRouteError::InvalidRequest))?;
+        .map_err(|_| ApiError::from_claim(ClaimRouteError::InvalidRequest, request_id.0.clone()))?;
     let decoded = URL_SAFE_NO_PAD
         .decode(input.claim_code)
-        .map_err(|_| ApiError::from_claim(ClaimRouteError::Forbidden))?;
+        .map_err(|_| ApiError::from_claim(ClaimRouteError::Forbidden, request_id.0.clone()))?;
     let code: [u8; 32] = decoded
         .try_into()
-        .map_err(|_| ApiError::from_claim(ClaimRouteError::Forbidden))?;
+        .map_err(|_| ApiError::from_claim(ClaimRouteError::Forbidden, request_id.0.clone()))?;
     let content_types = header_values(&headers, &header::CONTENT_TYPE);
     let origins = header_values(&headers, &header::ORIGIN);
     claim_owner(
@@ -325,22 +412,23 @@ async fn claim_handler<S: EnrollmentStore + 'static>(
         &code,
         (state.clock)(),
     )
-    .map_err(ApiError::from_claim)?;
+    .map_err(|error| ApiError::from_claim(error, request_id.0))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn session_handler<S: EnrollmentStore + 'static>(
     State(state): State<SessionState<S>>,
     Extension(claims): Extension<AccessClaims>,
+    Extension(request_id): Extension<RequestId>,
     method: Method,
 ) -> Result<impl IntoResponse, ApiError> {
     let authorization = state
         .enrollment
         .authorize(RouteAccess::OwnerOnly, &claims)
-        .map_err(ApiError::from_enrollment)?;
-    let owner_subject = authorization
-        .owner_subject()
-        .ok_or_else(|| ApiError::from_enrollment(EnrollmentError::Forbidden))?;
+        .map_err(|error| ApiError::from_enrollment(error, request_id.0.clone()))?;
+    let owner_subject = authorization.owner_subject().ok_or_else(|| {
+        ApiError::from_enrollment(EnrollmentError::Forbidden, request_id.0.clone())
+    })?;
     get_session(
         method.as_str(),
         &state.csrf,
@@ -357,42 +445,93 @@ async fn session_handler<S: EnrollmentStore + 'static>(
             Json(response),
         )
     })
-    .map_err(ApiError::from_session)
+    .map_err(|error| ApiError::from_session(error, request_id.0))
 }
 
-async fn not_found() -> StatusCode {
-    StatusCode::NOT_FOUND
+async fn not_found(Extension(request_id): Extension<RequestId>) -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "route_not_found",
+        "The requested resource was not found.",
+        request_id.0,
+    )
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ErrorBody {
-    error: &'static str,
+    code: &'static str,
+    message: &'static str,
+    request_id: String,
+    details: BTreeMap<String, String>,
 }
 
 pub struct ApiError {
     status: StatusCode,
     code: &'static str,
+    message: &'static str,
+    request_id: String,
 }
 
 impl ApiError {
-    const fn new(status: StatusCode, code: &'static str) -> Self {
-        Self { status, code }
+    const fn new(
+        status: StatusCode,
+        code: &'static str,
+        message: &'static str,
+        request_id: String,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message,
+            request_id,
+        }
     }
 
-    fn from_enrollment(error: EnrollmentError) -> Self {
-        Self::new(claim_status(&error), error.code())
+    fn from_enrollment(error: EnrollmentError, request_id: String) -> Self {
+        let message = match error {
+            EnrollmentError::InvalidIdentity => "The authenticated identity is invalid.",
+            EnrollmentError::Forbidden => "The authenticated owner is not allowed.",
+            EnrollmentError::NotFound => "The enrollment resource was not found.",
+            EnrollmentError::Conflict => "The enrollment request conflicts with current state.",
+            EnrollmentError::Unavailable => "The enrollment service is temporarily unavailable.",
+        };
+        Self::new(claim_status(&error), error.code(), message, request_id)
     }
 
-    fn from_csrf(error: CsrfError) -> Self {
-        Self::new(csrf_status(&error), error.code())
+    fn from_csrf(error: CsrfError, request_id: String) -> Self {
+        let message = match error {
+            CsrfError::Unauthenticated => "Authentication is required.",
+            CsrfError::Forbidden => "The mutation request could not be authorized.",
+            CsrfError::Capacity | CsrfError::Unavailable => {
+                "The request security service is temporarily unavailable."
+            }
+        };
+        Self::new(csrf_status(&error), error.code(), message, request_id)
     }
 
-    fn from_claim(error: ClaimRouteError) -> Self {
-        Self::new(error.status(), error.code())
+    fn from_claim(error: ClaimRouteError, request_id: String) -> Self {
+        let message = match error {
+            ClaimRouteError::InvalidRequest => "The owner claim request is invalid.",
+            ClaimRouteError::UnsupportedMediaType => "The owner claim content type is unsupported.",
+            ClaimRouteError::Forbidden => "The owner claim request is forbidden.",
+            ClaimRouteError::Enrollment(enrollment) => {
+                return Self::from_enrollment(enrollment, request_id);
+            }
+        };
+        Self::new(error.status(), error.code(), message, request_id)
     }
 
-    fn from_session(error: SessionRouteError) -> Self {
-        Self::new(error.status(), error.code())
+    fn from_session(error: SessionRouteError, request_id: String) -> Self {
+        match error {
+            SessionRouteError::NotFound => Self::new(
+                error.status(),
+                error.code(),
+                "The session resource was not found.",
+                request_id,
+            ),
+            SessionRouteError::Csrf(csrf) => Self::from_csrf(csrf, request_id),
+        }
     }
 }
 
@@ -404,6 +543,12 @@ impl fmt::Debug for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.code })).into_response()
+        let body = ErrorBody {
+            code: self.code,
+            message: self.message,
+            request_id: self.request_id.clone(),
+            details: BTreeMap::new(),
+        };
+        (self.status, [(REQUEST_ID, self.request_id)], Json(body)).into_response()
     }
 }

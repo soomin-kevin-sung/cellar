@@ -156,10 +156,74 @@ async fn migrations_are_versioned_and_safe_under_concurrent_execution() {
             .fetch_all(&first)
             .await
             .expect("read migration versions");
-    assert_eq!(versions, [1, 2, 3]);
+    assert_eq!(versions, [1, 2]);
 
     first.close().await;
     second.close().await;
+}
+
+async fn previous_release_v2_accepts_schema_history(pool: &SqlitePool) -> bool {
+    let installed: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, name, fingerprint
+         FROM cellar_schema_migration ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let known = [
+        (1, "initial", "cellar-0001-initial-v3"),
+        (2, "indexes", "cellar-0002-indexes-v2"),
+    ];
+    installed.len() <= known.len()
+        && installed
+            .iter()
+            .zip(known)
+            .all(|((version, name, fingerprint), expected)| {
+                (*version, name.as_str(), fingerprint.as_str()) == expected
+            })
+}
+
+#[tokio::test]
+async fn expand_only_catalog_extension_remains_openable_by_previous_v2_release() {
+    let (_db, pool) = migrated_db().await;
+    assert!(previous_release_v2_accepts_schema_history(&pool).await);
+    let marker: String = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'file_catalog_epoch'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marker, "cellar-file-catalog-epoch-v1");
+    let epoch_table: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'file_catalog_epoch'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(epoch_table, 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn catalog_extension_marker_tampering_fails_closed_without_new_history_rows() {
+    let (_db, pool) = migrated_db().await;
+    sqlx::query(
+        "UPDATE cellar_schema_extension SET fingerprint = 'tampered'
+         WHERE name = 'file_catalog_epoch'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(migrate(&pool).await, Err(DbError::SchemaVersion)));
+    let versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM cellar_schema_migration ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, [1, 2]);
+    pool.close().await;
 }
 
 #[tokio::test]

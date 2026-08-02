@@ -89,6 +89,27 @@ async fn insert_entry_with_id(
     .unwrap();
 }
 
+async fn insert_entry_with_raw_id(
+    pool: &SqlitePool,
+    raw_id: &str,
+    project_id: ProjectId,
+    exact_name: &str,
+) {
+    sqlx::query(
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size,
+          mtime_filetime_100ns, hash_state, state, revision, scan_generation, observed_at)
+         VALUES (?, ?, ?, 'file', 'windows_file_id', 0, 0, 'unknown',
+                 'unsupported', 1, 0, '2026-07-31T00:00:00Z')",
+    )
+    .bind(raw_id)
+    .bind(project_id.to_string())
+    .bind(exact_name)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn exact_windows_ordering_uses_binary_uuid_tie_breaker_without_gaps() {
     let db = TestDb::new().await;
@@ -300,4 +321,47 @@ async fn malformed_catalog_rows_fail_closed() {
             .await,
         Err(FileRepositoryError::Unavailable)
     );
+}
+
+#[tokio::test]
+async fn noncanonical_raw_uuid_keys_fail_closed_before_cursor_pagination_can_drift() {
+    for raw_id in [
+        FileEntryId::new().to_string().to_uppercase(),
+        FileEntryId::new().to_string().replace('-', ""),
+    ] {
+        let db = TestDb::new().await;
+        let project = insert_project(&db.pool, "active").await;
+        insert_entry_with_raw_id(&db.pool, &raw_id, project, "same").await;
+        insert_entry_with_id(
+            &db.pool,
+            FileEntryId::new(),
+            project,
+            None,
+            "SAME",
+            "file",
+            "unsupported",
+        )
+        .await;
+        let repository = db.repository();
+        let mut request = FileListRequest::first(project, None, 1).unwrap();
+        let mut seen = Vec::new();
+        let terminal = loop {
+            match repository.list(request).await {
+                Err(error) => break error,
+                Ok(page) => {
+                    seen.extend(page.items.iter().map(|entry| entry.id));
+                    let Some(cursor) = page.next_cursor else {
+                        panic!("noncanonical raw key was accepted through the final page");
+                    };
+                    request = FileListRequest::after(cursor, 1).unwrap();
+                }
+            }
+        };
+        assert_eq!(terminal, FileRepositoryError::Unavailable);
+        let unique = seen
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(seen.len(), unique.len(), "pagination duplicated an entry");
+    }
 }

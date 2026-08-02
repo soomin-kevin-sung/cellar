@@ -411,6 +411,41 @@ fn http_request(
     request
 }
 
+fn with_request_id(mut request: Request<Body>, request_id: &str) -> Request<Body> {
+    request.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        request_id.parse().unwrap(),
+    );
+    request
+}
+
+async fn assert_security_error(
+    response: axum::response::Response,
+    status: StatusCode,
+    code: &str,
+    expected_request_id: Option<&str>,
+) {
+    assert_eq!(response.status(), status);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let header_id = response.headers()[HeaderName::from_static("x-request-id")]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    if let Some(expected) = expected_request_id {
+        assert_eq!(header_id, expected);
+    }
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(body["code"], code);
+    assert_eq!(body["requestId"], header_id);
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(body["details"], serde_json::json!({}));
+}
+
 async fn issued_token(app: &axum::Router, claims: AccessClaims) -> String {
     let response = app
         .clone()
@@ -457,30 +492,81 @@ fn add_mutation_headers(request: &mut Request<Body>, token: &str) {
 #[tokio::test]
 async fn http_session_and_mutations_fail_closed_without_auth_or_csrf() {
     let app = enrolled_app();
-    for (method, uri) in [("GET", "/api/v1/session"), ("POST", "/api/v1/files")] {
+    for (index, (method, uri)) in [("GET", "/api/v1/session"), ("POST", "/api/v1/files")]
+        .into_iter()
+        .enumerate()
+    {
+        let request_id = format!("unauthenticated-{index}");
         let response = app
             .clone()
-            .oneshot(http_request(method, uri, None))
+            .oneshot(with_request_id(
+                http_request(method, uri, None),
+                &request_id,
+            ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(
             response
                 .headers()
                 .get("access-control-allow-origin")
                 .is_none()
         );
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&body).unwrap(),
-            serde_json::json!({"error": "missing_authentication"})
-        );
+        assert_security_error(
+            response,
+            StatusCode::UNAUTHORIZED,
+            "missing_authentication",
+            Some(&request_id),
+        )
+        .await;
     }
     let response = app
-        .oneshot(http_request("POST", "/api/v1/files", Some(claims())))
+        .oneshot(with_request_id(
+            http_request("POST", "/api/v1/files", Some(claims())),
+            "missing-csrf",
+        ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_security_error(
+        response,
+        StatusCode::FORBIDDEN,
+        "csrf_forbidden",
+        Some("missing-csrf"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn security_boundary_generates_or_rejects_request_ids_with_one_stable_envelope() {
+    let app = enrolled_app();
+    let generated = app
+        .clone()
+        .oneshot(http_request("GET", "/api/v1/session", None))
+        .await
+        .unwrap();
+    assert_security_error(
+        generated,
+        StatusCode::UNAUTHORIZED,
+        "missing_authentication",
+        None,
+    )
+    .await;
+
+    let mut duplicate = http_request("GET", "/api/v1/session", None);
+    duplicate.headers_mut().append(
+        HeaderName::from_static("x-request-id"),
+        "first".parse().unwrap(),
+    );
+    duplicate.headers_mut().append(
+        HeaderName::from_static("x-request-id"),
+        "second".parse().unwrap(),
+    );
+    assert_security_error(
+        app.oneshot(duplicate).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        "invalid_request_id",
+        None,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -576,13 +662,18 @@ async fn http_safe_methods_require_owner_but_not_csrf_and_emit_no_cors() {
     }
     let mut other = claims();
     other.sub = "other".into();
-    assert_eq!(
-        app.oneshot(http_request("GET", "/api/v1/files", Some(other)))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
+    assert_security_error(
+        app.oneshot(with_request_id(
+            http_request("GET", "/api/v1/files", Some(other)),
+            "wrong-subject",
+        ))
+        .await
+        .unwrap(),
+        StatusCode::FORBIDDEN,
+        "claim_forbidden",
+        Some("wrong-subject"),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -700,15 +791,19 @@ async fn http_capacity_failure_preserves_token_and_expiry_frees_capacity() {
     let first = issued_token(&app, claims()).await;
     let response = app
         .clone()
-        .oneshot(http_request("GET", "/api/v1/session", Some(claims())))
+        .oneshot(with_request_id(
+            http_request("GET", "/api/v1/session", Some(claims())),
+            "csrf-capacity",
+        ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap(),
-        serde_json::json!({"error": "csrf_capacity_exhausted"})
-    );
+    assert_security_error(
+        response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "csrf_capacity_exhausted",
+        Some("csrf-capacity"),
+    )
+    .await;
     let mut mutation = http_request("POST", "/api/v1/files", Some(claims()));
     add_mutation_headers(&mut mutation, &first);
     assert_eq!(

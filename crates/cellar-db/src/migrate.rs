@@ -25,12 +25,21 @@ const MIGRATIONS: &[Migration] = &[
         fingerprint: "cellar-0002-indexes-v2",
         sql: include_str!("../../../migrations/0002_indexes.sql"),
     },
-    Migration {
-        version: 3,
-        name: "file_catalog_epoch",
-        fingerprint: "cellar-0003-file-catalog-epoch-v1",
-        sql: include_str!("../../../migrations/0003_file_catalog_epoch.sql"),
-    },
+];
+
+const FILE_CATALOG_EXTENSION_SQL: &str =
+    include_str!("../../../migrations/expand_file_catalog_epoch.sql");
+const FILE_CATALOG_EXTENSION_FINGERPRINT: &str = "cellar-file-catalog-epoch-v1";
+const FILE_CATALOG_OBJECTS: &[(&str, &str)] = &[
+    ("table", "cellar_schema_extension"),
+    ("table", "file_catalog_epoch"),
+    ("trigger", "file_catalog_epoch_project_insert"),
+    ("trigger", "file_catalog_epoch_file_insert"),
+    ("trigger", "file_catalog_epoch_file_update_same_project"),
+    ("trigger", "file_catalog_epoch_file_update_old_project"),
+    ("trigger", "file_catalog_epoch_file_delete"),
+    ("index", "ix_file_list_root"),
+    ("index", "ix_file_list_child"),
 ];
 
 /// Applies Cellar's expand-only migrations under an exclusive SQLite
@@ -102,6 +111,12 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
         .map_err(DbError::Migration)?;
     }
 
+    sqlx::raw_sql(FILE_CATALOG_EXTENSION_SQL)
+        .execute(&mut **transaction)
+        .await
+        .map_err(DbError::Migration)?;
+    validate_file_catalog_extension(transaction).await?;
+
     let metadata: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM cellar_schema_metadata
          WHERE key IN (?, ?) ORDER BY key",
@@ -115,5 +130,50 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
         return Err(DbError::SchemaVersion);
     }
 
+    Ok(())
+}
+
+async fn validate_file_catalog_extension(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DbError> {
+    let fingerprint: Option<String> = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'file_catalog_epoch'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if fingerprint.as_deref() != Some(FILE_CATALOG_EXTENSION_FINGERPRINT) {
+        return Err(DbError::SchemaVersion);
+    }
+
+    let objects: Vec<(String, String)> = sqlx::query_as(
+        "SELECT type, name FROM sqlite_master
+         WHERE name LIKE 'file_catalog_epoch_%'
+            OR name IN ('cellar_schema_extension', 'file_catalog_epoch',
+                        'ix_file_list_root', 'ix_file_list_child')",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if FILE_CATALOG_OBJECTS.iter().any(|expected| {
+        !objects
+            .iter()
+            .any(|actual| (actual.0.as_str(), actual.1.as_str()) == *expected)
+    }) {
+        return Err(DbError::SchemaVersion);
+    }
+
+    let missing_epochs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project AS p
+         LEFT JOIN file_catalog_epoch AS e ON e.project_id = p.id
+         WHERE e.project_id IS NULL",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if missing_epochs != 0 {
+        return Err(DbError::SchemaVersion);
+    }
     Ok(())
 }

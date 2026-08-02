@@ -182,9 +182,7 @@ async fn directory_path(
                 .as_str()
                 .to_owned(),
         );
-        current = parent_id
-            .map(|value| value.parse().map_err(|_| FileRepositoryError::Unavailable))
-            .transpose()?;
+        current = parent_id.map(parse_canonical_file_id).transpose()?;
     }
     names.reverse();
     let path = names.join("/");
@@ -299,15 +297,11 @@ fn row_to_entry(
     expected_parent: Option<FileEntryId>,
     parent_path: &str,
 ) -> Result<FileEntry, FileRepositoryError> {
-    let id = row
-        .try_get::<String, _>("id")
-        .map_err(map_sql)?
-        .parse()
-        .map_err(|_| FileRepositoryError::Unavailable)?;
+    let id = parse_canonical_file_id(row.try_get::<String, _>("id").map_err(map_sql)?)?;
     let parent_id = row
         .try_get::<Option<String>, _>("parent_id")
         .map_err(map_sql)?
-        .map(|value| value.parse().map_err(|_| FileRepositoryError::Unavailable))
+        .map(parse_canonical_file_id)
         .transpose()?;
     if parent_id != expected_parent {
         return Err(FileRepositoryError::Unavailable);
@@ -389,6 +383,16 @@ fn row_to_entry(
         scan_generation,
         observed_at,
     })
+}
+
+fn parse_canonical_file_id(value: String) -> Result<FileEntryId, FileRepositoryError> {
+    let parsed = value
+        .parse::<FileEntryId>()
+        .map_err(|_| FileRepositoryError::Unavailable)?;
+    if parsed.to_string() != value {
+        return Err(FileRepositoryError::Unavailable);
+    }
+    Ok(parsed)
 }
 
 fn map_sql(_: sqlx::Error) -> FileRepositoryError {

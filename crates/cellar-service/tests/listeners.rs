@@ -222,6 +222,46 @@ async fn production_origin_composes_authentication_and_session_without_health() 
 }
 
 #[tokio::test]
+async fn production_origin_auth_failures_use_the_shared_request_envelope() {
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("config.toml");
+    enrolled_config(&config_path);
+    let origin = origin_router_with_authenticator(
+        &config_path,
+        std::sync::Arc::new(AllowOwner),
+        Readiness::new([]),
+        Shutdown::new(),
+    );
+    let response = origin
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/session")
+                .header("x-request-id", "production-auth-request")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "production-auth-request"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "code": "missing_access_token",
+            "message": "Authentication could not be completed.",
+            "requestId": "production-auth-request",
+            "details": {}
+        })
+    );
+}
+
+#[tokio::test]
 async fn shutdown_rejects_new_unsafe_origin_requests_but_allows_safe_drain() {
     let directory = tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
