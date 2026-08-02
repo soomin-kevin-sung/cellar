@@ -99,6 +99,33 @@ mod windows {
     }
 
     #[test]
+    fn download_handle_blocks_writers_and_delete_sharing_until_drop() {
+        let directory = tempdir().unwrap();
+        let storage = adopted_storage(directory.path());
+        fs::write(directory.path().join("payload.bin"), b"abcdef").unwrap();
+        let handle = storage
+            .open_download_verified(storage.root(), &name("payload.bin"))
+            .unwrap();
+        let metadata = storage.download_metadata(&handle).unwrap();
+        assert_eq!(metadata.length, 6);
+        assert_eq!(storage.read_download_exact(&handle, 1, 3).unwrap(), b"bcd");
+
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(directory.path().join("payload.bin"));
+        assert!(writer.is_err());
+        drop(handle);
+        assert!(
+            fs::OpenOptions::new()
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(directory.path().join("payload.bin"))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn rename_no_replace_preserves_both_files_on_conflict() {
         let directory = tempdir().unwrap();
         let storage = adopted_storage(directory.path());

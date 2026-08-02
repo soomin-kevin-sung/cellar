@@ -67,6 +67,13 @@ mod platform {
         root_volume: u64,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct VerifiedFileMetadata {
+        pub identity: FileIdentity,
+        pub length: u64,
+        pub mtime_filetime_100ns: i64,
+    }
+
     impl WindowsStorage {
         pub fn adopt(identity: StorageIdentity<TrustedRootHandle>) -> Result<Self, StorageError> {
             let (preflight_coordinates, trusted_root) = identity.into_parts();
@@ -117,6 +124,53 @@ mod platform {
                 OpenMode::ExistingWritable,
             )?;
             self.verify_new_handle(file)
+        }
+
+        pub fn open_download_verified(
+            &self,
+            parent: &VerifiedHandle,
+            name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            self.verify_parent(parent)?;
+            let file = open_relative(
+                parent.file.as_raw_handle(),
+                name,
+                OpenMode::DownloadExisting,
+            )?;
+            let handle = self.verify_new_handle(file)?;
+            if handle.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            Ok(handle)
+        }
+
+        pub fn download_metadata(
+            &self,
+            handle: &VerifiedHandle,
+        ) -> Result<VerifiedFileMetadata, StorageError> {
+            let facts = self.verify_existing(handle)?;
+            if facts.kind != EntryKind::File {
+                return Err(unsupported());
+            }
+            Ok(VerifiedFileMetadata {
+                identity: facts.identity,
+                length: facts.length,
+                mtime_filetime_100ns: facts.mtime_filetime_100ns,
+            })
+        }
+
+        pub fn read_download_exact(
+            &self,
+            handle: &VerifiedHandle,
+            offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.download_metadata(handle)?;
+            let mut file = handle.file.try_clone().map_err(map_io)?;
+            file.seek(SeekFrom::Start(offset)).map_err(map_io)?;
+            let mut bytes = vec![0_u8; length];
+            file.read_exact(&mut bytes).map_err(map_io)?;
+            Ok(bytes)
         }
 
         pub fn create_file_no_replace(
@@ -348,6 +402,8 @@ mod platform {
         hard_linked: bool,
         case_sensitive: bool,
         final_path: PathBuf,
+        length: u64,
+        mtime_filetime_100ns: i64,
     }
 
     pub(super) fn reject_unsupported_characteristics(
@@ -436,6 +492,13 @@ mod platform {
             hard_linked: kind == EntryKind::File && information.nNumberOfLinks > 1,
             case_sensitive,
             final_path: final_path(file)?,
+            length: u64::from(information.nFileSizeHigh) << 32
+                | u64::from(information.nFileSizeLow),
+            mtime_filetime_100ns: i64::try_from(
+                u64::from(information.ftLastWriteTime.dwHighDateTime) << 32
+                    | u64::from(information.ftLastWriteTime.dwLowDateTime),
+            )
+            .map_err(|_| io_error())?,
         })
     }
 
@@ -511,9 +574,11 @@ mod platform {
         value
     }
 
+    #[derive(Clone, Copy)]
     enum OpenMode {
         Existing,
         ExistingWritable,
+        DownloadExisting,
         CreateFile,
         CreateExclusiveFile,
         CreateDirectory,
@@ -616,6 +681,12 @@ mod platform {
                 FILE_OPEN,
                 0,
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ,
+            ),
+            OpenMode::DownloadExisting => (
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE,
+                FILE_GENERIC_READ,
                 FILE_SHARE_READ,
             ),
             OpenMode::CreateFile => (
@@ -747,7 +818,7 @@ mod platform {
 }
 
 #[cfg(windows)]
-pub use platform::{VerifiedHandle, WindowsStorage};
+pub use platform::{VerifiedFileMetadata, VerifiedHandle, WindowsStorage};
 
 #[cfg(not(windows))]
 mod platform_stub {
@@ -776,6 +847,13 @@ mod platform_stub {
         _private: (),
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct VerifiedFileMetadata {
+        pub identity: FileIdentity,
+        pub length: u64,
+        pub mtime_filetime_100ns: i64,
+    }
+
     impl WindowsStorage {
         pub fn adopt(_identity: StorageIdentity<TrustedRootHandle>) -> Result<Self, StorageError> {
             Err(StorageError::new(StorageErrorKind::Unsupported))
@@ -790,6 +868,30 @@ mod platform_stub {
             _parent: &VerifiedHandle,
             _name: &WindowsName,
         ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn open_download_verified(
+            &self,
+            _parent: &VerifiedHandle,
+            _name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn download_metadata(
+            &self,
+            _handle: &VerifiedHandle,
+        ) -> Result<VerifiedFileMetadata, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn read_download_exact(
+            &self,
+            _handle: &VerifiedHandle,
+            _offset: u64,
+            _length: usize,
+        ) -> Result<Vec<u8>, StorageError> {
             Err(unsupported())
         }
 
@@ -878,7 +980,7 @@ mod platform_stub {
 }
 
 #[cfg(not(windows))]
-pub use platform_stub::{VerifiedHandle, WindowsStorage};
+pub use platform_stub::{VerifiedFileMetadata, VerifiedHandle, WindowsStorage};
 
 async fn dispatch_blocking<T>(
     operation: impl FnOnce() -> Result<T, StorageError> + Send + 'static,

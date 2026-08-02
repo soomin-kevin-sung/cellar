@@ -6,6 +6,6 @@ pub mod service;
 mod upload_staging;
 
 pub use cellar_storage::{StorageError, StorageErrorKind};
-pub use handles::{VerifiedHandle, WindowsStorage};
+pub use handles::{VerifiedFileMetadata, VerifiedHandle, WindowsStorage};
 pub use names::{WindowsName, WindowsNameError};
 pub use upload_staging::WindowsUploadStaging;

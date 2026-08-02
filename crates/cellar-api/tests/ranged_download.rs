@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderName, Method, Request, StatusCode, header};
 use cellar_api::routes::files::{
-    DownloadError, DownloadMetadata, DownloadSource, DownloadSpan, VerifiedDownload,
-    files_router_with_downloads,
+    DOWNLOAD_CHUNK_BYTES, DownloadError, DownloadMetadata, DownloadReadError, DownloadSource,
+    DownloadSpan, VerifiedDownload, files_router_with_downloads,
 };
 use cellar_api::routes::session::session_router_with_routes;
 use cellar_auth::{
@@ -116,10 +117,103 @@ impl VerifiedDownload for MemoryDownload {
         self.verify_error.map_or(Ok(()), Err)
     }
 
-    fn into_body(self: Box<Self>, span: DownloadSpan) -> Body {
+    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError> {
         let start = span.start() as usize;
         let end = start + span.length() as usize;
-        Body::from(self.bytes[start..end].to_vec())
+        Ok(self.bytes[start..end].to_vec())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProbeBehavior {
+    Normal,
+    ShortFirst,
+    ErrorAfterFirst,
+}
+
+#[derive(Clone)]
+struct ProbeSource {
+    bytes: Arc<Vec<u8>>,
+    behavior: ProbeBehavior,
+    opens: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
+    max_request: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl ProbeSource {
+    fn new(bytes: Vec<u8>, behavior: ProbeBehavior) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            behavior,
+            opens: Arc::new(AtomicUsize::new(0)),
+            reads: Arc::new(AtomicUsize::new(0)),
+            max_request: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl DownloadSource for ProbeSource {
+    async fn open_verified(
+        &self,
+        _: ProjectId,
+        _: FileEntryId,
+    ) -> Result<Box<dyn VerifiedDownload>, DownloadError> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(ProbeDownload {
+            metadata: DownloadMetadata::new("large.bin", self.bytes.len() as u64, None).unwrap(),
+            bytes: Arc::clone(&self.bytes),
+            behavior: self.behavior,
+            local_reads: 0,
+            reads: Arc::clone(&self.reads),
+            max_request: Arc::clone(&self.max_request),
+            drops: Arc::clone(&self.drops),
+        }))
+    }
+}
+
+struct ProbeDownload {
+    metadata: DownloadMetadata,
+    bytes: Arc<Vec<u8>>,
+    behavior: ProbeBehavior,
+    local_reads: usize,
+    reads: Arc<AtomicUsize>,
+    max_request: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for ProbeDownload {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl VerifiedDownload for ProbeDownload {
+    fn metadata(&self) -> &DownloadMetadata {
+        &self.metadata
+    }
+
+    async fn verify(&self) -> Result<(), DownloadError> {
+        Ok(())
+    }
+
+    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.max_request
+            .fetch_max(span.length() as usize, Ordering::SeqCst);
+        if matches!(self.behavior, ProbeBehavior::ErrorAfterFirst) && self.local_reads > 0 {
+            return Err(DownloadReadError::Io);
+        }
+        self.local_reads += 1;
+        let start = span.start() as usize;
+        let mut end = start + span.length() as usize;
+        if matches!(self.behavior, ProbeBehavior::ShortFirst) && self.local_reads == 1 {
+            end -= 1;
+        }
+        Ok(self.bytes[start..end].to_vec())
     }
 }
 
@@ -136,7 +230,7 @@ fn claims() -> AccessClaims {
     }
 }
 
-fn app(source: MemorySource) -> axum::Router {
+fn app(source: impl DownloadSource + 'static) -> axum::Router {
     let service = FileService::new(Arc::new(EmptyRepository));
     let protected = files_router_with_downloads::<EnrolledStore>(service, Arc::new(source));
     session_router_with_routes(
@@ -504,6 +598,170 @@ async fn strong_etag_and_download_headers_are_safe_and_only_present_when_hash_is
         .unwrap();
     assert_eq!(no_hash.status(), StatusCode::OK);
     assert!(no_hash.headers().get(header::ETAG).is_none());
+}
+
+#[tokio::test]
+async fn large_download_is_pull_based_bounded_and_disconnect_releases_handle() {
+    let project = ProjectId::new();
+    let file = FileEntryId::new();
+    let content = vec![0x5a; DOWNLOAD_CHUNK_BYTES * 3 + 17];
+    let source = ProbeSource::new(content.clone(), ProbeBehavior::Normal);
+    let response = app(source.clone())
+        .oneshot(download_request(
+            project,
+            file,
+            Method::GET,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+    let mut body = response.into_body();
+    let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert_eq!(first.len(), DOWNLOAD_CHUNK_BYTES);
+    assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        source.max_request.load(Ordering::SeqCst),
+        DOWNLOAD_CHUNK_BYTES
+    );
+    drop(body);
+    assert_eq!(source.drops.load(Ordering::SeqCst), 1);
+
+    let complete_source = ProbeSource::new(content.clone(), ProbeBehavior::Normal);
+    let complete = app(complete_source.clone())
+        .oneshot(download_request(
+            project,
+            file,
+            Method::GET,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bytes(complete).await, content);
+    assert_eq!(complete_source.reads.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        complete_source.max_request.load(Ordering::SeqCst),
+        DOWNLOAD_CHUNK_BYTES
+    );
+    assert_eq!(complete_source.drops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn short_reads_and_mid_stream_errors_are_propagated() {
+    let project = ProjectId::new();
+    let file = FileEntryId::new();
+    for behavior in [ProbeBehavior::ShortFirst, ProbeBehavior::ErrorAfterFirst] {
+        let source = ProbeSource::new(vec![0x5a; DOWNLOAD_CHUNK_BYTES * 2], behavior);
+        let response = app(source.clone())
+            .oneshot(download_request(
+                project,
+                file,
+                Method::GET,
+                None,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert!(response.into_body().collect().await.is_err());
+        assert_eq!(source.drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn ninth_open_is_rejected_and_head_never_holds_a_streaming_permit() {
+    let project = ProjectId::new();
+    let file = FileEntryId::new();
+    let source = ProbeSource::new(vec![0x5a; DOWNLOAD_CHUNK_BYTES], ProbeBehavior::Normal);
+    let router = app(source.clone());
+    let mut open = Vec::new();
+    for _ in 0..8 {
+        let response = router
+            .clone()
+            .oneshot(download_request(
+                project,
+                file,
+                Method::GET,
+                None,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        open.push(response);
+    }
+    assert_eq!(source.opens.load(Ordering::SeqCst), 8);
+    let ninth = router
+        .clone()
+        .oneshot(download_request(
+            project,
+            file,
+            Method::GET,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ninth.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(ninth.headers()[header::RETRY_AFTER], "1");
+    assert_eq!(json(ninth).await["code"], "download_capacity_exhausted");
+    assert_eq!(source.opens.load(Ordering::SeqCst), 8);
+
+    let saturated_head = router
+        .clone()
+        .oneshot(download_request(
+            project,
+            file,
+            Method::HEAD,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saturated_head.status(), StatusCode::OK);
+    assert!(bytes(saturated_head).await.is_empty());
+    assert_eq!(source.opens.load(Ordering::SeqCst), 9);
+
+    drop(open.pop());
+    let replacement = router
+        .clone()
+        .oneshot(download_request(
+            project,
+            file,
+            Method::GET,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), StatusCode::OK);
+    drop(replacement);
+    drop(open);
+
+    for _ in 0..16 {
+        let head = router
+            .clone()
+            .oneshot(download_request(
+                project,
+                file,
+                Method::HEAD,
+                None,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert!(bytes(head).await.is_empty());
+    }
 }
 
 #[tokio::test]

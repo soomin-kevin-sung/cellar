@@ -16,9 +16,9 @@ use axum::response::{IntoResponse, Response};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use cellar_api::health::{Readiness, health_router};
+use cellar_api::routes::files::{DownloadSource, files_router_with_downloads};
 use cellar_api::routes::session::{
-    RequestId, prepare_request_id, session_router, session_router_with_routes,
-    shared_error_response,
+    RequestId, SessionState, prepare_request_id, session_router_with_routes, shared_error_response,
 };
 use cellar_api::uploads_router;
 use cellar_auth::{
@@ -27,7 +27,7 @@ use cellar_auth::{
     select_access_jwt_header,
 };
 use cellar_config::CellarConfig;
-use cellar_core::{ReadinessBlocker, UploadLimits, UploadService, UploadStagingStore};
+use cellar_core::{FileService, ReadinessBlocker, UploadLimits, UploadService, UploadStagingStore};
 use cellar_db::{FilenameCollation, SqliteUploadRepository};
 use cellar_windows::service::{NORMAL_STOP_TARGET, PRESHUTDOWN_BUDGET, ServiceControl};
 use cellar_windows::{WindowsStorage, WindowsUploadStaging};
@@ -37,6 +37,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::watch;
 use tokio_util::io::StreamReader;
 
+use crate::downloads::{
+    BoundedReconciliationScheduler, DEFAULT_RECONCILIATION_QUEUE_CAPACITY,
+    ProductionDownloadSource, SqliteDownloadCatalog, WindowsDownloadPlatform,
+};
 use crate::tls::{OriginTlsPaths, TlsMaterial, ensure_origin_tls};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -244,6 +248,22 @@ pub fn origin_router_with_authenticator(
     readiness: Readiness,
     shutdown: Shutdown,
 ) -> Router {
+    origin_router_with_authenticator_and_routes(
+        config_path,
+        authenticator,
+        readiness,
+        shutdown,
+        Router::new(),
+    )
+}
+
+fn origin_router_with_authenticator_and_routes(
+    config_path: &std::path::Path,
+    authenticator: Arc<dyn OriginAuthenticator>,
+    readiness: Readiness,
+    shutdown: Shutdown,
+    protected_routes: Router<SessionState<FileEnrollmentStore>>,
+) -> Router {
     let store = Arc::new(FileEnrollmentStore::new(config_path));
     let enrollment = EnrollmentService::new(Arc::clone(&store));
     let auth_state = Arc::new(OriginAuthState {
@@ -251,9 +271,14 @@ pub fn origin_router_with_authenticator(
         config_path: config_path.to_path_buf(),
         readiness,
     });
-    session_router(enrollment, Arc::new(CsrfManager::new()), unix_now)
-        .layer(from_fn_with_state(shutdown, mutation_shutdown_boundary))
-        .layer(from_fn_with_state(auth_state, access_boundary))
+    session_router_with_routes(
+        enrollment,
+        Arc::new(CsrfManager::new()),
+        unix_now,
+        protected_routes,
+    )
+    .layer(from_fn_with_state(shutdown, mutation_shutdown_boundary))
+    .layer(from_fn_with_state(auth_state, access_boundary))
 }
 
 pub fn origin_router_with_authenticator_and_uploads(
@@ -263,22 +288,38 @@ pub fn origin_router_with_authenticator_and_uploads(
     shutdown: Shutdown,
     upload_service: UploadService,
 ) -> Router {
-    let store = Arc::new(FileEnrollmentStore::new(config_path));
-    let enrollment = EnrollmentService::new(Arc::clone(&store));
-    let auth_state = Arc::new(OriginAuthState {
+    origin_router_with_authenticator_and_routes(
+        config_path,
         authenticator,
-        config_path: config_path.to_path_buf(),
         readiness,
-    });
-    let protected = uploads_router::<FileEnrollmentStore>(upload_service);
-    session_router_with_routes(
-        enrollment,
-        Arc::new(CsrfManager::new()),
-        unix_now,
+        shutdown,
+        uploads_router::<FileEnrollmentStore>(upload_service),
+    )
+}
+
+pub fn origin_router_with_authenticator_and_services(
+    config_path: &std::path::Path,
+    authenticator: Arc<dyn OriginAuthenticator>,
+    readiness: Readiness,
+    shutdown: Shutdown,
+    upload_service: UploadService,
+    file_service: FileService,
+    download_source: Arc<dyn DownloadSource>,
+) -> Router {
+    let protected =
+        uploads_router::<FileEnrollmentStore>(upload_service).merge(files_router_with_downloads::<
+            FileEnrollmentStore,
+        >(
+            file_service,
+            download_source,
+        ));
+    origin_router_with_authenticator_and_routes(
+        config_path,
+        authenticator,
+        readiness,
+        shutdown,
         protected,
     )
-    .layer(from_fn_with_state(shutdown, mutation_shutdown_boundary))
-    .layer(from_fn_with_state(auth_state, access_boundary))
 }
 
 fn unix_now() -> i64 {
@@ -546,8 +587,9 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
     let identity = cellar_windows::preflight::open_as_service(&options.config.storage_root)
         .map_err(|_| AppError::StoragePreflight)?;
     let storage = WindowsStorage::adopt(identity).map_err(|_| AppError::StoragePreflight)?;
-    let staging =
-        Arc::new(WindowsUploadStaging::open(storage).map_err(|_| AppError::StoragePreflight)?);
+    let staging = Arc::new(
+        WindowsUploadStaging::open(storage.clone()).map_err(|_| AppError::StoragePreflight)?,
+    );
     readiness.clear(ReadinessBlocker::StorageUnavailable);
 
     let database_directory = options.database_path.parent().ok_or(AppError::Database)?;
@@ -594,12 +636,29 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         )
         .map_err(|_| AppError::Tls)?;
     let rustls = RustlsConfig::from_config(Arc::new(server_config));
-    let origin = origin_router_with_authenticator_and_uploads(
+    let file_service =
+        FileService::new(Arc::new(cellar_db::SqliteFileRepository::new(pool.clone())));
+    let (reconciliation_scheduler, mut reconciliation_requests) =
+        BoundedReconciliationScheduler::channel(DEFAULT_RECONCILIATION_QUEUE_CAPACITY);
+    let reconciliation_readiness = readiness.clone();
+    let reconciliation_task = tokio::spawn(async move {
+        while reconciliation_requests.recv().await.is_some() {
+            reconciliation_readiness.block(ReadinessBlocker::ReconciliationRequired);
+        }
+    });
+    let download_source = Arc::new(ProductionDownloadSource::new(
+        Arc::new(SqliteDownloadCatalog::new(pool.clone())),
+        Arc::new(WindowsDownloadPlatform::new(storage)),
+        reconciliation_scheduler,
+    ));
+    let origin = origin_router_with_authenticator_and_services(
         &options.config_path,
         production_authenticator(&options.config)?,
         readiness.clone(),
         options.shutdown.clone(),
         upload_service,
+        file_service,
+        download_source,
     );
     let result = serve_bound(
         listeners,
@@ -610,6 +669,8 @@ pub async fn run(mut options: RunOptions) -> Result<(), AppError> {
         options.shutdown,
     )
     .await;
+    reconciliation_task.abort();
+    let _ = reconciliation_task.await;
     pool.close().await;
     result.map_err(|_| AppError::Listener)
 }

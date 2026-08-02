@@ -17,15 +17,19 @@ use cellar_core::{
     FileRepositoryError, FileService, MAX_FILE_LIST_LIMIT, OperationId, ProjectId,
 };
 use cellar_storage::{RangeDecision, decide_range};
+use futures_util::stream::try_unfold;
 use serde::{Deserialize, Serialize};
 use time::UtcOffset;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::session::SessionState;
 
 pub const MAX_FILE_CURSOR_BYTES: usize = 4 * 1024;
 pub const MAX_FILE_QUERY_BYTES: usize = 8 * 1024;
 pub const FILE_CURSOR_VERSION: u8 = 1;
+pub const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_OPEN_DOWNLOADS: usize = 8;
 
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -34,6 +38,7 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 struct FilesState {
     service: FileService,
     downloads: Arc<dyn DownloadSource>,
+    download_permits: Arc<Semaphore>,
 }
 
 pub fn files_router<S>(service: FileService) -> Router<SessionState<S>>
@@ -75,7 +80,11 @@ where
             "/api/v1/projects/{project_id}/files/{file_id}/{action}/{*rest}",
             any(invalid_file_path),
         )
-        .layer(Extension(FilesState { service, downloads }))
+        .layer(Extension(FilesState {
+            service,
+            downloads,
+            download_permits: Arc::new(Semaphore::new(MAX_OPEN_DOWNLOADS)),
+        }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +110,21 @@ impl DownloadMetadata {
             ready_sha256,
         })
     }
+
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    #[must_use]
+    pub const fn length(&self) -> u64 {
+        self.length
+    }
+
+    #[must_use]
+    pub const fn ready_sha256(&self) -> Option<[u8; 32]> {
+        self.ready_sha256
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +145,16 @@ pub struct DownloadSpan {
 }
 
 impl DownloadSpan {
+    pub fn new(start: u64, length: u64) -> Result<Self, DownloadMetadataError> {
+        if start
+            .checked_add(length)
+            .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(DownloadMetadataError);
+        }
+        Ok(Self { start, length })
+    }
+
     #[must_use]
     pub const fn start(self) -> u64 {
         self.start
@@ -140,8 +174,26 @@ pub enum DownloadError {
     Settling,
     Unsupported,
     IdentityChanged,
+    Saturated,
     Unavailable,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadReadError {
+    Io,
+    UnexpectedEof,
+}
+
+impl fmt::Display for DownloadReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Io => "download_read_failed",
+            Self::UnexpectedEof => "download_short_read",
+        })
+    }
+}
+
+impl std::error::Error for DownloadReadError {}
 
 /// An opened download whose metadata, verification, and body all refer to the
 /// same stable filesystem handle.
@@ -151,7 +203,9 @@ pub trait VerifiedDownload: Send {
 
     async fn verify(&self) -> Result<(), DownloadError>;
 
-    fn into_body(self: Box<Self>, span: DownloadSpan) -> Body;
+    /// Pulls exactly the requested bounded chunk from this same verified
+    /// handle. Returning fewer or more bytes is treated as a stream failure.
+    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError>;
 }
 
 #[async_trait]
@@ -239,6 +293,19 @@ async fn download_file(
 ) -> Result<Response, FileApiError> {
     let request_id = request_id(request.headers())?;
     let (project_id, file_id) = parse_download_path(request.uri().path(), &request_id)?;
+    let permit = if request.method() == Method::HEAD {
+        None
+    } else {
+        Some(
+            state
+                .download_permits
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    FileApiError::download(DownloadError::Saturated, request_id.clone())
+                })?,
+        )
+    };
     let download = state
         .downloads
         .open_verified(project_id, file_id)
@@ -309,9 +376,56 @@ async fn download_file(
     let body = if request.method() == Method::HEAD {
         Body::empty()
     } else {
-        download.into_body(span)
+        download_body(
+            download,
+            span,
+            permit.ok_or_else(|| FileApiError::unavailable(request_id.clone()))?,
+        )
     };
     Ok((status, headers, body).into_response())
+}
+
+struct DownloadBodyState {
+    download: Box<dyn VerifiedDownload>,
+    offset: u64,
+    remaining: u64,
+    _permit: OwnedSemaphorePermit,
+}
+
+fn download_body(
+    download: Box<dyn VerifiedDownload>,
+    span: DownloadSpan,
+    permit: OwnedSemaphorePermit,
+) -> Body {
+    let stream = try_unfold(
+        DownloadBodyState {
+            download,
+            offset: span.start,
+            remaining: span.length,
+            _permit: permit,
+        },
+        |mut state| async move {
+            if state.remaining == 0 {
+                return Ok(None);
+            }
+            let length = state.remaining.min(DOWNLOAD_CHUNK_BYTES as u64);
+            let span = DownloadSpan {
+                start: state.offset,
+                length,
+            };
+            let bytes = state.download.read_exact_chunk(span).await?;
+            if bytes.len() != length as usize {
+                return Err(DownloadReadError::UnexpectedEof);
+            }
+            state.offset = state
+                .offset
+                .checked_add(length)
+                .ok_or(DownloadReadError::Io)?;
+            state.remaining -= length;
+            Ok(Some((bytes, state)))
+        },
+    );
+    Body::from_stream(stream)
 }
 
 enum HeaderField {
@@ -708,6 +822,7 @@ pub struct FileApiError {
     message: &'static str,
     request_id: String,
     content_range: Option<String>,
+    retry_after: bool,
 }
 
 impl FileApiError {
@@ -718,6 +833,7 @@ impl FileApiError {
             message: "The file listing request is invalid.",
             request_id,
             content_range: None,
+            retry_after: false,
         }
     }
 
@@ -751,6 +867,7 @@ impl FileApiError {
             message,
             request_id,
             content_range: None,
+            retry_after: false,
         }
     }
 
@@ -765,6 +882,7 @@ impl FileApiError {
             message: "The request method is not allowed for this file resource.",
             request_id,
             content_range: None,
+            retry_after: false,
         }
     }
 
@@ -800,6 +918,11 @@ impl FileApiError {
                 "file_identity_changed",
                 "The file changed before the download could start.",
             ),
+            DownloadError::Saturated => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "download_capacity_exhausted",
+                "Too many downloads are already open.",
+            ),
             DownloadError::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "file_storage_unavailable",
@@ -812,6 +935,7 @@ impl FileApiError {
             message,
             request_id,
             content_range: None,
+            retry_after: error == DownloadError::Saturated,
         }
     }
 
@@ -822,6 +946,7 @@ impl FileApiError {
             message: "The requested byte range cannot be satisfied.",
             request_id,
             content_range: Some(format!("bytes */{len}")),
+            retry_after: false,
         }
     }
 }
@@ -851,6 +976,11 @@ impl IntoResponse for FileApiError {
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
         );
+        if self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
         response.headers_mut().insert(
             HeaderName::from_static("x-content-type-options"),
             HeaderValue::from_static("nosniff"),
@@ -886,5 +1016,6 @@ mod tests {
             assert!(parse_limit(invalid, "request").is_err());
         }
         assert!(decode_cursor(&(encoded + "="), "request").is_err());
+        assert!(DownloadSpan::new(i64::MAX as u64, 1).is_err());
     }
 }
