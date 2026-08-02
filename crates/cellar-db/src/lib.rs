@@ -2,6 +2,7 @@ mod file_repo;
 mod migrate;
 mod pool;
 mod project_repo;
+mod upload_repo;
 
 use thiserror::Error;
 
@@ -12,6 +13,7 @@ pub use project_repo::{
     MAX_PROJECT_CREATE_PAYLOAD_BYTES, RecoveredProjectCreate, SqliteProjectRepository,
     decode_project_create_payload,
 };
+pub use upload_repo::SqliteUploadRepository;
 
 /// Stable, client-safe database failure categories.
 ///

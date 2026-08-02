@@ -3,6 +3,7 @@ mod file_entry;
 mod ids;
 pub mod ports;
 mod project;
+mod upload;
 
 pub use error::{CellarError, ReadinessBlocker};
 pub use file_entry::{
@@ -18,4 +19,10 @@ pub use project::{
     ProjectDescription, ProjectDirectoryStore, ProjectListFilter, ProjectName, ProjectPatch,
     ProjectRepository, ProjectRepositoryError, ProjectService, ProjectServiceError, ProjectStatus,
     ProjectValidationError,
+};
+pub use upload::{
+    DEFAULT_FREE_SPACE_RESERVE, DEFAULT_MAX_ACTIVE_SESSIONS, DEFAULT_MAX_CHUNK_SIZE,
+    DEFAULT_MAX_CONCURRENT_UPLOADS, DEFAULT_UPLOAD_TTL_DAYS, MAX_UPLOAD_NAME_BYTES, NewUpload,
+    PendingChunk, UploadLimits, UploadRepository, UploadRepositoryError, UploadService,
+    UploadServiceError, UploadSession, UploadStagingError, UploadStagingStore, UploadState,
 };
