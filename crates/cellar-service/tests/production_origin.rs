@@ -4,23 +4,24 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode, header};
 use cellar_api::health::Readiness;
 use cellar_api::routes::files::DownloadSource as _;
 use cellar_auth::{AccessClaims, OwnerMode};
 use cellar_config::{CellarConfig, PersistedConfig, save_config};
-use cellar_core::{FileEntryId, FileService, ProjectId, ReadinessBlocker};
+use cellar_core::{FileService, NewUpload, ProjectId, ReadinessBlocker};
 use cellar_db::{FilenameCollation, SqliteFileRepository};
 use cellar_service::app::{
-    OriginAuthenticator, Shutdown, initialize_upload_recovery,
-    origin_router_with_authenticator_and_services,
+    OriginAuthenticator, Shutdown, origin_router_with_authenticator_and_services,
 };
 use cellar_service::downloads::{
     ProductionDownloadSource, ReconciliationRequest, ReconciliationScheduler,
     SqliteDownloadCatalog, WindowsDownloadPlatform,
 };
-use cellar_windows::{WindowsName, WindowsStorage, WindowsUploadStaging};
+use cellar_service::recovery::initialize_upload_finalization_recovery;
+use cellar_windows::{WindowsStorage, WindowsUploadStaging};
 use http_body_util::BodyExt as _;
+use sha2::{Digest as _, Sha256};
 use tempfile::tempdir;
 use time::OffsetDateTime;
 use tower::ServiceExt as _;
@@ -77,14 +78,11 @@ async fn production_origin_shares_one_trusted_root_between_uploads_and_downloads
     let database_path = directory.path().join("cellar.db");
     let config_path = directory.path().join("config.toml");
     let project_id = ProjectId::new();
-    let file_id = FileEntryId::new();
-    let payload_path = storage_root
+    let files = storage_root
         .join("projects")
         .join(project_id.to_string())
-        .join("files")
-        .join("payload.bin");
-    std::fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
-    std::fs::write(&payload_path, b"abcdef").unwrap();
+        .join("files");
+    std::fs::create_dir_all(&files).unwrap();
 
     save_config(
         &config_path,
@@ -126,47 +124,34 @@ async fn production_origin_shares_one_trusted_root_between_uploads_and_downloads
     .await
     .unwrap();
 
-    let mut parent = storage.root().clone();
-    for component in ["projects", project_id.to_string().as_str(), "files"] {
-        parent = storage
-            .open_verified(&parent, &WindowsName::parse(component).unwrap())
-            .unwrap();
-    }
-    let payload = storage
-        .open_download_verified(&parent, &WindowsName::parse("payload.bin").unwrap())
-        .unwrap();
-    let metadata = storage.download_metadata(&payload).unwrap();
-    assert!(
-        metadata.mtime_filetime_100ns >= 0,
-        "download metadata must fit the catalog's signed FILETIME: {metadata:?}"
-    );
-    drop(payload);
-    drop(parent);
-    sqlx::query(
-        "INSERT INTO file_entry
-         (id, project_id, parent_id, exact_name, kind, platform_kind,
-          volume_serial, filesystem_file_id, size, mtime_filetime_100ns,
-          hash, hash_state, state, revision, scan_generation, observed_at)
-         VALUES (?, ?, NULL, 'payload.bin', 'file', 'windows_file_id', ?, ?,
-                 ?, ?, NULL, 'computing', 'live', 1, 1,
-                 '2026-08-02T00:00:00Z')",
-    )
-    .bind(file_id.to_string())
-    .bind(project_id.to_string())
-    .bind(metadata.identity.volume_serial.to_le_bytes().as_slice())
-    .bind(metadata.identity.file_id.to_le_bytes().as_slice())
-    .bind(i64::try_from(metadata.length).unwrap())
-    .bind(metadata.mtime_filetime_100ns)
-    .execute(&pool)
-    .await
-    .unwrap();
-
     let readiness = Readiness::new([ReadinessBlocker::RecoveryRequired]);
+    let now = OffsetDateTime::now_utc();
     let upload_service =
-        initialize_upload_recovery(&pool, staging, &readiness, OffsetDateTime::now_utc())
+        initialize_upload_finalization_recovery(&pool, staging.clone(), staging, &readiness, now)
             .await
             .unwrap();
     assert!(!readiness.blocker_codes().contains(&"recovery_required"));
+    let payload = b"abcdef";
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    let upload = upload_service
+        .create(
+            NewUpload {
+                project_id,
+                destination_parent_id: None,
+                destination_name: "payload.bin".into(),
+                expected_size: i64::try_from(payload.len()).unwrap(),
+                expected_hash: Some(digest),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    upload_service
+        .put_chunk(upload.id, 0, payload, digest, now)
+        .await
+        .unwrap();
+    let finalized = upload_service.finalize(upload.id, now).await.unwrap();
+    assert_eq!(std::fs::read(files.join("payload.bin")).unwrap(), payload);
 
     let file_service = FileService::new(Arc::new(SqliteFileRepository::new(pool.clone())));
     let download_source = Arc::new(ProductionDownloadSource::new(
@@ -175,7 +160,7 @@ async fn production_origin_shares_one_trusted_root_between_uploads_and_downloads
         Arc::new(NoopScheduler),
     ));
     let direct = download_source
-        .open_verified(project_id, file_id)
+        .open_verified(project_id, finalized.id)
         .await
         .expect("production download source opens from the shared trusted root");
     direct
@@ -192,19 +177,27 @@ async fn production_origin_shares_one_trusted_root_between_uploads_and_downloads
         download_source,
     );
 
-    let download = app
-        .clone()
-        .oneshot(authenticated(
-            Method::GET,
-            format!("/api/v1/projects/{project_id}/files/{file_id}/download"),
-            Body::empty(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(download.status(), StatusCode::OK);
+    let mut ranged = authenticated(
+        Method::GET,
+        format!(
+            "/api/v1/projects/{project_id}/files/{}/download",
+            finalized.id
+        ),
+        Body::empty(),
+    );
+    ranged
+        .headers_mut()
+        .insert(header::RANGE, "bytes=1-3".parse().unwrap());
+    let download = app.clone().oneshot(ranged).await.unwrap();
+    assert_eq!(download.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(download.headers()[header::CONTENT_RANGE], "bytes 1-3/6");
+    assert_eq!(
+        download.headers()[header::ETAG],
+        "\"sha256-vvV-x_U6bUC-tkCngKY5yDvCmsipgW8fxsXG3Nk8RyE\""
+    );
     assert_eq!(
         download.into_body().collect().await.unwrap().to_bytes(),
-        b"abcdef".as_slice()
+        b"bcd".as_slice()
     );
 
     let upload = app
