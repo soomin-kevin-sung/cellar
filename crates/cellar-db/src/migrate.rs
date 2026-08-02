@@ -25,6 +25,12 @@ const MIGRATIONS: &[Migration] = &[
         fingerprint: "cellar-0002-indexes-v2",
         sql: include_str!("../../../migrations/0002_indexes.sql"),
     },
+    Migration {
+        version: 3,
+        name: "file_catalog_epoch",
+        fingerprint: "cellar-0003-file-catalog-epoch-v1",
+        sql: include_str!("../../../migrations/0003_file_catalog_epoch.sql"),
+    },
 ];
 
 /// Applies Cellar's expand-only migrations under an exclusive SQLite

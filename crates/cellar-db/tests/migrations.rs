@@ -156,10 +156,67 @@ async fn migrations_are_versioned_and_safe_under_concurrent_execution() {
             .fetch_all(&first)
             .await
             .expect("read migration versions");
-    assert_eq!(versions, [1, 2]);
+    assert_eq!(versions, [1, 2, 3]);
 
     first.close().await;
     second.close().await;
+}
+
+#[tokio::test]
+async fn file_catalog_epochs_are_project_scoped_and_cover_every_row_mutation() {
+    let (_db, pool) = migrated_db().await;
+    insert_project(&pool, "p1").await;
+    insert_project(&pool, "p2").await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM file_catalog_epoch WHERE project_id = 'p1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    insert_file(&pool, "entry", "p1", None, "a", "live")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE file_entry SET exact_name = 'b' WHERE id = 'entry'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM file_entry WHERE id = 'entry'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM file_catalog_epoch WHERE project_id = 'p1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM file_catalog_epoch WHERE project_id = 'p2'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'index' AND name LIKE 'ix_file_list_%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(indexes, ["ix_file_list_child", "ix_file_list_root"]);
+    pool.close().await;
 }
 
 #[tokio::test]

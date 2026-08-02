@@ -1,9 +1,11 @@
+mod file_repo;
 mod migrate;
 mod pool;
 mod project_repo;
 
 use thiserror::Error;
 
+pub use file_repo::SqliteFileRepository;
 pub use migrate::migrate;
 pub use pool::{FilenameCollation, open_pool};
 pub use project_repo::{
