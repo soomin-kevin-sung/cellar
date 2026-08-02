@@ -524,6 +524,7 @@ fn map_storage(error: cellar_windows::StorageError) -> PlatformError {
         | cellar_windows::StorageErrorKind::Conflict => PlatformError::Busy,
         cellar_windows::StorageErrorKind::CleanupFailed
         | cellar_windows::StorageErrorKind::WorkerFailed
+        | cellar_windows::StorageErrorKind::InsufficientStorage
         | cellar_windows::StorageErrorKind::Io => PlatformError::Io,
     }
 }
