@@ -15,6 +15,7 @@ use cellar_core::{
     DEFAULT_MAX_CHUNK_SIZE, FileEntryId, NewUpload, OperationId, ProjectId, UploadId,
     UploadService, UploadServiceError, UploadSession,
 };
+use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -24,6 +25,8 @@ use super::session::{SessionState, require_json_content_type};
 
 pub const MAX_UPLOAD_CHUNK_BYTES: i64 = DEFAULT_MAX_CHUNK_SIZE;
 pub const MAX_UPLOAD_JSON_BYTES: usize = 16 * 1024;
+pub const DEFAULT_UPLOAD_BODY_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
 
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 const UPLOAD_OFFSET: HeaderName = HeaderName::from_static("upload-offset");
@@ -36,6 +39,7 @@ type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 struct UploadsState {
     service: UploadService,
     clock: Clock,
+    body_idle_timeout: std::time::Duration,
 }
 
 pub fn uploads_router<S>(service: UploadService) -> Router<SessionState<S>>
@@ -50,9 +54,22 @@ where
     S: EnrollmentStore + 'static,
     F: Fn() -> OffsetDateTime + Send + Sync + 'static,
 {
+    uploads_router_with_clock_and_idle_timeout(service, clock, DEFAULT_UPLOAD_BODY_IDLE_TIMEOUT)
+}
+
+pub fn uploads_router_with_clock_and_idle_timeout<S, F>(
+    service: UploadService,
+    clock: F,
+    body_idle_timeout: std::time::Duration,
+) -> Router<SessionState<S>>
+where
+    S: EnrollmentStore + 'static,
+    F: Fn() -> OffsetDateTime + Send + Sync + 'static,
+{
     let state = UploadsState {
         service,
         clock: Arc::new(clock),
+        body_idle_timeout,
     };
     Router::new()
         .route(
@@ -130,6 +147,9 @@ async fn create_upload(
         .project_id
         .parse()
         .map_err(|_| UploadApiError::invalid("invalid_project_id", request_id.clone()))?;
+    if project_id.to_string() != input.project_id {
+        return Err(UploadApiError::invalid("invalid_project_id", request_id));
+    }
     let destination_parent_id: Option<FileEntryId> = input
         .destination_parent_id
         .as_deref()
@@ -138,6 +158,15 @@ async fn create_upload(
         .map_err(|_| {
             UploadApiError::invalid("invalid_destination_parent_id", request_id.clone())
         })?;
+    if destination_parent_id
+        .zip(input.destination_parent_id.as_deref())
+        .is_some_and(|(parsed, raw)| parsed.to_string() != raw)
+    {
+        return Err(UploadApiError::invalid(
+            "invalid_destination_parent_id",
+            request_id,
+        ));
+    }
     let expected_size = parse_decimal_i64(&input.expected_size)
         .ok_or_else(|| UploadApiError::invalid("invalid_expected_size", request_id.clone()))?;
     let expected_hash = input
@@ -215,19 +244,10 @@ async fn put_chunk(
     if content_length > max_chunk {
         return Err(UploadApiError::too_large(request_id));
     }
-    let limit = usize::try_from(max_chunk)
-        .ok()
-        .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| UploadApiError::unavailable(request_id.clone()))?;
-    let bytes = to_bytes(body, limit)
-        .await
-        .map_err(|_| UploadApiError::too_large(request_id.clone()))?;
-    if i64::try_from(bytes.len())
-        .ok()
-        .is_none_or(|length| length > max_chunk)
-    {
-        return Err(UploadApiError::too_large(request_id));
-    }
+    let max_chunk =
+        usize::try_from(max_chunk).map_err(|_| UploadApiError::unavailable(request_id.clone()))?;
+    let bytes =
+        read_chunk_body(body, max_chunk, state.body_idle_timeout, request_id.clone()).await?;
     if i64::try_from(bytes.len()).ok() != Some(content_length) {
         return Err(UploadApiError::invalid(
             "content_length_mismatch",
@@ -246,6 +266,37 @@ async fn put_chunk(
             (UPLOAD_OFFSET, session.committed_offset.to_string()),
         ],
     ))
+}
+
+async fn read_chunk_body(
+    mut body: Body,
+    max_bytes: usize,
+    idle_timeout: std::time::Duration,
+    request_id: String,
+) -> Result<Vec<u8>, UploadApiError> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    loop {
+        let frame = tokio::time::timeout(idle_timeout, body.frame())
+            .await
+            .map_err(|_| UploadApiError::body_timeout(request_id.clone()))?;
+        let Some(frame) = frame else {
+            break;
+        };
+        let frame = frame
+            .map_err(|_| UploadApiError::invalid("invalid_upload_body", request_id.clone()))?;
+        let data = frame
+            .into_data()
+            .map_err(|_| UploadApiError::invalid("invalid_upload_body", request_id.clone()))?;
+        if bytes
+            .len()
+            .checked_add(data.len())
+            .is_none_or(|length| length > max_bytes)
+        {
+            return Err(UploadApiError::too_large(request_id));
+        }
+        bytes.extend_from_slice(&data);
+    }
+    Ok(bytes)
 }
 
 async fn cancel_upload(
@@ -463,6 +514,15 @@ impl UploadApiError {
         }
     }
 
+    fn body_timeout(request_id: String) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code: "upload_body_timeout",
+            message: "The upload body stopped making progress.",
+            request_id,
+        }
+    }
+
     fn unavailable(request_id: String) -> Self {
         Self::service(UploadServiceError::Unavailable, request_id)
     }
@@ -494,12 +554,20 @@ impl fmt::Debug for UploadApiError {
 
 impl IntoResponse for UploadApiError {
     fn into_response(self) -> Response {
+        let status = self.status;
         let body = ErrorEnvelope {
             code: self.code,
             message: self.message,
             request_id: self.request_id.clone(),
             details: BTreeMap::new(),
         };
-        (self.status, [(REQUEST_ID, self.request_id)], Json(body)).into_response()
+        let mut response = (status, [(REQUEST_ID, self.request_id)], Json(body)).into_response();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                "5".parse().expect("static header value"),
+            );
+        }
+        response
     }
 }

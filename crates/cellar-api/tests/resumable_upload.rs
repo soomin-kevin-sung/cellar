@@ -8,7 +8,9 @@ use axum::http::{HeaderName, Request, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use cellar_api::routes::session::session_router_with_routes;
-use cellar_api::routes::uploads::{MAX_UPLOAD_CHUNK_BYTES, uploads_router_with_clock};
+use cellar_api::routes::uploads::{
+    MAX_UPLOAD_CHUNK_BYTES, uploads_router_with_clock, uploads_router_with_clock_and_idle_timeout,
+};
 use cellar_auth::{
     AccessClaims, CompareAndSet, CsrfManager, EnrollmentService, EnrollmentSnapshot,
     EnrollmentStore, EnrollmentStoreError,
@@ -63,6 +65,10 @@ struct MemoryStaging {
     files: Mutex<HashMap<UploadId, Vec<u8>>>,
     available: AtomicI64,
     short_write: AtomicBool,
+    fail_create: AtomicBool,
+    block_write: AtomicBool,
+    write_started: tokio::sync::Notify,
+    release_write: tokio::sync::Notify,
 }
 
 impl MemoryStaging {
@@ -71,6 +77,10 @@ impl MemoryStaging {
             files: Mutex::new(HashMap::new()),
             available: AtomicI64::new(bytes),
             short_write: AtomicBool::new(false),
+            fail_create: AtomicBool::new(false),
+            block_write: AtomicBool::new(false),
+            write_started: tokio::sync::Notify::new(),
+            release_write: tokio::sync::Notify::new(),
         }
     }
 
@@ -86,6 +96,9 @@ impl MemoryStaging {
 #[async_trait]
 impl UploadStagingStore for MemoryStaging {
     async fn create(&self, id: UploadId) -> Result<(), UploadStagingError> {
+        if self.fail_create.swap(false, Ordering::SeqCst) {
+            return Err(UploadStagingError::Unavailable);
+        }
         let mut files = self.files.lock().unwrap();
         if files.insert(id, Vec::new()).is_some() {
             return Err(UploadStagingError::Unavailable);
@@ -137,6 +150,10 @@ impl UploadStagingStore for MemoryStaging {
         input: &[u8],
     ) -> Result<(), UploadStagingError> {
         let offset = usize::try_from(offset).map_err(|_| UploadStagingError::Unavailable)?;
+        if self.block_write.load(Ordering::SeqCst) {
+            self.write_started.notify_one();
+            self.release_write.notified().await;
+        }
         let mut files = self.files.lock().unwrap();
         let bytes = files.get_mut(&id).ok_or(UploadStagingError::NotFound)?;
         if bytes.len() != offset {
@@ -184,6 +201,14 @@ fn default_limits() -> UploadLimits {
 }
 
 async fn make_harness(limits: UploadLimits, available: i64) -> Harness {
+    make_harness_with_idle_timeout(limits, available, None).await
+}
+
+async fn make_harness_with_idle_timeout(
+    limits: UploadLimits,
+    available: i64,
+    idle_timeout: Option<std::time::Duration>,
+) -> Harness {
     let directory = TempDir::new().unwrap();
     let collation = FilenameCollation::windows_ordinal_ci_v1(|left, right| left.cmp(right));
     let pool = open_pool(directory.path().join("cellar.db"), collation)
@@ -205,9 +230,17 @@ async fn make_harness(limits: UploadLimits, available: i64) -> Harness {
     let staging = Arc::new(MemoryStaging::with_space(available));
     let repository = Arc::new(SqliteUploadRepository::new(pool.clone()));
     let service = UploadService::new(repository, staging.clone(), limits);
-    let protected = uploads_router_with_clock::<EnrolledStore, _>(service, || {
-        OffsetDateTime::from_unix_timestamp(NOW).unwrap()
-    });
+    let protected = if let Some(idle_timeout) = idle_timeout {
+        uploads_router_with_clock_and_idle_timeout::<EnrolledStore, _>(
+            service,
+            || OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
+            idle_timeout,
+        )
+    } else {
+        uploads_router_with_clock::<EnrolledStore, _>(service, || {
+            OffsetDateTime::from_unix_timestamp(NOW).unwrap()
+        })
+    };
     let app = session_router_with_routes(
         EnrollmentService::new(Arc::new(EnrolledStore)),
         Arc::new(CsrfManager::new()),
@@ -302,6 +335,15 @@ async fn chunk(
     offset: &str,
     bytes: &[u8],
 ) -> axum::response::Response {
+    harness
+        .app
+        .clone()
+        .oneshot(chunk_request(token, id, offset, bytes))
+        .await
+        .unwrap()
+}
+
+fn chunk_request(token: &str, id: UploadId, offset: &str, bytes: &[u8]) -> Request<Body> {
     let mut request = request(
         "PUT",
         &format!("/api/v1/uploads/{id}/chunk"),
@@ -325,7 +367,7 @@ async fn chunk(
         format!("sha-256={digest}").parse().unwrap(),
     );
     authorize_mutation(&mut request, token);
-    harness.app.clone().oneshot(request).await.unwrap()
+    request
 }
 
 async fn status(harness: &Harness, id: UploadId) -> axum::response::Response {
@@ -347,6 +389,20 @@ async fn assert_error(response: axum::response::Response, status: StatusCode, co
     assert_eq!(body["code"], code);
     assert_eq!(body["details"], json!({}));
     assert!(body["requestId"].as_str().is_some_and(|id| !id.is_empty()));
+}
+
+async fn assert_error_with_request_id(
+    response: axum::response::Response,
+    status: StatusCode,
+    code: &str,
+    expected_request_id: &str,
+) {
+    assert_eq!(response.status(), status);
+    assert_eq!(response.headers()["x-request-id"], expected_request_id);
+    let body = response_json(response).await;
+    assert_eq!(body["code"], code);
+    assert_eq!(body["requestId"], expected_request_id);
+    assert_eq!(body["details"], json!({}));
 }
 
 #[test]
@@ -535,8 +591,10 @@ async fn enforces_expiry_chunk_size_session_concurrency_and_free_space_limits() 
         chunk(&harness, &token, first, "0", b"1234").await.status(),
         StatusCode::NO_CONTENT
     );
+    let concurrency_response = chunk(&harness, &token, second, "0", b"12").await;
+    assert_eq!(concurrency_response.headers()[header::RETRY_AFTER], "5");
     assert_error(
-        chunk(&harness, &token, second, "0", b"12").await,
+        concurrency_response,
         StatusCode::TOO_MANY_REQUESTS,
         "upload_capacity_exceeded",
     )
@@ -681,5 +739,455 @@ async fn requires_canonical_decimal_headers_exact_lengths_and_rfc_sha256_digest(
     )
     .await;
     tiny.pool.close().await;
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn creation_requires_canonical_project_and_parent_uuid_text() {
+    let harness = make_harness(default_limits(), 1_000).await;
+    let token = csrf_token(&harness.app).await;
+    let parent_id = cellar_core::FileEntryId::new();
+    sqlx::query(
+        "INSERT INTO file_entry
+         (id, project_id, exact_name, kind, platform_kind, size,
+          mtime_filetime_100ns, hash_state, state, revision, scan_generation, observed_at)
+         VALUES (?, ?, 'folder', 'directory', 'directory', 0, 0,
+                 'unknown', 'live', 1, 1, '1970-01-01T00:00:00.000000000Z')",
+    )
+    .bind(parent_id.to_string())
+    .bind(harness.project_id.to_string())
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+
+    for (project_id, parent, code) in [
+        (
+            harness.project_id.to_string().to_uppercase(),
+            None,
+            "invalid_project_id",
+        ),
+        (
+            harness.project_id.to_string().replace('-', ""),
+            None,
+            "invalid_project_id",
+        ),
+        (
+            harness.project_id.to_string(),
+            Some(parent_id.to_string().to_uppercase()),
+            "invalid_destination_parent_id",
+        ),
+        (
+            harness.project_id.to_string(),
+            Some(parent_id.to_string().replace('-', "")),
+            "invalid_destination_parent_id",
+        ),
+    ] {
+        let mut request = request(
+            "POST",
+            "/api/v1/uploads",
+            Body::from(
+                json!({
+                    "projectId": project_id,
+                    "destinationParentId": parent,
+                    "destinationName": format!("{code}.bin"),
+                    "expectedSize": "0"
+                })
+                .to_string(),
+            ),
+        );
+        request
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        authorize_mutation(&mut request, &token);
+        assert_error(
+            harness.app.clone().oneshot(request).await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            code,
+        )
+        .await;
+    }
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn expired_sessions_release_destination_session_concurrency_and_reserved_space() {
+    let mut limits = default_limits();
+    limits.max_active_sessions = 1;
+    let session_capacity = make_harness(limits, 100).await;
+    let token = csrf_token(&session_capacity.app).await;
+    let expired = created_id(&session_capacity, &token, "same.bin", "80").await;
+    sqlx::query(
+        "UPDATE upload_session SET expires_at = '1970-01-01T00:00:00.000000000Z' WHERE id = ?",
+    )
+    .bind(expired.to_string())
+    .execute(&session_capacity.pool)
+    .await
+    .unwrap();
+    let replacement = create_upload(&session_capacity, &token, "same.bin", "80").await;
+    assert_eq!(replacement.status(), StatusCode::CREATED);
+    let state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
+        .bind(expired.to_string())
+        .fetch_one(&session_capacity.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert!(
+        !session_capacity
+            .staging
+            .files
+            .lock()
+            .unwrap()
+            .contains_key(&expired)
+    );
+    session_capacity.pool.close().await;
+
+    let mut limits = default_limits();
+    limits.max_concurrent_uploads = 1;
+    let concurrency = make_harness(limits, 1_000).await;
+    let token = csrf_token(&concurrency.app).await;
+    let expired = created_id(&concurrency, &token, "expired-writer.bin", "3").await;
+    assert_eq!(
+        chunk(&concurrency, &token, expired, "0", b"a")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    sqlx::query(
+        "UPDATE upload_session SET expires_at = '1970-01-01T00:00:00.000000000Z' WHERE id = ?",
+    )
+    .bind(expired.to_string())
+    .execute(&concurrency.pool)
+    .await
+    .unwrap();
+    let next = created_id(&concurrency, &token, "next.bin", "1").await;
+    assert_eq!(
+        chunk(&concurrency, &token, next, "0", b"z").await.status(),
+        StatusCode::NO_CONTENT
+    );
+    concurrency.pool.close().await;
+}
+
+#[tokio::test]
+async fn every_upload_capacity_response_has_bounded_retry_after() {
+    let mut limits = default_limits();
+    limits.max_active_sessions = 1;
+    let harness = make_harness(limits, 1_000).await;
+    let token = csrf_token(&harness.app).await;
+    created_id(&harness, &token, "one.bin", "1").await;
+    let response = create_upload(&harness, &token, "two.bin", "1").await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = response.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=60).contains(&retry_after));
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn upload_security_and_method_errors_share_request_id_envelopes() {
+    let harness = make_harness(default_limits(), 1_000).await;
+    let unauthenticated_id = "upload-unauthenticated";
+    let mut unauthenticated = Request::builder()
+        .uri("/api/v1/uploads")
+        .body(Body::empty())
+        .unwrap();
+    unauthenticated.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        unauthenticated_id.parse().unwrap(),
+    );
+    assert_error_with_request_id(
+        harness.app.clone().oneshot(unauthenticated).await.unwrap(),
+        StatusCode::UNAUTHORIZED,
+        "missing_authentication",
+        unauthenticated_id,
+    )
+    .await;
+
+    let forbidden_id = "upload-forbidden";
+    let mut wrong_owner = claims();
+    wrong_owner.sub = "different-owner".into();
+    let mut forbidden = Request::builder()
+        .uri("/api/v1/uploads")
+        .body(Body::empty())
+        .unwrap();
+    forbidden.extensions_mut().insert(wrong_owner);
+    forbidden.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        forbidden_id.parse().unwrap(),
+    );
+    assert_error_with_request_id(
+        harness.app.clone().oneshot(forbidden).await.unwrap(),
+        StatusCode::FORBIDDEN,
+        "claim_forbidden",
+        forbidden_id,
+    )
+    .await;
+
+    let token = csrf_token(&harness.app).await;
+    let id = created_id(&harness, &token, "method.bin", "0").await;
+    let method_id = "upload-method";
+    let mut unsupported = request("POST", &format!("/api/v1/uploads/{id}"), Body::empty());
+    unsupported.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        method_id.parse().unwrap(),
+    );
+    authorize_mutation(&mut unsupported, &token);
+    assert_error_with_request_id(
+        harness.app.clone().oneshot(unsupported).await.unwrap(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        method_id,
+    )
+    .await;
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn live_chunk_lease_blocks_status_duplicate_put_and_cancel_until_cas_commit() {
+    let harness = make_harness(default_limits(), 1_000).await;
+    let token = csrf_token(&harness.app).await;
+
+    let status_id = created_id(&harness, &token, "blocked-status.bin", "3").await;
+    harness.staging.block_write.store(true, Ordering::SeqCst);
+    let app = harness.app.clone();
+    let put_request = chunk_request(&token, status_id, "0", b"abc");
+    let writer = tokio::spawn(async move { app.oneshot(put_request).await.unwrap() });
+    harness.staging.write_started.notified().await;
+    let pending: (i64, i64, Vec<u8>) = sqlx::query_as(
+        "SELECT pending_offset, pending_length, pending_digest
+         FROM upload_session WHERE id = ?",
+    )
+    .bind(status_id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, (0, 3, Sha256::digest(b"abc").to_vec()));
+
+    let app = harness.app.clone();
+    let status_request = request(
+        "GET",
+        &format!("/api/v1/uploads/{status_id}"),
+        Body::empty(),
+    );
+    let status_task = tokio::spawn(async move { app.oneshot(status_request).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !status_task.is_finished(),
+        "status bypassed the live writer lease"
+    );
+    harness.staging.block_write.store(false, Ordering::SeqCst);
+    harness.staging.release_write.notify_one();
+    assert_eq!(writer.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let status_response = status_task.await.unwrap();
+    assert_eq!(status_response.status(), StatusCode::OK);
+    assert_eq!(response_json(status_response).await["committedOffset"], "3");
+
+    let duplicate_id = created_id(&harness, &token, "blocked-duplicate.bin", "3").await;
+    harness.staging.block_write.store(true, Ordering::SeqCst);
+    let app = harness.app.clone();
+    let first_request = chunk_request(&token, duplicate_id, "0", b"xyz");
+    let first = tokio::spawn(async move { app.oneshot(first_request).await.unwrap() });
+    harness.staging.write_started.notified().await;
+    let app = harness.app.clone();
+    let duplicate_request = chunk_request(&token, duplicate_id, "0", b"xyz");
+    let duplicate = tokio::spawn(async move { app.oneshot(duplicate_request).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !duplicate.is_finished(),
+        "duplicate PUT bypassed the live writer lease"
+    );
+    harness.staging.block_write.store(false, Ordering::SeqCst);
+    harness.staging.release_write.notify_one();
+    assert_eq!(first.await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(duplicate.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let committed: (i64, Option<i64>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT committed_offset, pending_offset, pending_digest
+         FROM upload_session WHERE id = ?",
+    )
+    .bind(duplicate_id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(committed, (3, None, None));
+    assert_eq!(harness.staging.bytes(duplicate_id), b"xyz");
+
+    let cancel_id = created_id(&harness, &token, "blocked-cancel.bin", "3").await;
+    harness.staging.block_write.store(true, Ordering::SeqCst);
+    let app = harness.app.clone();
+    let put_request = chunk_request(&token, cancel_id, "0", b"end");
+    let writer = tokio::spawn(async move { app.oneshot(put_request).await.unwrap() });
+    harness.staging.write_started.notified().await;
+    let mut cancel_request = request(
+        "DELETE",
+        &format!("/api/v1/uploads/{cancel_id}"),
+        Body::empty(),
+    );
+    authorize_mutation(&mut cancel_request, &token);
+    let app = harness.app.clone();
+    let cancel = tokio::spawn(async move { app.oneshot(cancel_request).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(
+        !cancel.is_finished(),
+        "cancel bypassed the live writer lease"
+    );
+    harness.staging.block_write.store(false, Ordering::SeqCst);
+    harness.staging.release_write.notify_one();
+    assert_eq!(writer.await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(cancel.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let cancelled: (String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT state, committed_offset, pending_offset FROM upload_session WHERE id = ?",
+    )
+    .bind(cancel_id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(cancelled, ("cancelled".to_owned(), 3, None));
+    assert!(
+        !harness
+            .staging
+            .files
+            .lock()
+            .unwrap()
+            .contains_key(&cancel_id)
+    );
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn startup_maintenance_releases_db_committed_creation_with_missing_staging() {
+    let mut limits = default_limits();
+    limits.max_active_sessions = 1;
+    let harness = make_harness(limits, 1_000).await;
+    let token = csrf_token(&harness.app).await;
+    sqlx::query(
+        "CREATE TRIGGER injected_fail_creation_cleanup
+         BEFORE UPDATE OF state ON upload_session
+         WHEN OLD.state = 'created' AND NEW.state = 'failed'
+         BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END",
+    )
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+    harness.staging.fail_create.store(true, Ordering::SeqCst);
+    assert_error(
+        create_upload(&harness, &token, "crash-window.bin", "1").await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "upload_unavailable",
+    )
+    .await;
+    let stranded: (String, String) = sqlx::query_as(
+        "SELECT id, state FROM upload_session WHERE destination_name = 'crash-window.bin'",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(stranded.1, "created");
+    let stranded_id: UploadId = stranded.0.parse().unwrap();
+    assert!(
+        !harness
+            .staging
+            .files
+            .lock()
+            .unwrap()
+            .contains_key(&stranded_id)
+    );
+
+    sqlx::query("DROP TRIGGER injected_fail_creation_cleanup")
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    let restarted = UploadService::new(
+        Arc::new(SqliteUploadRepository::new(harness.pool.clone())),
+        harness.staging.clone(),
+        limits,
+    );
+    restarted
+        .maintain(OffsetDateTime::from_unix_timestamp(NOW).unwrap())
+        .await
+        .unwrap();
+    let old_state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
+        .bind(stranded_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(old_state, "failed");
+
+    let replacement = create_upload(&harness, &token, "crash-window.bin", "1").await;
+    assert_eq!(replacement.status(), StatusCode::CREATED);
+    let replacement_id: UploadId = response_json(replacement).await["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(replacement_id, stranded_id);
+    assert_eq!(harness.staging.files.lock().unwrap().len(), 1);
+    assert!(
+        harness
+            .staging
+            .files
+            .lock()
+            .unwrap()
+            .contains_key(&replacement_id)
+    );
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn partial_chunk_body_idle_timeout_is_bounded_and_does_not_record_pending_work() {
+    use futures_util::StreamExt as _;
+
+    let harness = make_harness_with_idle_timeout(
+        default_limits(),
+        1_000,
+        Some(std::time::Duration::from_millis(20)),
+    )
+    .await;
+    let token = csrf_token(&harness.app).await;
+    let id = created_id(&harness, &token, "stalled.bin", "3").await;
+    let stream = futures_util::stream::once(async {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"a"))
+    })
+    .chain(futures_util::stream::pending());
+    let mut request = request(
+        "PUT",
+        &format!("/api/v1/uploads/{id}/chunk"),
+        Body::from_stream(stream),
+    );
+    request.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
+    request
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, "3".parse().unwrap());
+    request.headers_mut().insert(
+        HeaderName::from_static("upload-offset"),
+        "0".parse().unwrap(),
+    );
+    let digest = STANDARD.encode(Sha256::digest(b"abc"));
+    request.headers_mut().insert(
+        HeaderName::from_static("digest"),
+        format!("sha-256={digest}").parse().unwrap(),
+    );
+    authorize_mutation(&mut request, &token);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        harness.app.clone().oneshot(request),
+    )
+    .await
+    .expect("idle timeout must bound a stalled body")
+    .unwrap();
+    assert_error(response, StatusCode::REQUEST_TIMEOUT, "upload_body_timeout").await;
+    let row: (i64, Option<i64>, String) = sqlx::query_as(
+        "SELECT committed_offset, pending_offset, state FROM upload_session WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(row, (0, None, "created".to_owned()));
+    assert!(harness.staging.bytes(id).is_empty());
     harness.pool.close().await;
 }

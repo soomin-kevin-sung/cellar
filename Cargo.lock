@@ -332,6 +332,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "time",
+ "tokio",
  "uuid",
 ]
 

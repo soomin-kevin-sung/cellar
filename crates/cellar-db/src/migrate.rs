@@ -30,6 +30,22 @@ const MIGRATIONS: &[Migration] = &[
 const FILE_CATALOG_EXTENSION_SQL: &str =
     include_str!("../../../migrations/expand_file_catalog_epoch.sql");
 const FILE_CATALOG_EXTENSION_FINGERPRINT: &str = "cellar-file-catalog-epoch-v1";
+const UPLOAD_CLEANUP_EXTENSION_SQL: &str =
+    include_str!("../../../migrations/expand_upload_staging_cleanup.sql");
+const UPLOAD_CLEANUP_EXTENSION_FINGERPRINT: &str = "cellar-upload-staging-cleanup-v1";
+const UPLOAD_CLEANUP_TABLE_SQL: &str = "
+    CREATE TABLE upload_staging_cleanup (
+      upload_id TEXT PRIMARY KEY NOT NULL,
+      FOREIGN KEY (upload_id) REFERENCES upload_session(id) ON DELETE CASCADE
+    )";
+const UPLOAD_CLEANUP_TRIGGER_SQL: &str = "
+    CREATE TRIGGER upload_staging_cleanup_terminal
+    AFTER UPDATE OF state ON upload_session
+    WHEN NEW.state IN ('failed', 'cancelled')
+     AND OLD.state NOT IN ('failed', 'cancelled')
+    BEGIN
+      INSERT OR IGNORE INTO upload_staging_cleanup (upload_id) VALUES (NEW.id);
+    END";
 const FILE_CATALOG_OBJECTS: &[(&str, &str)] = &[
     ("table", "cellar_schema_extension"),
     ("table", "file_catalog_epoch"),
@@ -116,6 +132,11 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
         .await
         .map_err(DbError::Migration)?;
     validate_file_catalog_extension(transaction).await?;
+    sqlx::raw_sql(UPLOAD_CLEANUP_EXTENSION_SQL)
+        .execute(&mut **transaction)
+        .await
+        .map_err(DbError::Migration)?;
+    validate_upload_cleanup_extension(transaction).await?;
 
     let metadata: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM cellar_schema_metadata
@@ -131,6 +152,65 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
     }
 
     Ok(())
+}
+
+async fn validate_upload_cleanup_extension(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), DbError> {
+    let fingerprint: Option<String> = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_staging_cleanup'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if fingerprint.as_deref() != Some(UPLOAD_CLEANUP_EXTENSION_FINGERPRINT) {
+        return Err(DbError::SchemaVersion);
+    }
+    let objects: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master
+         WHERE (type = 'table' AND name = 'upload_staging_cleanup')
+            OR (type = 'trigger' AND name = 'upload_staging_cleanup_terminal')",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if objects != 2 {
+        return Err(DbError::SchemaVersion);
+    }
+    let definitions: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master
+         WHERE name IN ('upload_staging_cleanup', 'upload_staging_cleanup_terminal')
+         ORDER BY name",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    let expected = [
+        ("upload_staging_cleanup", UPLOAD_CLEANUP_TABLE_SQL),
+        (
+            "upload_staging_cleanup_terminal",
+            UPLOAD_CLEANUP_TRIGGER_SQL,
+        ),
+    ];
+    if expected.iter().any(|(name, sql)| {
+        !definitions
+            .iter()
+            .any(|(actual_name, actual_sql)| actual_name == name && sql_eq(actual_sql, sql))
+    }) {
+        return Err(DbError::SchemaVersion);
+    }
+    Ok(())
+}
+
+fn sql_eq(left: &str, right: &str) -> bool {
+    left.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_lowercase)
+        .eq(right
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .flat_map(char::to_lowercase))
 }
 
 async fn validate_file_catalog_extension(

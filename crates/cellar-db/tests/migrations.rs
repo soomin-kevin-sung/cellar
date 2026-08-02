@@ -207,6 +207,70 @@ async fn expand_only_catalog_extension_remains_openable_by_previous_v2_release()
 }
 
 #[tokio::test]
+async fn expand_only_upload_cleanup_queue_is_durable_and_v2_compatible() {
+    let (_db, pool) = migrated_db().await;
+    assert!(previous_release_v2_accepts_schema_history(&pool).await);
+    let marker: String = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_staging_cleanup'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marker, "cellar-upload-staging-cleanup-v1");
+    insert_project(&pool, "p1").await;
+    insert_upload(&pool, "cleanup", "p1", None, "cleanup.bin", "created")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE upload_session SET state = 'cancelled' WHERE id = 'cleanup'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let queued: String = sqlx::query_scalar(
+        "SELECT upload_id FROM upload_staging_cleanup WHERE upload_id = 'cleanup'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued, "cleanup");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn upload_cleanup_extension_tampering_fails_closed() {
+    let (_marker_db, marker_pool) = migrated_db().await;
+    sqlx::query(
+        "UPDATE cellar_schema_extension SET fingerprint = 'tampered'
+         WHERE name = 'upload_staging_cleanup'",
+    )
+    .execute(&marker_pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        migrate(&marker_pool).await,
+        Err(DbError::SchemaVersion)
+    ));
+    assert!(previous_release_v2_accepts_schema_history(&marker_pool).await);
+    marker_pool.close().await;
+
+    let (_object_db, object_pool) = migrated_db().await;
+    sqlx::raw_sql(
+        "DROP TRIGGER upload_staging_cleanup_terminal;
+         CREATE TRIGGER upload_staging_cleanup_terminal
+         AFTER UPDATE OF state ON upload_session BEGIN SELECT 1; END;",
+    )
+    .execute(&object_pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        migrate(&object_pool).await,
+        Err(DbError::SchemaVersion)
+    ));
+    assert!(previous_release_v2_accepts_schema_history(&object_pool).await);
+    object_pool.close().await;
+}
+
+#[tokio::test]
 async fn catalog_extension_marker_tampering_fails_closed_without_new_history_rows() {
     let (_db, pool) = migrated_db().await;
     sqlx::query(

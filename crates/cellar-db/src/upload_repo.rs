@@ -228,6 +228,74 @@ impl UploadRepository for SqliteUploadRepository {
     async fn cancel(&self, id: UploadId) -> Result<(), UploadRepositoryError> {
         transition_terminal(&self.pool, id, "cancelled").await
     }
+
+    async fn active_ids(&self) -> Result<Vec<UploadId>, UploadRepositoryError> {
+        let raw: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM upload_session
+             WHERE state IN ('created', 'uploading', 'verifying', 'committing')
+             ORDER BY id COLLATE BINARY",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sql)?;
+        raw.iter().map(|id| canonical_id(id)).collect()
+    }
+
+    async fn expire_if_due(
+        &self,
+        id: UploadId,
+        now: OffsetDateTime,
+    ) -> Result<bool, UploadRepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE upload_session
+             SET state = 'failed', pending_offset = NULL, pending_length = NULL,
+                 pending_digest = NULL
+             WHERE id = ? AND expires_at <= ?
+               AND state IN ('created', 'uploading', 'verifying', 'committing')",
+        )
+        .bind(id.to_string())
+        .bind(timestamp(now)?)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sql)?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    async fn fail_pristine_created(&self, id: UploadId) -> Result<bool, UploadRepositoryError> {
+        let updated = sqlx::query(
+            "UPDATE upload_session SET state = 'failed'
+             WHERE id = ? AND state = 'created' AND committed_offset = 0
+               AND pending_offset IS NULL AND pending_length IS NULL
+               AND pending_digest IS NULL",
+        )
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sql)?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    async fn cleanup_ids(&self) -> Result<Vec<UploadId>, UploadRepositoryError> {
+        let raw: Vec<String> = sqlx::query_scalar(
+            "SELECT upload_id FROM upload_staging_cleanup
+             ORDER BY upload_id COLLATE BINARY LIMIT 256",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sql)?;
+        raw.iter().map(|id| canonical_id(id)).collect()
+    }
+
+    async fn complete_cleanup(&self, id: UploadId) -> Result<(), UploadRepositoryError> {
+        sqlx::query("DELETE FROM upload_staging_cleanup WHERE upload_id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sql)?;
+        Ok(())
+    }
 }
 
 async fn transition_terminal(

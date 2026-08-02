@@ -1,8 +1,10 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
 use sha2::{Digest as _, Sha256};
 use time::{Duration, OffsetDateTime};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{FileEntryId, ProjectId, UploadId};
 
@@ -136,6 +138,15 @@ pub trait UploadRepository: Send + Sync {
     async fn clear_pending(&self, id: UploadId) -> Result<UploadSession, UploadRepositoryError>;
     async fn fail(&self, id: UploadId) -> Result<(), UploadRepositoryError>;
     async fn cancel(&self, id: UploadId) -> Result<(), UploadRepositoryError>;
+    async fn active_ids(&self) -> Result<Vec<UploadId>, UploadRepositoryError>;
+    async fn expire_if_due(
+        &self,
+        id: UploadId,
+        now: OffsetDateTime,
+    ) -> Result<bool, UploadRepositoryError>;
+    async fn fail_pristine_created(&self, id: UploadId) -> Result<bool, UploadRepositoryError>;
+    async fn cleanup_ids(&self) -> Result<Vec<UploadId>, UploadRepositoryError>;
+    async fn complete_cleanup(&self, id: UploadId) -> Result<(), UploadRepositoryError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -199,6 +210,7 @@ pub struct UploadService {
     repository: Arc<dyn UploadRepository>,
     staging: Arc<dyn UploadStagingStore>,
     limits: UploadLimits,
+    leases: Arc<UploadLeaseTable>,
 }
 
 impl UploadService {
@@ -213,6 +225,7 @@ impl UploadService {
             repository,
             staging,
             limits,
+            leases: Arc::new(UploadLeaseTable::default()),
         }
     }
 
@@ -227,6 +240,7 @@ impl UploadService {
         now: OffsetDateTime,
     ) -> Result<UploadSession, UploadServiceError> {
         validate_new_upload(&input)?;
+        self.maintain_except(now, None).await?;
         let available = self.staging.available_space().await.map_err(map_staging)?;
         let capacity = available
             .checked_sub(self.limits.free_space_reserve)
@@ -247,13 +261,18 @@ impl UploadService {
             state: UploadState::Created,
             expires_at,
         };
+        let _lease = self.leases.acquire(session.id).await;
         self.repository
             .create(&session, self.limits.max_active_sessions, capacity)
             .await
             .map_err(map_repository)?;
         if let Err(error) = self.staging.create(session.id).await {
-            let _ = self.repository.cancel(session.id).await;
-            return Err(map_staging(error));
+            let staging_error = map_staging(error);
+            self.repository
+                .fail_pristine_created(session.id)
+                .await
+                .map_err(map_repository)?;
+            return Err(staging_error);
         }
         Ok(session)
     }
@@ -263,7 +282,9 @@ impl UploadService {
         id: UploadId,
         now: OffsetDateTime,
     ) -> Result<UploadSession, UploadServiceError> {
-        self.reconcile(id, now).await
+        self.maintain_except(now, Some(id)).await?;
+        let _lease = self.leases.acquire(id).await;
+        self.reconcile_locked(id, now).await
     }
 
     pub async fn put_chunk(
@@ -281,7 +302,9 @@ impl UploadService {
         if sha256(bytes) != digest {
             return Err(UploadServiceError::Conflict);
         }
-        let session = self.reconcile(id, now).await?;
+        self.maintain_except(now, Some(id)).await?;
+        let _lease = self.leases.acquire(id).await;
+        let session = self.reconcile_locked(id, now).await?;
         let end = offset
             .checked_add(length)
             .ok_or(UploadServiceError::Conflict)?;
@@ -341,6 +364,7 @@ impl UploadService {
     }
 
     pub async fn cancel(&self, id: UploadId) -> Result<(), UploadServiceError> {
+        let _lease = self.leases.acquire(id).await;
         self.repository.cancel(id).await.map_err(map_repository)?;
         match self.staging.remove(id).await {
             Ok(()) | Err(UploadStagingError::NotFound) => Ok(()),
@@ -348,7 +372,73 @@ impl UploadService {
         }
     }
 
-    async fn reconcile(
+    pub async fn maintain(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
+        self.maintain_except(now, None).await
+    }
+
+    async fn maintain_except(
+        &self,
+        now: OffsetDateTime,
+        excluded: Option<UploadId>,
+    ) -> Result<(), UploadServiceError> {
+        let ids = self.repository.active_ids().await.map_err(map_repository)?;
+        for id in ids {
+            if Some(id) == excluded {
+                continue;
+            }
+            let _lease = self.leases.acquire(id).await;
+            let session = match self.repository.read(id).await {
+                Ok(session) if session.state.is_active() => session,
+                Ok(_) | Err(UploadRepositoryError::NotFound) => continue,
+                Err(error) => return Err(map_repository(error)),
+            };
+            if now >= session.expires_at {
+                if self
+                    .repository
+                    .expire_if_due(id, now)
+                    .await
+                    .map_err(map_repository)?
+                {
+                    let _ = self.staging.remove(id).await;
+                }
+                continue;
+            }
+            if session.state == UploadState::Created
+                && session.committed_offset == 0
+                && session.pending.is_none()
+                && matches!(
+                    self.staging.length(id).await,
+                    Err(UploadStagingError::NotFound)
+                )
+                && self
+                    .repository
+                    .fail_pristine_created(id)
+                    .await
+                    .map_err(map_repository)?
+            {
+                let _ = self.staging.remove(id).await;
+            }
+        }
+        for id in self
+            .repository
+            .cleanup_ids()
+            .await
+            .map_err(map_repository)?
+        {
+            let _lease = self.leases.acquire(id).await;
+            match self.staging.remove(id).await {
+                Ok(()) | Err(UploadStagingError::NotFound) => self
+                    .repository
+                    .complete_cleanup(id)
+                    .await
+                    .map_err(map_repository)?,
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_locked(
         &self,
         id: UploadId,
         now: OffsetDateTime,
@@ -411,6 +501,59 @@ impl UploadService {
                 .map_err(map_staging)?;
         }
         Ok(session)
+    }
+}
+
+#[derive(Default)]
+struct UploadLeaseTable {
+    entries: StdMutex<HashMap<UploadId, Arc<Mutex<()>>>>,
+}
+
+impl UploadLeaseTable {
+    async fn acquire(self: &Arc<Self>, id: UploadId) -> UploadLease {
+        let lock = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                entries
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let guard = Arc::clone(&lock).lock_owned().await;
+        UploadLease {
+            id,
+            lock,
+            guard: Some(guard),
+            table: Arc::clone(self),
+        }
+    }
+}
+
+struct UploadLease {
+    id: UploadId,
+    lock: Arc<Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+    table: Arc<UploadLeaseTable>,
+}
+
+impl Drop for UploadLease {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut entries = self
+            .table
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.lock) == 2
+            && entries
+                .get(&self.id)
+                .is_some_and(|lock| Arc::ptr_eq(lock, &self.lock))
+        {
+            entries.remove(&self.id);
+        }
     }
 }
 

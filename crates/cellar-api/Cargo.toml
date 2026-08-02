@@ -11,16 +11,17 @@ axum.workspace = true
 base64 = "=0.22.1"
 cellar-auth = { path = "../cellar-auth" }
 cellar-core = { path = "../cellar-core" }
+http-body-util = "=0.1.4"
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
 cellar-config = { path = "../cellar-config" }
 cellar-db = { path = "../cellar-db" }
 futures-util = "0.3.33"
-http-body-util = "=0.1.4"
 sha2.workspace = true
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
 tempfile = "=3.27.0"
