@@ -31,6 +31,9 @@ pub const FILE_CURSOR_VERSION: u8 = 1;
 pub const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_OPEN_DOWNLOADS: usize = 8;
 
+/// Keeps one download-capacity slot owned by cancellation-insensitive I/O.
+pub type DownloadReadLease = Arc<OwnedSemaphorePermit>;
+
 const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 const MAX_REQUEST_ID_BYTES: usize = 128;
 
@@ -204,8 +207,14 @@ pub trait VerifiedDownload: Send {
     async fn verify(&self) -> Result<(), DownloadError>;
 
     /// Pulls exactly the requested bounded chunk from this same verified
-    /// handle. Returning fewer or more bytes is treated as a stream failure.
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError>;
+    /// handle. The implementation must retain `lease` in any detached I/O
+    /// transaction until that work exits. Returning fewer or more bytes is
+    /// treated as a stream failure.
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, DownloadReadError>;
 }
 
 #[async_trait]
@@ -389,7 +398,7 @@ struct DownloadBodyState {
     download: Box<dyn VerifiedDownload>,
     offset: u64,
     remaining: u64,
-    _permit: OwnedSemaphorePermit,
+    lease: DownloadReadLease,
 }
 
 fn download_body(
@@ -402,7 +411,7 @@ fn download_body(
             download,
             offset: span.start,
             remaining: span.length,
-            _permit: permit,
+            lease: Arc::new(permit),
         },
         |mut state| async move {
             if state.remaining == 0 {
@@ -413,7 +422,10 @@ fn download_body(
                 start: state.offset,
                 length,
             };
-            let bytes = state.download.read_exact_chunk(span).await?;
+            let bytes = state
+                .download
+                .read_exact_chunk(span, state.lease.clone())
+                .await?;
             if bytes.len() != length as usize {
                 return Err(DownloadReadError::UnexpectedEof);
             }

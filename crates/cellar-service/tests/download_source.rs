@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cellar_api::routes::files::{DownloadError, DownloadSource, DownloadSpan};
+use cellar_api::routes::files::{DownloadError, DownloadReadLease, DownloadSource, DownloadSpan};
 use cellar_core::{FileEntryId, ProjectId};
 use cellar_db::{FilenameCollation, migrate, open_pool};
 use cellar_service::downloads::{
@@ -11,6 +11,11 @@ use cellar_service::downloads::{
 };
 use sqlx::SqlitePool;
 use tempfile::TempDir;
+use tokio::sync::Semaphore;
+
+fn test_lease() -> DownloadReadLease {
+    Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap())
+}
 
 #[derive(Clone)]
 struct FakePlatform {
@@ -51,7 +56,11 @@ impl PlatformDownloadHandle for FakeHandle {
         Ok(self.verify)
     }
 
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, PlatformError> {
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        _lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, PlatformError> {
         let start = span.start() as usize;
         let end = start + span.length() as usize;
         Ok(self.bytes[start..end].to_vec())
@@ -181,7 +190,7 @@ async fn archived_project_opens_exact_handle_relative_components_and_ready_hash(
     assert_eq!(download.verify().await, Ok(()));
     assert_eq!(
         download
-            .read_exact_chunk(DownloadSpan::new(1, 3).unwrap())
+            .read_exact_chunk(DownloadSpan::new(1, 3).unwrap(), test_lease())
             .await,
         Ok(b"bcd".to_vec())
     );

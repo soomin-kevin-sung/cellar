@@ -1,13 +1,14 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderName, Method, Request, StatusCode, header};
 use cellar_api::routes::files::{
-    DOWNLOAD_CHUNK_BYTES, DownloadError, DownloadMetadata, DownloadReadError, DownloadSource,
-    DownloadSpan, VerifiedDownload, files_router_with_downloads,
+    DOWNLOAD_CHUNK_BYTES, DownloadError, DownloadMetadata, DownloadReadError, DownloadReadLease,
+    DownloadSource, DownloadSpan, MAX_OPEN_DOWNLOADS, VerifiedDownload,
+    files_router_with_downloads,
 };
 use cellar_api::routes::session::session_router_with_routes;
 use cellar_auth::{
@@ -117,7 +118,11 @@ impl VerifiedDownload for MemoryDownload {
         self.verify_error.map_or(Ok(()), Err)
     }
 
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError> {
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        _lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, DownloadReadError> {
         let start = span.start() as usize;
         let end = start + span.length() as usize;
         Ok(self.bytes[start..end].to_vec())
@@ -184,6 +189,114 @@ struct ProbeDownload {
     drops: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Default)]
+struct BlockingReadSource {
+    state: Arc<BlockingReadState>,
+}
+
+#[derive(Default)]
+struct BlockingReadState {
+    gate: (Mutex<bool>, Condvar),
+    started: AtomicUsize,
+    completed: AtomicUsize,
+    handles: Mutex<Vec<Weak<()>>>,
+}
+
+impl BlockingReadSource {
+    async fn wait_for(&self, counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while counter.load(Ordering::SeqCst) != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocking download workers reached the expected state");
+    }
+
+    fn release(&self) {
+        let (released, condition) = &self.state.gate;
+        *released.lock().unwrap() = true;
+        condition.notify_all();
+    }
+
+    fn every_handle_is_retained(&self) -> bool {
+        let handles = self.state.handles.lock().unwrap();
+        handles.len() == MAX_OPEN_DOWNLOADS
+            && handles.iter().all(|handle| handle.upgrade().is_some())
+    }
+
+    fn every_handle_is_released(&self) -> bool {
+        self.state
+            .handles
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|handle| handle.upgrade().is_none())
+    }
+}
+
+#[async_trait]
+impl DownloadSource for BlockingReadSource {
+    async fn open_verified(
+        &self,
+        _: ProjectId,
+        _: FileEntryId,
+    ) -> Result<Box<dyn VerifiedDownload>, DownloadError> {
+        let handle = Arc::new(());
+        self.state
+            .handles
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&handle));
+        Ok(Box::new(BlockingReadDownload {
+            metadata: DownloadMetadata::new("blocked.bin", 1, None).unwrap(),
+            state: Arc::clone(&self.state),
+            handle,
+        }))
+    }
+}
+
+struct BlockingReadDownload {
+    metadata: DownloadMetadata,
+    state: Arc<BlockingReadState>,
+    handle: Arc<()>,
+}
+
+#[async_trait]
+impl VerifiedDownload for BlockingReadDownload {
+    fn metadata(&self) -> &DownloadMetadata {
+        &self.metadata
+    }
+
+    async fn verify(&self) -> Result<(), DownloadError> {
+        Ok(())
+    }
+
+    async fn read_exact_chunk(
+        &mut self,
+        _: DownloadSpan,
+        lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, DownloadReadError> {
+        let state = Arc::clone(&self.state);
+        let handle = Arc::clone(&self.handle);
+        tokio::task::spawn_blocking(move || {
+            state.started.fetch_add(1, Ordering::SeqCst);
+            let (released, condition) = &state.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+            drop(released);
+            drop(handle);
+            drop(lease);
+            state.completed.fetch_add(1, Ordering::SeqCst);
+            vec![0x5a]
+        })
+        .await
+        .map_err(|_| DownloadReadError::Io)
+    }
+}
+
 impl Drop for ProbeDownload {
     fn drop(&mut self) {
         self.drops.fetch_add(1, Ordering::SeqCst);
@@ -200,7 +313,11 @@ impl VerifiedDownload for ProbeDownload {
         Ok(())
     }
 
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError> {
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        _lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, DownloadReadError> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         self.max_request
             .fetch_max(span.length() as usize, Ordering::SeqCst);
@@ -762,6 +879,79 @@ async fn ninth_open_is_rejected_and_head_never_holds_a_streaming_permit() {
         assert_eq!(head.status(), StatusCode::OK);
         assert!(bytes(head).await.is_empty());
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnected_blocking_reads_retain_all_permits_and_handles_until_workers_exit() {
+    let project = ProjectId::new();
+    let file = FileEntryId::new();
+    let source = BlockingReadSource::default();
+    let router = app(source.clone());
+    let mut readers = Vec::new();
+    for _ in 0..MAX_OPEN_DOWNLOADS {
+        let response = router
+            .clone()
+            .oneshot(download_request(
+                project,
+                file,
+                Method::GET,
+                None,
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        readers.push(tokio::spawn(async move {
+            let mut body = response.into_body();
+            let _ = body.frame().await;
+        }));
+    }
+    source
+        .wait_for(&source.state.started, MAX_OPEN_DOWNLOADS)
+        .await;
+    for reader in &readers {
+        reader.abort();
+    }
+    for reader in readers {
+        assert!(reader.await.unwrap_err().is_cancelled());
+    }
+    assert!(source.every_handle_is_retained());
+
+    let ninth = router
+        .clone()
+        .oneshot(download_request(
+            project,
+            file,
+            Method::GET,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    let ninth_status = ninth.status();
+    drop(ninth);
+
+    source.release();
+    source
+        .wait_for(&source.state.completed, MAX_OPEN_DOWNLOADS)
+        .await;
+    assert!(source.every_handle_is_released());
+    assert_eq!(ninth_status, StatusCode::TOO_MANY_REQUESTS);
+
+    let replacement = router
+        .oneshot(download_request(
+            project,
+            file,
+            Method::GET,
+            None,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement.status(), StatusCode::OK);
 }
 
 #[tokio::test]

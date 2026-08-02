@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cellar_api::routes::files::{
-    DownloadError, DownloadMetadata, DownloadReadError, DownloadSource, DownloadSpan,
-    VerifiedDownload,
+    DownloadError, DownloadMetadata, DownloadReadError, DownloadReadLease, DownloadSource,
+    DownloadSpan, VerifiedDownload,
 };
 use cellar_core::{FileEntryId, ProjectId};
 use sqlx::{Row, SqlitePool};
@@ -48,7 +48,11 @@ pub trait PlatformDownloadHandle: Send + Sync {
 
     async fn verify(&self) -> Result<PlatformFacts, PlatformError>;
 
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, PlatformError>;
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, PlatformError>;
 }
 
 #[async_trait]
@@ -403,9 +407,13 @@ impl VerifiedDownload for ProductionVerifiedDownload {
         Ok(())
     }
 
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, DownloadReadError> {
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, DownloadReadError> {
         self.handle
-            .read_exact_chunk(span)
+            .read_exact_chunk(span, lease)
             .await
             .map_err(|_| DownloadReadError::Io)
     }
@@ -492,14 +500,21 @@ impl PlatformDownloadHandle for WindowsPlatformHandle {
         .map_err(|_| PlatformError::Io)?
     }
 
-    async fn read_exact_chunk(&mut self, span: DownloadSpan) -> Result<Vec<u8>, PlatformError> {
+    async fn read_exact_chunk(
+        &mut self,
+        span: DownloadSpan,
+        lease: DownloadReadLease,
+    ) -> Result<Vec<u8>, PlatformError> {
         let storage = self.storage.clone();
         let handle = self.handle.clone();
         let length = usize::try_from(span.length()).map_err(|_| PlatformError::Io)?;
         tokio::task::spawn_blocking(move || {
-            storage
+            let result = storage
                 .read_download_exact(&handle, span.start(), length)
-                .map_err(map_storage)
+                .map_err(map_storage);
+            drop(handle);
+            drop(lease);
+            result
         })
         .await
         .map_err(|_| PlatformError::Io)?
