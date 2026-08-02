@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cellar_core::{
-    PendingChunk, ProjectId, UploadId, UploadRepository, UploadRepositoryError, UploadSession,
-    UploadState,
+    PendingChunk, ProjectId, StagingIdentity, UploadId, UploadRepository, UploadRepositoryError,
+    UploadSession, UploadState,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
@@ -295,6 +295,53 @@ impl UploadRepository for SqliteUploadRepository {
             .await
             .map_err(map_sql)?;
         Ok(())
+    }
+
+    async fn staging_identity(
+        &self,
+        id: UploadId,
+    ) -> Result<Option<StagingIdentity>, UploadRepositoryError> {
+        let value: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT platform_identity FROM upload_staging_identity WHERE upload_id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sql)?;
+        value
+            .map(|bytes| {
+                <[u8; 24]>::try_from(bytes)
+                    .map(StagingIdentity::new)
+                    .map_err(|_| UploadRepositoryError::Unavailable)
+            })
+            .transpose()
+    }
+
+    async fn record_staging_identity(
+        &self,
+        id: UploadId,
+        identity: StagingIdentity,
+    ) -> Result<(), UploadRepositoryError> {
+        sqlx::query(
+            "INSERT INTO upload_staging_identity (upload_id, platform_identity)
+             VALUES (?, ?)
+             ON CONFLICT(upload_id) DO UPDATE SET platform_identity = excluded.platform_identity
+             WHERE upload_staging_identity.platform_identity = excluded.platform_identity",
+        )
+        .bind(id.to_string())
+        .bind(identity.as_bytes().to_vec())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sql)?;
+        let persisted = self
+            .staging_identity(id)
+            .await?
+            .ok_or(UploadRepositoryError::Unavailable)?;
+        if persisted == identity {
+            Ok(())
+        } else {
+            Err(UploadRepositoryError::Conflict)
+        }
     }
 }
 

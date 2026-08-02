@@ -412,6 +412,7 @@ dependencies = [
  "cellar-core",
  "cellar-storage",
  "sha1 0.11.0",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

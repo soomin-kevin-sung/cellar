@@ -147,6 +147,15 @@ pub trait UploadRepository: Send + Sync {
     async fn fail_pristine_created(&self, id: UploadId) -> Result<bool, UploadRepositoryError>;
     async fn cleanup_ids(&self) -> Result<Vec<UploadId>, UploadRepositoryError>;
     async fn complete_cleanup(&self, id: UploadId) -> Result<(), UploadRepositoryError>;
+    async fn staging_identity(
+        &self,
+        id: UploadId,
+    ) -> Result<Option<StagingIdentity>, UploadRepositoryError>;
+    async fn record_staging_identity(
+        &self,
+        id: UploadId,
+        identity: StagingIdentity,
+    ) -> Result<(), UploadRepositoryError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +163,21 @@ pub enum UploadStagingError {
     NotFound,
     InsufficientStorage,
     Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StagingIdentity([u8; 24]);
+
+impl StagingIdentity {
+    #[must_use]
+    pub const fn new(bytes: [u8; 24]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 24] {
+        self.0
+    }
 }
 
 #[async_trait]
@@ -175,8 +199,33 @@ pub trait UploadStagingStore: Send + Sync {
         offset: i64,
         bytes: &[u8],
     ) -> Result<(), UploadStagingError>;
+    async fn write_verify_and_flush(
+        &self,
+        id: UploadId,
+        offset: i64,
+        bytes: &[u8],
+        digest: [u8; 32],
+    ) -> Result<i64, UploadStagingError> {
+        self.write_exact_and_flush(id, offset, bytes).await?;
+        let length = self.length(id).await?;
+        let durable = self
+            .read_exact(
+                id,
+                offset,
+                i64::try_from(bytes.len()).map_err(|_| UploadStagingError::Unavailable)?,
+            )
+            .await?;
+        if sha256(&durable) == digest {
+            Ok(length)
+        } else {
+            Err(UploadStagingError::Unavailable)
+        }
+    }
     async fn remove(&self, id: UploadId) -> Result<(), UploadStagingError>;
     async fn available_space(&self) -> Result<i64, UploadStagingError>;
+    async fn identity(&self, _id: UploadId) -> Result<Option<StagingIdentity>, UploadStagingError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,7 +289,7 @@ impl UploadService {
         now: OffsetDateTime,
     ) -> Result<UploadSession, UploadServiceError> {
         validate_new_upload(&input)?;
-        self.maintain_except(now, None).await?;
+        self.maintain_runtime(now, None).await?;
         let available = self.staging.available_space().await.map_err(map_staging)?;
         let capacity = available
             .checked_sub(self.limits.free_space_reserve)
@@ -274,6 +323,28 @@ impl UploadService {
                 .map_err(map_repository)?;
             return Err(staging_error);
         }
+        let identity = match self.staging.identity(session.id).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.repository
+                    .fail_pristine_created(session.id)
+                    .await
+                    .map_err(map_repository)?;
+                return Err(map_staging(error));
+            }
+        };
+        if let Some(identity) = identity
+            && let Err(error) = self
+                .repository
+                .record_staging_identity(session.id, identity)
+                .await
+        {
+            self.repository
+                .fail_pristine_created(session.id)
+                .await
+                .map_err(map_repository)?;
+            return Err(map_repository(error));
+        }
         Ok(session)
     }
 
@@ -282,7 +353,7 @@ impl UploadService {
         id: UploadId,
         now: OffsetDateTime,
     ) -> Result<UploadSession, UploadServiceError> {
-        self.maintain_except(now, Some(id)).await?;
+        self.maintain_runtime(now, Some(id)).await?;
         let _lease = self.leases.acquire(id).await;
         self.reconcile_locked(id, now).await
     }
@@ -302,7 +373,7 @@ impl UploadService {
         if sha256(bytes) != digest {
             return Err(UploadServiceError::Conflict);
         }
-        self.maintain_except(now, Some(id)).await?;
+        self.maintain_runtime(now, Some(id)).await?;
         let _lease = self.leases.acquire(id).await;
         let session = self.reconcile_locked(id, now).await?;
         let end = offset
@@ -340,21 +411,13 @@ impl UploadService {
             )
             .await
             .map_err(map_repository)?;
-        self.staging
-            .write_exact_and_flush(id, offset, bytes)
+        let durable_length = self
+            .staging
+            .write_verify_and_flush(id, offset, bytes, digest)
             .await
             .map_err(map_staging)?;
-        let durable_length = self.staging.length(id).await.map_err(map_staging)?;
         if durable_length < end {
             self.repository.fail(id).await.map_err(map_repository)?;
-            return Err(UploadServiceError::Unavailable);
-        }
-        let durable = self
-            .staging
-            .read_exact(id, offset, length)
-            .await
-            .map_err(map_staging)?;
-        if sha256(&durable) != digest {
             return Err(UploadServiceError::Unavailable);
         }
         self.repository
@@ -373,39 +436,58 @@ impl UploadService {
     }
 
     pub async fn maintain(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
-        self.maintain_except(now, None).await
+        self.maintain_runtime(now, None).await
     }
 
     /// Completes upload crash recovery before the service reports readiness.
     pub async fn initialize(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
-        self.maintain_except(now, None).await
+        self.initialize_all(now).await
     }
 
-    async fn maintain_except(
+    async fn maintain_runtime(
         &self,
         now: OffsetDateTime,
         excluded: Option<UploadId>,
     ) -> Result<(), UploadServiceError> {
-        let ids = self.repository.active_ids().await.map_err(map_repository)?;
-        for id in ids {
+        for id in self.repository.active_ids().await.map_err(map_repository)? {
             if Some(id) == excluded {
                 continue;
             }
+            if self
+                .repository
+                .expire_if_due(id, now)
+                .await
+                .map_err(map_repository)?
+            {
+                let _ = self.staging.remove(id).await;
+            }
+        }
+        self.cleanup_staging(excluded).await
+    }
+
+    async fn initialize_all(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
+        let ids = self.repository.active_ids().await.map_err(map_repository)?;
+        for id in ids {
             let _lease = self.leases.acquire(id).await;
             let session = match self.repository.read(id).await {
                 Ok(session) if session.state.is_active() => session,
                 Ok(_) | Err(UploadRepositoryError::NotFound) => continue,
                 Err(error) => return Err(map_repository(error)),
             };
-            if now >= session.expires_at {
-                if self
-                    .repository
-                    .expire_if_due(id, now)
-                    .await
-                    .map_err(map_repository)?
+            if let Err(error) = self.verify_staging_identity(id).await {
+                if matches!(error, UploadServiceError::NotFound)
+                    && session.state == UploadState::Created
+                    && session.committed_offset == 0
+                    && session.pending.is_none()
+                    && self
+                        .repository
+                        .fail_pristine_created(id)
+                        .await
+                        .map_err(map_repository)?
                 {
-                    let _ = self.staging.remove(id).await;
+                    continue;
                 }
+                self.repository.fail(id).await.map_err(map_repository)?;
                 continue;
             }
             if session.state == UploadState::Created
@@ -421,7 +503,17 @@ impl UploadService {
                     .await
                     .map_err(map_repository)?
             {
-                let _ = self.staging.remove(id).await;
+                continue;
+            }
+            if now >= session.expires_at {
+                if self
+                    .repository
+                    .expire_if_due(id, now)
+                    .await
+                    .map_err(map_repository)?
+                {
+                    let _ = self.staging.remove(id).await;
+                }
                 continue;
             }
             if let Err(error) = self.reconcile_locked(id, now).await {
@@ -431,13 +523,23 @@ impl UploadService {
                 }
             }
         }
+        self.cleanup_staging(None).await
+    }
+
+    async fn cleanup_staging(&self, excluded: Option<UploadId>) -> Result<(), UploadServiceError> {
         for id in self
             .repository
             .cleanup_ids()
             .await
             .map_err(map_repository)?
         {
+            if Some(id) == excluded {
+                continue;
+            }
             let _lease = self.leases.acquire(id).await;
+            if self.verify_staging_identity(id).await.is_err() {
+                continue;
+            }
             match self.staging.remove(id).await {
                 Ok(()) | Err(UploadStagingError::NotFound) => self
                     .repository
@@ -458,6 +560,10 @@ impl UploadService {
         let mut session = self.repository.read(id).await.map_err(map_repository)?;
         if !session.state.is_active() {
             return Err(UploadServiceError::NotFound);
+        }
+        if let Err(error) = self.verify_staging_identity(id).await {
+            self.repository.fail(id).await.map_err(map_repository)?;
+            return Err(error);
         }
         if now >= session.expires_at {
             self.repository.fail(id).await.map_err(map_repository)?;
@@ -513,6 +619,26 @@ impl UploadService {
                 .map_err(map_staging)?;
         }
         Ok(session)
+    }
+
+    async fn verify_staging_identity(&self, id: UploadId) -> Result<(), UploadServiceError> {
+        let Some(actual) = self.staging.identity(id).await.map_err(map_staging)? else {
+            return Ok(());
+        };
+        match self
+            .repository
+            .staging_identity(id)
+            .await
+            .map_err(map_repository)?
+        {
+            Some(expected) if expected != actual => Err(UploadServiceError::Unavailable),
+            None => self
+                .repository
+                .record_staging_identity(id, actual)
+                .await
+                .map_err(map_repository),
+            Some(_) => Ok(()),
+        }
     }
 }
 

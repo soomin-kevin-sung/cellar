@@ -129,6 +129,20 @@ mod platform {
             self.verify_created_handle(file)
         }
 
+        pub fn create_staging_file_no_replace(
+            &self,
+            parent: &VerifiedHandle,
+            name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            self.verify_parent(parent)?;
+            let file = open_relative(
+                parent.file.as_raw_handle(),
+                name,
+                OpenMode::CreateExclusiveFile,
+            )?;
+            self.verify_created_handle(file)
+        }
+
         pub fn create_directory_no_replace(
             &self,
             parent: &VerifiedHandle,
@@ -501,6 +515,7 @@ mod platform {
         Existing,
         ExistingWritable,
         CreateFile,
+        CreateExclusiveFile,
         CreateDirectory,
     }
 
@@ -590,22 +605,36 @@ mod platform {
             information: 0,
         };
         let mut handle = ptr::null_mut();
-        let (disposition, type_option, desired_access) = match mode {
-            OpenMode::Existing => (FILE_OPEN, 0, FILE_GENERIC_READ | DELETE),
+        let (disposition, type_option, desired_access, share_access) = match mode {
+            OpenMode::Existing => (
+                FILE_OPEN,
+                0,
+                FILE_GENERIC_READ | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
             OpenMode::ExistingWritable => (
                 FILE_OPEN,
                 0,
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ,
             ),
             OpenMode::CreateFile => (
                 FILE_CREATE,
                 FILE_NON_DIRECTORY_FILE,
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
+            OpenMode::CreateExclusiveFile => (
+                FILE_CREATE,
+                FILE_NON_DIRECTORY_FILE,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ,
             ),
             OpenMode::CreateDirectory => (
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE,
                 FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
             ),
         };
         // SAFETY: all pointers reference live, correctly laid-out structures.
@@ -619,7 +648,7 @@ mod platform {
                 &mut status_block,
                 ptr::null_mut(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                share_access,
                 disposition,
                 type_option | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
                 ptr::null_mut(),
@@ -765,6 +794,14 @@ mod platform_stub {
         }
 
         pub fn create_file_no_replace(
+            &self,
+            _parent: &VerifiedHandle,
+            _name: &WindowsName,
+        ) -> Result<VerifiedHandle, StorageError> {
+            Err(unsupported())
+        }
+
+        pub fn create_staging_file_no_replace(
             &self,
             _parent: &VerifiedHandle,
             _name: &WindowsName,

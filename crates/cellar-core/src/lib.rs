@@ -23,6 +23,7 @@ pub use project::{
 pub use upload::{
     DEFAULT_FREE_SPACE_RESERVE, DEFAULT_MAX_ACTIVE_SESSIONS, DEFAULT_MAX_CHUNK_SIZE,
     DEFAULT_MAX_CONCURRENT_UPLOADS, DEFAULT_UPLOAD_TTL_DAYS, MAX_UPLOAD_NAME_BYTES, NewUpload,
-    PendingChunk, UploadLimits, UploadRepository, UploadRepositoryError, UploadService,
-    UploadServiceError, UploadSession, UploadStagingError, UploadStagingStore, UploadState,
+    PendingChunk, StagingIdentity, UploadLimits, UploadRepository, UploadRepositoryError,
+    UploadService, UploadServiceError, UploadSession, UploadStagingError, UploadStagingStore,
+    UploadState,
 };

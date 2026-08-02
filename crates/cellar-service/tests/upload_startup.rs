@@ -251,3 +251,104 @@ async fn initialization_failure_keeps_readiness_blocked_with_sanitized_reason() 
     assert_eq!(error.to_string(), "startup_recovery_failed");
     assert!(readiness.blocker_codes().contains(&"recovery_required"));
 }
+
+#[tokio::test]
+async fn staging_identity_is_durable_across_database_and_storage_reopen() {
+    let mut harness = Harness::new().await;
+    let (service, id) = harness.create().await;
+    let persisted: Vec<u8> = sqlx::query_scalar(
+        "SELECT platform_identity FROM upload_staging_identity WHERE upload_id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .expect("creation persisted exact staging identity");
+    assert_eq!(persisted.len(), 24);
+
+    drop(service);
+    drop(harness.staging.take());
+    harness.pool.close().await;
+    let database = harness._database_directory.path().join("cellar.db");
+    let reopened_pool = cellar_db::open_pool(
+        &database,
+        FilenameCollation::windows_ordinal_ci_v1(str::cmp),
+    )
+    .await
+    .unwrap();
+    cellar_db::migrate(&reopened_pool).await.unwrap();
+    harness.pool = reopened_pool;
+    let staging = harness.reopen_staging();
+    let readiness = Readiness::new([ReadinessBlocker::RecoveryRequired]);
+    let restarted = initialize_upload_recovery(
+        &harness.pool,
+        staging,
+        &readiness,
+        harness.now + Duration::seconds(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        restarted.status(id, harness.now).await.unwrap().state,
+        UploadState::Created
+    );
+}
+
+#[tokio::test]
+async fn live_staging_handle_excludes_namespace_replacement_and_local_writers() {
+    let harness = Harness::new().await;
+    let (service, id) = harness.create().await;
+    let staging_file = harness
+        .storage_directory
+        .path()
+        .join(".cellar-upload-staging")
+        .join(format!("{id}.part"));
+    let replacement = staging_file.with_extension("replacement");
+
+    assert!(std::fs::rename(&staging_file, &replacement).is_err());
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staging_file)
+            .is_err()
+    );
+    drop(service);
+}
+
+#[tokio::test]
+async fn restart_fails_replaced_staging_identity_and_queues_cleanup() {
+    let mut harness = Harness::new().await;
+    let (service, id) = harness.create().await;
+    let staging_file = harness
+        .storage_directory
+        .path()
+        .join(".cellar-upload-staging")
+        .join(format!("{id}.part"));
+    let displaced = staging_file.with_extension("displaced");
+    drop(service);
+    drop(harness.staging.take());
+    std::fs::rename(&staging_file, &displaced).unwrap();
+    std::fs::write(&staging_file, b"replacement").unwrap();
+
+    let staging = harness.reopen_staging();
+    let readiness = Readiness::new([ReadinessBlocker::RecoveryRequired]);
+    initialize_upload_recovery(&harness.pool, staging, &readiness, harness.now)
+        .await
+        .unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "failed");
+    assert!(staging_file.exists(), "mismatched replacement was deleted");
+    let queued: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_staging_cleanup WHERE upload_id = ?")
+            .bind(id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(queued, 1);
+    assert_eq!(std::fs::read(displaced).unwrap(), Vec::<u8>::new());
+}

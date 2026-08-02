@@ -237,6 +237,73 @@ async fn expand_only_upload_cleanup_queue_is_durable_and_v2_compatible() {
 }
 
 #[tokio::test]
+async fn expand_only_upload_staging_identity_is_v2_compatible_and_tamper_evident() {
+    let (_db, pool) = migrated_db().await;
+    assert!(previous_release_v2_accepts_schema_history(&pool).await);
+    let marker: String = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_staging_identity'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marker, "cellar-upload-staging-identity-v1");
+    insert_project(&pool, "identity-project").await;
+    insert_upload(
+        &pool,
+        "identity-upload",
+        "identity-project",
+        None,
+        "identity.bin",
+        "created",
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO upload_staging_identity (upload_id, platform_identity) VALUES (?, ?)")
+        .bind("identity-upload")
+        .bind(vec![7_u8; 24])
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_upload(
+        &pool,
+        "bad-length",
+        "identity-project",
+        None,
+        "bad-length.bin",
+        "created",
+    )
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query(
+            "INSERT INTO upload_staging_identity (upload_id, platform_identity) VALUES (?, ?)",
+        )
+        .bind("bad-length")
+        .bind(vec![0_u8; 23])
+        .execute(&pool)
+        .await
+        .is_err()
+    );
+    pool.close().await;
+
+    let (_tampered_db, tampered_pool) = migrated_db().await;
+    sqlx::query(
+        "UPDATE cellar_schema_extension SET fingerprint = 'tampered'
+         WHERE name = 'upload_staging_identity'",
+    )
+    .execute(&tampered_pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        migrate(&tampered_pool).await,
+        Err(DbError::SchemaVersion)
+    ));
+    assert!(previous_release_v2_accepts_schema_history(&tampered_pool).await);
+    tampered_pool.close().await;
+}
+
+#[tokio::test]
 async fn upload_cleanup_extension_tampering_fails_closed() {
     let (_marker_db, marker_pool) = migrated_db().await;
     sqlx::query(

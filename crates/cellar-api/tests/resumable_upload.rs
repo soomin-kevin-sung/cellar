@@ -1056,7 +1056,37 @@ async fn live_chunk_lease_blocks_status_duplicate_put_and_cancel_until_cas_commi
 }
 
 #[tokio::test]
-async fn startup_maintenance_releases_db_committed_creation_with_missing_staging() {
+async fn blocked_upload_does_not_head_of_line_block_an_independent_session() {
+    let harness = make_harness(default_limits(), 1_000).await;
+    let token = csrf_token(&harness.app).await;
+    let blocked_id = created_id(&harness, &token, "blocked-a.bin", "3").await;
+    let independent_id = created_id(&harness, &token, "independent-b.bin", "3").await;
+    harness.staging.block_write.store(true, Ordering::SeqCst);
+    let app = harness.app.clone();
+    let writer_request = chunk_request(&token, blocked_id, "0", b"abc");
+    let writer = tokio::spawn(async move { app.oneshot(writer_request).await.unwrap() });
+    harness.staging.write_started.notified().await;
+
+    let app = harness.app.clone();
+    let status_request = request(
+        "GET",
+        &format!("/api/v1/uploads/{independent_id}"),
+        Body::empty(),
+    );
+    let independent = tokio::spawn(async move { app.oneshot(status_request).await.unwrap() });
+    let response = tokio::time::timeout(std::time::Duration::from_millis(250), independent)
+        .await
+        .expect("independent upload was globally blocked")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    harness.staging.block_write.store(false, Ordering::SeqCst);
+    harness.staging.release_write.notify_one();
+    assert_eq!(writer.await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn startup_initialization_releases_db_committed_creation_with_missing_staging() {
     let mut limits = default_limits();
     limits.max_active_sessions = 1;
     let harness = make_harness(limits, 1_000).await;
@@ -1104,7 +1134,7 @@ async fn startup_maintenance_releases_db_committed_creation_with_missing_staging
         limits,
     );
     restarted
-        .maintain(OffsetDateTime::from_unix_timestamp(NOW).unwrap())
+        .initialize(OffsetDateTime::from_unix_timestamp(NOW).unwrap())
         .await
         .unwrap();
     let old_state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
