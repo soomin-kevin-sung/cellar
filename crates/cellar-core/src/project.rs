@@ -240,6 +240,7 @@ pub enum OperationStart {
     New,
     Completed(Project),
     InProgress,
+    Failed(DirectoryStoreError),
 }
 
 #[async_trait]
@@ -247,9 +248,8 @@ pub trait ProjectRepository: Send + Sync {
     async fn begin_create(
         &self,
         operation_id: OperationId,
-        project_id: ProjectId,
+        project: &Project,
         request_digest: &str,
-        now: OffsetDateTime,
     ) -> Result<OperationStart, ProjectRepositoryError>;
 
     async fn mark_create_fs_applied(
@@ -269,6 +269,12 @@ pub trait ProjectRepository: Send + Sync {
         &self,
         operation_id: OperationId,
         project: &Project,
+    ) -> Result<Project, ProjectRepositoryError>;
+
+    /// Completes or replays a create from its recorded versioned payload.
+    async fn recover_create(
+        &self,
+        operation_id: OperationId,
     ) -> Result<Project, ProjectRepositoryError>;
 
     async fn read(&self, id: ProjectId) -> Result<Project, ProjectRepositoryError>;
@@ -406,9 +412,10 @@ impl ProjectService {
         let operation_id = idempotency_key.unwrap_or_default();
         let project_id = ProjectId::new();
         let digest = request_digest(&input);
+        let project = Project::from_new(project_id, input, now);
         match self
             .repository
-            .begin_create(operation_id, project_id, &digest, now)
+            .begin_create(operation_id, &project, &digest)
             .await
         {
             Ok(OperationStart::Completed(project)) => {
@@ -418,13 +425,18 @@ impl ProjectService {
                 });
             }
             Ok(OperationStart::InProgress) => return Err(ProjectServiceError::InProgress),
+            Ok(OperationStart::Failed(error)) => {
+                return Err(match error {
+                    DirectoryStoreError::Conflict => ProjectServiceError::Conflict,
+                    DirectoryStoreError::Unavailable => ProjectServiceError::Unavailable,
+                });
+            }
             Ok(OperationStart::New) => {}
             Err(ProjectRepositoryError::Conflict) => {
                 return Err(ProjectServiceError::IdempotencyConflict);
             }
             Err(error) => return Err(map_repository_error(error)),
         }
-        let project = Project::from_new(project_id, input, now);
         if let Err(error) = self.directories.create_project_directory(project_id).await {
             let _ = self
                 .repository

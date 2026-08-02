@@ -145,7 +145,13 @@ async fn assert_project_error(response: axum::response::Response, status: Status
 }
 
 async fn app() -> (axum::Router, TempDir, SqlitePool, Arc<RecordingDirectories>) {
-    let (directory, pool, service, directories) = test_service(None).await;
+    app_with_directory_outcome(None).await
+}
+
+async fn app_with_directory_outcome(
+    outcome: Option<DirectoryStoreError>,
+) -> (axum::Router, TempDir, SqlitePool, Arc<RecordingDirectories>) {
+    let (directory, pool, service, directories) = test_service(outcome).await;
     let protected = projects_router_with_clock::<EnrolledStore, _>(service, || {
         OffsetDateTime::from_unix_timestamp(NOW).unwrap()
     });
@@ -672,6 +678,130 @@ async fn pending_and_fs_applied_replays_fail_closed_without_directory_mutation()
     assert!(replay.replayed);
     assert_eq!(replay.project, created);
     assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn terminal_storage_failures_replay_the_same_outward_error_without_retrying_directory() {
+    for (outcome, status, code) in [
+        (
+            DirectoryStoreError::Conflict,
+            StatusCode::CONFLICT,
+            "project_destination_conflict",
+        ),
+        (
+            DirectoryStoreError::Unavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_service_unavailable",
+        ),
+    ] {
+        let (app, _directory, pool, directories) = app_with_directory_outcome(Some(outcome)).await;
+        let token = csrf_token(&app).await;
+        let operation = OperationId::new();
+        for _ in 0..2 {
+            let mut create = json_request(
+                "POST",
+                "/api/v1/projects",
+                json!({"name":"terminal","description":"same"}),
+            );
+            create.headers_mut().insert(
+                HeaderName::from_static("idempotency-key"),
+                operation.to_string().parse().unwrap(),
+            );
+            authorize_mutation(&mut create, &token);
+            assert_project_error(app.clone().oneshot(create).await.unwrap(), status, code).await;
+        }
+        assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+
+        let mut mismatch = json_request(
+            "POST",
+            "/api/v1/projects",
+            json!({"name":"terminal-different","description":"same"}),
+        );
+        mismatch.headers_mut().insert(
+            HeaderName::from_static("idempotency-key"),
+            operation.to_string().parse().unwrap(),
+        );
+        authorize_mutation(&mut mismatch, &token);
+        assert_project_error(
+            app.clone().oneshot(mismatch).await.unwrap(),
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+        )
+        .await;
+        assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+
+        sqlx::query("UPDATE operation SET error = ? WHERE id = ?")
+            .bind("C:\\private\\must-not-leak")
+            .bind(operation.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut corrupt = json_request(
+            "POST",
+            "/api/v1/projects",
+            json!({"name":"terminal","description":"same"}),
+        );
+        corrupt.headers_mut().insert(
+            HeaderName::from_static("idempotency-key"),
+            operation.to_string().parse().unwrap(),
+        );
+        authorize_mutation(&mut corrupt, &token);
+        let corrupt = app.clone().oneshot(corrupt).await.unwrap();
+        assert_project_error(
+            corrupt,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_service_unavailable",
+        )
+        .await;
+        assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn unsupported_project_methods_use_stable_json_after_auth_and_csrf() {
+    let (app, _directory, pool, _directories) = app().await;
+    let id = ProjectId::new();
+    let anonymous = app
+        .clone()
+        .oneshot(request("PUT", "/api/v1/projects", Body::empty(), false))
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let no_csrf = app
+        .clone()
+        .oneshot(request("PUT", "/api/v1/projects", Body::empty(), true))
+        .await
+        .unwrap();
+    assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+    let token = csrf_token(&app).await;
+    for (method, uri, csrf) in [
+        ("PUT", "/api/v1/projects".to_owned(), true),
+        ("DELETE", format!("/api/v1/projects/{id}"), true),
+        ("DELETE", format!("/api/v1/projects/{id}/archive"), true),
+        ("OPTIONS", "/api/v1/projects".to_owned(), false),
+    ] {
+        let mut unsupported = request(method, &uri, Body::empty(), true);
+        if csrf {
+            authorize_mutation(&mut unsupported, &token);
+        }
+        let response = app.clone().oneshot(unsupported).await.unwrap();
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+        assert_project_error(
+            response,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+        )
+        .await;
+    }
     pool.close().await;
 }
 

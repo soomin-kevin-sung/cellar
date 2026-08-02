@@ -56,12 +56,22 @@ where
         clock: Arc::new(clock),
     };
     Router::new()
-        .route("/api/v1/projects", post(create_project).get(list_projects))
+        .route(
+            "/api/v1/projects",
+            post(create_project)
+                .get(list_projects)
+                .fallback(method_not_allowed),
+        )
         .route(
             "/api/v1/projects/{id}",
-            get(get_project).patch(update_project),
+            get(get_project)
+                .patch(update_project)
+                .fallback(method_not_allowed),
         )
-        .route("/api/v1/projects/{id}/archive", post(archive_project))
+        .route(
+            "/api/v1/projects/{id}/archive",
+            post(archive_project).fallback(method_not_allowed),
+        )
         .route("/api/v1/projects/", any(invalid_project_path))
         .route("/api/v1/projects/{id}/", any(invalid_project_path))
         .route("/api/v1/projects/{id}/{extra}", any(invalid_project_path))
@@ -323,6 +333,13 @@ async fn invalid_project_path(headers: HeaderMap) -> ProjectApiError {
     }
 }
 
+async fn method_not_allowed(headers: HeaderMap) -> ProjectApiError {
+    match request_id(&headers) {
+        Ok(request_id) => ProjectApiError::method_not_allowed(request_id),
+        Err(error) => error,
+    }
+}
+
 fn request_id(headers: &HeaderMap) -> Result<String, ProjectApiError> {
     let values: Vec<_> = headers.get_all(&REQUEST_ID).iter().collect();
     if values.is_empty() {
@@ -516,6 +533,15 @@ impl ProjectApiError {
 
     fn unavailable(request_id: String) -> Self {
         Self::service(ProjectServiceError::Unavailable, request_id)
+    }
+
+    fn method_not_allowed(request_id: String) -> Self {
+        Self {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: "method_not_allowed",
+            message: "The request method is not allowed for this project resource.",
+            request_id,
+        }
     }
 }
 

@@ -6,8 +6,7 @@ use cellar_core::{
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
-use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, UtcOffset};
+use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
 #[derive(Clone)]
 pub struct SqliteProjectRepository {
@@ -21,10 +20,20 @@ impl SqliteProjectRepository {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+const FIXED_UTC_TIMESTAMP_FORMAT: &str =
+    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z";
+const MAX_REQUEST_DIGEST_BYTES: usize = 128;
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreatePayload<'a> {
     project_id: String,
+    name: &'a str,
+    description: &'a str,
+    status: ProjectStatus,
+    version: i64,
+    created_at: String,
+    updated_at: String,
     request_digest: &'a str,
 }
 
@@ -32,7 +41,76 @@ struct CreatePayload<'a> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredCreatePayload {
     project_id: String,
+    name: String,
+    description: String,
+    status: ProjectStatus,
+    version: i64,
+    created_at: String,
+    updated_at: String,
     request_digest: String,
+}
+
+pub struct RecoveredProjectCreate {
+    pub project: Project,
+    request_digest: String,
+}
+
+impl RecoveredProjectCreate {
+    #[must_use]
+    pub fn request_digest(&self) -> &str {
+        &self.request_digest
+    }
+}
+
+impl std::fmt::Debug for RecoveredProjectCreate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveredProjectCreate")
+            .field("project", &self.project)
+            .field("request_digest", &"<redacted>")
+            .finish()
+    }
+}
+
+pub fn decode_project_create_payload(
+    payload: &str,
+) -> Result<RecoveredProjectCreate, ProjectRepositoryError> {
+    let payload: StoredCreatePayload =
+        serde_json::from_str(payload).map_err(|_| ProjectRepositoryError::Unavailable)?;
+    if payload.request_digest.is_empty()
+        || payload.request_digest.len() > MAX_REQUEST_DIGEST_BYTES
+        || !payload
+            .request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic())
+        || payload.status != ProjectStatus::Active
+        || payload.version != 1
+    {
+        return Err(ProjectRepositoryError::Unavailable);
+    }
+    let created_at = parse_timestamp(&payload.created_at)?;
+    let updated_at = parse_timestamp(&payload.updated_at)?;
+    if created_at != updated_at {
+        return Err(ProjectRepositoryError::Unavailable);
+    }
+    Ok(RecoveredProjectCreate {
+        project: Project {
+            id: payload
+                .project_id
+                .parse()
+                .map_err(|_| ProjectRepositoryError::Unavailable)?,
+            name: ProjectName::parse(payload.name)
+                .map_err(|_| ProjectRepositoryError::Unavailable)?,
+            description: ProjectDescription::parse(payload.description)
+                .map_err(|_| ProjectRepositoryError::Unavailable)?,
+            status: payload.status,
+            version: payload.version,
+            created_at,
+            updated_at,
+            deleted_at: None,
+        },
+        request_digest: payload.request_digest,
+    })
 }
 
 #[async_trait]
@@ -40,16 +118,21 @@ impl ProjectRepository for SqliteProjectRepository {
     async fn begin_create(
         &self,
         operation_id: OperationId,
-        project_id: ProjectId,
+        project: &Project,
         request_digest: &str,
-        now: OffsetDateTime,
     ) -> Result<OperationStart, ProjectRepositoryError> {
         let payload = serde_json::to_string(&CreatePayload {
-            project_id: project_id.to_string(),
+            project_id: project.id.to_string(),
+            name: project.name.as_str(),
+            description: project.description.as_str(),
+            status: project.status,
+            version: project.version,
+            created_at: timestamp(project.created_at)?,
+            updated_at: timestamp(project.updated_at)?,
             request_digest,
         })
         .map_err(|_| ProjectRepositoryError::Unavailable)?;
-        let now = timestamp(now)?;
+        let now = timestamp(project.created_at)?;
         let inserted = sqlx::query(
             "INSERT INTO operation
              (id, project_id, kind, state, payload_version, payload, created_at, updated_at)
@@ -68,34 +151,42 @@ impl ProjectRepository for SqliteProjectRepository {
             return Ok(OperationStart::New);
         }
 
-        let row =
-            sqlx::query("SELECT kind, state, payload_version, payload FROM operation WHERE id = ?")
-                .bind(operation_id.to_string())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sql)?
-                .ok_or(ProjectRepositoryError::Unavailable)?;
+        let row = sqlx::query(
+            "SELECT kind, state, payload_version, payload, error
+             FROM operation WHERE id = ?",
+        )
+        .bind(operation_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sql)?
+        .ok_or(ProjectRepositoryError::Unavailable)?;
         let kind: String = row.try_get("kind").map_err(map_sql)?;
         let state: String = row.try_get("state").map_err(map_sql)?;
         let payload_version: i64 = row.try_get("payload_version").map_err(map_sql)?;
         let payload: String = row.try_get("payload").map_err(map_sql)?;
+        let operation_error: Option<String> = row.try_get("error").map_err(map_sql)?;
         if kind != "project_create" || payload_version != 1 {
             return Err(ProjectRepositoryError::Conflict);
         }
-        let payload: StoredCreatePayload =
-            serde_json::from_str(&payload).map_err(|_| ProjectRepositoryError::Unavailable)?;
-        if payload.request_digest != request_digest {
+        let payload = decode_project_create_payload(&payload)?;
+        if payload.request_digest() != request_digest {
             return Err(ProjectRepositoryError::Conflict);
         }
         match state.as_str() {
-            "complete" => {
-                let id = payload
-                    .project_id
-                    .parse()
-                    .map_err(|_| ProjectRepositoryError::Unavailable)?;
-                self.read(id).await.map(OperationStart::Completed)
-            }
-            "pending" | "fs_applied" | "failed" => Ok(OperationStart::InProgress),
+            "complete" => self
+                .read(payload.project.id)
+                .await
+                .map(OperationStart::Completed),
+            "pending" | "fs_applied" => Ok(OperationStart::InProgress),
+            "failed" => match operation_error.as_deref() {
+                Some("project_destination_conflict") => Ok(OperationStart::Failed(
+                    cellar_core::DirectoryStoreError::Conflict,
+                )),
+                Some("project_storage_unavailable") => Ok(OperationStart::Failed(
+                    cellar_core::DirectoryStoreError::Unavailable,
+                )),
+                _ => Err(ProjectRepositoryError::Unavailable),
+            },
             _ => Err(ProjectRepositoryError::Unavailable),
         }
     }
@@ -151,11 +242,60 @@ impl ProjectRepository for SqliteProjectRepository {
         operation_id: OperationId,
         project: &Project,
     ) -> Result<Project, ProjectRepositoryError> {
+        let recovered = self.recover_create(operation_id).await?;
+        if recovered == *project {
+            Ok(recovered)
+        } else {
+            Err(ProjectRepositoryError::Conflict)
+        }
+    }
+
+    async fn recover_create(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Project, ProjectRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(map_sql)?;
-        let inserted = sqlx::query(
+        let row = sqlx::query(
+            "SELECT state, payload_version, payload FROM operation
+             WHERE id = ? AND kind = 'project_create'",
+        )
+        .bind(operation_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_sql)?
+        .ok_or(ProjectRepositoryError::NotFound)?;
+        let state: String = row.try_get("state").map_err(map_sql)?;
+        let payload_version: i64 = row.try_get("payload_version").map_err(map_sql)?;
+        let payload: String = row.try_get("payload").map_err(map_sql)?;
+        if payload_version != 1 {
+            return Err(ProjectRepositoryError::Unavailable);
+        }
+        let recovered = decode_project_create_payload(&payload)?;
+        if state == "complete" {
+            let row = sqlx::query(
+                "SELECT id, name, description, status, version, created_at, updated_at,
+                        deleted_at
+                 FROM project WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(recovered.project.id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(map_sql)?
+            .ok_or(ProjectRepositoryError::Unavailable)?;
+            let project = project_from_row(&row)?;
+            transaction.commit().await.map_err(map_sql)?;
+            return Ok(project);
+        }
+        if state != "fs_applied" {
+            return Err(ProjectRepositoryError::Unavailable);
+        }
+
+        let project = &recovered.project;
+        sqlx::query(
             "INSERT INTO project
              (id, name, description, status, version, created_at, updated_at, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+             ON CONFLICT(id) DO NOTHING",
         )
         .bind(project.id.to_string())
         .bind(project.name.as_str())
@@ -166,10 +306,17 @@ impl ProjectRepository for SqliteProjectRepository {
         .bind(timestamp(project.updated_at)?)
         .execute(&mut *transaction)
         .await
-        .map_err(map_insert_sql)?
-        .rows_affected();
-        if inserted != 1 {
-            return Err(ProjectRepositoryError::Unavailable);
+        .map_err(map_sql)?;
+        let row = sqlx::query(
+            "SELECT id, name, description, status, version, created_at, updated_at, deleted_at
+             FROM project WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(project.id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_sql)?;
+        if project_from_row(&row)? != *project {
+            return Err(ProjectRepositoryError::Conflict);
         }
         let completed = sqlx::query(
             "UPDATE operation
@@ -344,26 +491,24 @@ fn project_from_row(row: &SqliteRow) -> Result<Project, ProjectRepositoryError> 
 }
 
 fn timestamp(value: OffsetDateTime) -> Result<String, ProjectRepositoryError> {
+    let format = time::format_description::parse_borrowed::<2>(FIXED_UTC_TIMESTAMP_FORMAT)
+        .map_err(|_| ProjectRepositoryError::Unavailable)?;
     value
         .to_offset(UtcOffset::UTC)
-        .format(&Rfc3339)
+        .format(&format)
         .map_err(|_| ProjectRepositoryError::Unavailable)
 }
 
 fn parse_timestamp(value: &str) -> Result<OffsetDateTime, ProjectRepositoryError> {
-    OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ProjectRepositoryError::Unavailable)
+    let format = time::format_description::parse_borrowed::<2>(FIXED_UTC_TIMESTAMP_FORMAT)
+        .map_err(|_| ProjectRepositoryError::Unavailable)?;
+    PrimitiveDateTime::parse(value, &format)
+        .map(PrimitiveDateTime::assume_utc)
+        .map_err(|_| ProjectRepositoryError::Unavailable)
 }
 
 fn map_sql(_error: sqlx::Error) -> ProjectRepositoryError {
     ProjectRepositoryError::Unavailable
-}
-
-fn map_insert_sql(error: sqlx::Error) -> ProjectRepositoryError {
-    if matches!(&error, sqlx::Error::Database(database) if database.is_unique_violation()) {
-        ProjectRepositoryError::Conflict
-    } else {
-        ProjectRepositoryError::Unavailable
-    }
 }
 
 #[cfg(test)]
@@ -386,9 +531,14 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(10).unwrap();
         let operation = OperationId::new();
         let id = ProjectId::new();
+        let project = Project::from_new(
+            id,
+            cellar_core::NewProject::try_new("name", "description").unwrap(),
+            now,
+        );
         assert_eq!(
             repository
-                .begin_create(operation, id, "digest", now)
+                .begin_create(operation, &project, "digest")
                 .await
                 .unwrap(),
             OperationStart::New
@@ -397,11 +547,6 @@ mod tests {
             .mark_create_fs_applied(operation, now)
             .await
             .unwrap();
-        let project = Project::from_new(
-            id,
-            cellar_core::NewProject::try_new("name", "description").unwrap(),
-            now,
-        );
         repository.create(operation, &project).await.unwrap()
     }
 
@@ -465,14 +610,14 @@ mod tests {
         let operation: OperationId = operation.parse().unwrap();
         assert_eq!(
             repository
-                .begin_create(operation, ProjectId::new(), "digest", project.created_at)
+                .begin_create(operation, &project, "digest")
                 .await
                 .unwrap(),
             OperationStart::Completed(project.clone())
         );
         assert_eq!(
             repository
-                .begin_create(operation, ProjectId::new(), "different", project.created_at)
+                .begin_create(operation, &project, "different")
                 .await,
             Err(ProjectRepositoryError::Conflict)
         );
@@ -493,28 +638,40 @@ mod tests {
         let archived = ProjectId::new();
         let deleted = ProjectId::new();
         for (id, name, status, created_at, deleted_at) in [
-            (early, "early", "active", "1970-01-01T00:00:01Z", None),
+            (
+                early,
+                "early",
+                "active",
+                "1970-01-01T00:00:01.000000000Z",
+                None,
+            ),
             (
                 higher_id,
                 "same-high",
                 "active",
-                "1970-01-01T00:00:02Z",
+                "1970-01-01T00:00:02.000000000Z",
                 None,
             ),
-            (lower_id, "same-low", "active", "1970-01-01T00:00:02Z", None),
+            (
+                lower_id,
+                "same-low",
+                "active",
+                "1970-01-01T00:00:02.000000000Z",
+                None,
+            ),
             (
                 archived,
                 "archived",
                 "archived",
-                "1970-01-01T00:00:03Z",
+                "1970-01-01T00:00:03.000000000Z",
                 None,
             ),
             (
                 deleted,
                 "deleted",
                 "active",
-                "1970-01-01T00:00:00Z",
-                Some("1970-01-01T00:00:04Z"),
+                "1970-01-01T00:00:00.000000000Z",
+                Some("1970-01-01T00:00:04.000000000Z"),
             ),
         ] {
             sqlx::query(
@@ -577,6 +734,146 @@ mod tests {
             repository.archive(deleted, 1, now).await,
             Err(ProjectRepositoryError::NotFound)
         );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn fs_applied_payload_reconstructs_and_recovers_the_exact_project() {
+        let (_directory, pool, repository) = repository().await;
+        let operation = OperationId::new();
+        let project = Project::from_new(
+            ProjectId::new(),
+            cellar_core::NewProject::try_new("recover me", "line one\nline two").unwrap(),
+            OffsetDateTime::from_unix_timestamp(5)
+                .unwrap()
+                .replace_nanosecond(123_456_789)
+                .unwrap(),
+        );
+        assert_eq!(
+            repository
+                .begin_create(operation, &project, "body-digest")
+                .await
+                .unwrap(),
+            OperationStart::New
+        );
+        repository
+            .mark_create_fs_applied(operation, project.created_at)
+            .await
+            .unwrap();
+        let payload: String = sqlx::query_scalar("SELECT payload FROM operation WHERE id = ?")
+            .bind(operation.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let recovered = decode_project_create_payload(&payload).unwrap();
+        assert_eq!(recovered.project, project);
+        assert_eq!(recovered.request_digest(), "body-digest");
+        assert_eq!(
+            payload,
+            format!(
+                concat!(
+                    "{{\"projectId\":\"{}\",\"name\":\"recover me\",",
+                    "\"description\":\"line one\\nline two\",\"status\":\"active\",",
+                    "\"version\":1,\"createdAt\":\"1970-01-01T00:00:05.123456789Z\",",
+                    "\"updatedAt\":\"1970-01-01T00:00:05.123456789Z\",",
+                    "\"requestDigest\":\"body-digest\"}}"
+                ),
+                project.id
+            )
+        );
+        let with_unknown = payload.replacen("{", "{\"absolutePath\":\"C:\\\\private\",", 1);
+        assert_eq!(
+            decode_project_create_payload(&with_unknown).unwrap_err(),
+            ProjectRepositoryError::Unavailable
+        );
+        let variable_width = payload.replace("05.123456789Z", "05.123Z");
+        assert_eq!(
+            decode_project_create_payload(&variable_width).unwrap_err(),
+            ProjectRepositoryError::Unavailable
+        );
+
+        assert_eq!(repository.recover_create(operation).await.unwrap(), project);
+        assert_eq!(repository.recover_create(operation).await.unwrap(), project);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn timestamps_are_fixed_width_utc_and_sort_chronologically() {
+        let (_directory, pool, repository) = repository().await;
+        let zero = OffsetDateTime::from_unix_timestamp(5).unwrap();
+        let fraction = zero.replace_nanosecond(100_000_000).unwrap();
+        assert_eq!(timestamp(zero).unwrap(), "1970-01-01T00:00:05.000000000Z");
+        assert_eq!(
+            timestamp(fraction).unwrap(),
+            "1970-01-01T00:00:05.100000000Z"
+        );
+
+        let later = Project::from_new(
+            ProjectId::new(),
+            cellar_core::NewProject::try_new("later", "").unwrap(),
+            fraction,
+        );
+        let earlier = Project::from_new(
+            ProjectId::new(),
+            cellar_core::NewProject::try_new("earlier", "").unwrap(),
+            zero,
+        );
+        for project in [&later, &earlier] {
+            let operation = OperationId::new();
+            repository
+                .begin_create(operation, project, project.name.as_str())
+                .await
+                .unwrap();
+            repository
+                .mark_create_fs_applied(operation, project.created_at)
+                .await
+                .unwrap();
+            repository.create(operation, project).await.unwrap();
+        }
+        let listed = repository
+            .list(ProjectListFilter::Status(ProjectStatus::Active), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|project| project.id).collect::<Vec<_>>(),
+            vec![earlier.id, later.id]
+        );
+        assert_eq!(listed, vec![earlier.clone(), later.clone()]);
+        let stored: Vec<String> =
+            sqlx::query_scalar("SELECT created_at FROM project ORDER BY created_at")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                "1970-01-01T00:00:05.000000000Z",
+                "1970-01-01T00:00:05.100000000Z"
+            ]
+        );
+
+        let update_time = OffsetDateTime::from_unix_timestamp(6)
+            .unwrap()
+            .replace_nanosecond(7)
+            .unwrap();
+        let updated = repository
+            .update(
+                earlier.id,
+                1,
+                &ProjectPatch::try_new(None, Some("updated".into())).unwrap(),
+                update_time,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.updated_at, update_time);
+        assert_eq!(repository.read(earlier.id).await.unwrap(), updated);
+        let stored_updated_at: String =
+            sqlx::query_scalar("SELECT updated_at FROM project WHERE id = ?")
+                .bind(earlier.id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_updated_at, "1970-01-01T00:00:06.000000007Z");
         pool.close().await;
     }
 }
