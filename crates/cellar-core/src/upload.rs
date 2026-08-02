@@ -226,6 +226,7 @@ pub trait UploadStagingStore: Send + Sync {
     async fn identity(&self, _id: UploadId) -> Result<Option<StagingIdentity>, UploadStagingError> {
         Ok(None)
     }
+    async fn release(&self, _id: UploadId) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,7 +431,11 @@ impl UploadService {
         let _lease = self.leases.acquire(id).await;
         self.repository.cancel(id).await.map_err(map_repository)?;
         match self.staging.remove(id).await {
-            Ok(()) | Err(UploadStagingError::NotFound) => Ok(()),
+            Ok(()) | Err(UploadStagingError::NotFound) => self
+                .repository
+                .complete_cleanup(id)
+                .await
+                .map_err(map_repository),
             Err(error) => Err(map_staging(error)),
         }
     }
@@ -453,6 +458,9 @@ impl UploadService {
             if Some(id) == excluded {
                 continue;
             }
+            let Some(_lease) = self.leases.try_acquire(id) else {
+                continue;
+            };
             if self
                 .repository
                 .expire_if_due(id, now)
@@ -462,7 +470,7 @@ impl UploadService {
                 let _ = self.staging.remove(id).await;
             }
         }
-        self.cleanup_staging(excluded).await
+        self.cleanup_staging(excluded, false).await
     }
 
     async fn initialize_all(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
@@ -523,10 +531,14 @@ impl UploadService {
                 }
             }
         }
-        self.cleanup_staging(None).await
+        self.cleanup_staging(None, true).await
     }
 
-    async fn cleanup_staging(&self, excluded: Option<UploadId>) -> Result<(), UploadServiceError> {
+    async fn cleanup_staging(
+        &self,
+        excluded: Option<UploadId>,
+        wait_for_lease: bool,
+    ) -> Result<(), UploadServiceError> {
         for id in self
             .repository
             .cleanup_ids()
@@ -536,9 +548,39 @@ impl UploadService {
             if Some(id) == excluded {
                 continue;
             }
-            let _lease = self.leases.acquire(id).await;
-            if self.verify_staging_identity(id).await.is_err() {
-                continue;
+            let _lease = if wait_for_lease {
+                self.leases.acquire(id).await
+            } else {
+                let Some(lease) = self.leases.try_acquire(id) else {
+                    continue;
+                };
+                lease
+            };
+            let actual = match self.staging.identity(id).await {
+                Ok(actual) => actual,
+                Err(UploadStagingError::NotFound) => {
+                    self.staging.release(id).await;
+                    self.repository
+                        .complete_cleanup(id)
+                        .await
+                        .map_err(map_repository)?;
+                    continue;
+                }
+                Err(_) => {
+                    self.staging.release(id).await;
+                    continue;
+                }
+            };
+            if let Some(actual) = actual {
+                let expected = self
+                    .repository
+                    .staging_identity(id)
+                    .await
+                    .map_err(map_repository)?;
+                if expected.is_some_and(|expected| expected != actual) {
+                    self.staging.release(id).await;
+                    continue;
+                }
             }
             match self.staging.remove(id).await {
                 Ok(()) | Err(UploadStagingError::NotFound) => self
@@ -667,6 +709,27 @@ impl UploadLeaseTable {
             guard: Some(guard),
             table: Arc::clone(self),
         }
+    }
+
+    fn try_acquire(self: &Arc<Self>, id: UploadId) -> Option<UploadLease> {
+        let lock = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                entries
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let guard = Arc::clone(&lock).try_lock_owned().ok()?;
+        Some(UploadLease {
+            id,
+            lock,
+            guard: Some(guard),
+            table: Arc::clone(self),
+        })
     }
 }
 

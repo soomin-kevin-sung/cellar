@@ -351,4 +351,8 @@ async fn restart_fails_replaced_staging_identity_and_queues_cleanup() {
             .unwrap();
     assert_eq!(queued, 1);
     assert_eq!(std::fs::read(displaced).unwrap(), Vec::<u8>::new());
+    let released = staging_file.with_extension("released");
+    std::fs::rename(&staging_file, &released)
+        .expect("identity mismatch retained a cached adapter handle");
+    std::fs::rename(released, staging_file).unwrap();
 }

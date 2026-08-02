@@ -69,7 +69,7 @@ impl WindowsUploadStaging {
     fn ensure_handle(
         &self,
         id: UploadId,
-        entry: &StagingEntry,
+        entry: &Arc<StagingEntry>,
     ) -> Result<VerifiedHandle, UploadStagingError> {
         let mut slot = entry
             .handle
@@ -79,12 +79,33 @@ impl WindowsUploadStaging {
             return Ok(handle.clone());
         }
         let name = Self::name(id)?;
-        let handle = self
-            .storage
-            .open_verified_writable(&self.directory, &name)
-            .map_err(map_storage)?;
+        let handle = match self.storage.open_verified_writable(&self.directory, &name) {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(slot);
+                self.release_entry(id, entry);
+                return Err(map_storage(error));
+            }
+        };
         *slot = Some(handle.clone());
         Ok(handle)
+    }
+
+    fn release_entry(&self, id: UploadId, entry: &Arc<StagingEntry>) {
+        *entry
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            entries.remove(&id);
+        }
     }
 }
 
@@ -96,10 +117,16 @@ impl UploadStagingStore for WindowsUploadStaging {
         blocking(move || {
             let _guard = entry.io.blocking_lock();
             let name = Self::name(id)?;
-            let handle = this
+            let handle = match this
                 .storage
                 .create_staging_file_no_replace(&this.directory, &name)
-                .map_err(map_storage)?;
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    this.release_entry(id, &entry);
+                    return Err(map_storage(error));
+                }
+            };
             *entry
                 .handle
                 .lock()
@@ -210,14 +237,7 @@ impl UploadStagingStore for WindowsUploadStaging {
             let _guard = entry.io.blocking_lock();
             let handle = this.ensure_handle(id, &entry)?;
             this.storage.remove_file(handle).map_err(map_storage)?;
-            *entry
-                .handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-            this.entries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&id);
+            this.release_entry(id, &entry);
             Ok(())
         })
         .await
@@ -241,6 +261,17 @@ impl UploadStagingStore for WindowsUploadStaging {
             Ok(Some(StagingIdentity::new(bytes)))
         })
         .await
+    }
+
+    async fn release(&self, id: UploadId) {
+        let entry = self.entry(id);
+        let this = self.clone();
+        let _ = blocking(move || {
+            let _guard = entry.io.blocking_lock();
+            this.release_entry(id, &entry);
+            Ok(())
+        })
+        .await;
     }
 }
 
@@ -296,5 +327,22 @@ mod tests {
         );
         release_tx.send(()).unwrap();
         assert_eq!(waiting.await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_open_releases_new_adapter_entry_and_retry_can_create() {
+        let directory = tempdir().unwrap();
+        let identity = crate::preflight::open_as_service(directory.path()).unwrap();
+        let storage = WindowsStorage::adopt(identity).unwrap();
+        let staging = WindowsUploadStaging::open(storage).unwrap();
+        let id = UploadId::new();
+
+        assert_eq!(
+            staging.length(id).await.unwrap_err(),
+            UploadStagingError::NotFound
+        );
+        assert!(!staging.entries.lock().unwrap().contains_key(&id));
+        staging.create(id).await.unwrap();
+        assert_eq!(staging.length(id).await.unwrap(), 0);
     }
 }

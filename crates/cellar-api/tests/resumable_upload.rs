@@ -1044,6 +1044,13 @@ async fn live_chunk_lease_blocks_status_duplicate_put_and_cancel_until_cas_commi
     .await
     .unwrap();
     assert_eq!(cancelled, ("cancelled".to_owned(), 3, None));
+    let cleanup_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM upload_staging_cleanup WHERE upload_id = ?")
+            .bind(cancel_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(cleanup_rows, 0, "successful cancel left cleanup evidence");
     assert!(
         !harness
             .staging
@@ -1066,6 +1073,13 @@ async fn blocked_upload_does_not_head_of_line_block_an_independent_session() {
     let writer_request = chunk_request(&token, blocked_id, "0", b"abc");
     let writer = tokio::spawn(async move { app.oneshot(writer_request).await.unwrap() });
     harness.staging.write_started.notified().await;
+    sqlx::query(
+        "UPDATE upload_session SET expires_at = '1970-01-01T00:00:00.000000000Z' WHERE id = ?",
+    )
+    .bind(blocked_id.to_string())
+    .execute(&harness.pool)
+    .await
+    .unwrap();
 
     let app = harness.app.clone();
     let status_request = request(
@@ -1079,10 +1093,96 @@ async fn blocked_upload_does_not_head_of_line_block_an_independent_session() {
         .expect("independent upload was globally blocked")
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let busy_state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
+        .bind(blocked_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        busy_state, "uploading",
+        "runtime maintenance mutated busy A"
+    );
 
     harness.staging.block_write.store(false, Ordering::SeqCst);
     harness.staging.release_write.notify_one();
     assert_eq!(writer.await.unwrap().status(), StatusCode::NO_CONTENT);
+    let response = harness
+        .app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/v1/uploads/{independent_id}"),
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let expired_state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
+        .bind(blocked_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(expired_state, "failed");
+}
+
+#[tokio::test]
+async fn missing_cleanup_rows_cannot_starve_the_bounded_batch() {
+    let harness = make_harness(default_limits(), 10_000).await;
+    let token = csrf_token(&harness.app).await;
+    let live_id = created_id(&harness, &token, "live.bin", "1").await;
+    let mut real_cleanup = None;
+    for index in 0..257 {
+        let id = UploadId::new();
+        sqlx::query(
+            "INSERT INTO upload_session
+             (id, project_id, destination_name, expected_size, committed_offset, state, expires_at)
+             VALUES (?, ?, ?, 1, 0, 'cancelled', '2100-01-01T00:00:00.000000000Z')",
+        )
+        .bind(id.to_string())
+        .bind(harness.project_id.to_string())
+        .bind(format!("cleanup-{index:03}.bin"))
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO upload_staging_cleanup (upload_id) VALUES (?)")
+            .bind(id.to_string())
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+        if index == 256 {
+            harness.staging.files.lock().unwrap().insert(id, vec![1]);
+            real_cleanup = Some(id);
+        }
+    }
+    let real_cleanup = real_cleanup.unwrap();
+
+    for _ in 0..2 {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/v1/uploads/{live_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_staging_cleanup")
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    assert!(
+        !harness
+            .staging
+            .files
+            .lock()
+            .unwrap()
+            .contains_key(&real_cleanup)
+    );
 }
 
 #[tokio::test]
