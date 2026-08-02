@@ -19,3 +19,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.24.0", features = ["v7", "serde"] }
 time = { version = "0.3.54", features = ["serde", "formatting", "parsing"] }
+async-trait = "0.1.89"
+sha2 = "0.10.9"

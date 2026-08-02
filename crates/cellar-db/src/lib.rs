@@ -1,10 +1,12 @@
 mod migrate;
 mod pool;
+mod project_repo;
 
 use thiserror::Error;
 
 pub use migrate::migrate;
 pub use pool::{FilenameCollation, open_pool};
+pub use project_repo::SqliteProjectRepository;
 
 /// Stable, client-safe database failure categories.
 ///

@@ -7,9 +7,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+cellar-core = { path = "../cellar-core" }
 libsqlite3-sys = "=0.30.1"
+serde.workspace = true
+serde_json.workspace = true
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
 thiserror.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 tempfile = "3.20.0"
