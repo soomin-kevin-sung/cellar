@@ -478,4 +478,105 @@ mod tests {
         );
         pool.close().await;
     }
+
+    #[tokio::test]
+    async fn list_order_filters_and_soft_delete_exclusion_are_exact() {
+        let (_directory, pool, repository) = repository().await;
+        let early = ProjectId::new();
+        let same_time_first = ProjectId::new();
+        let same_time_second = ProjectId::new();
+        let (lower_id, higher_id) = if same_time_first.to_string() < same_time_second.to_string() {
+            (same_time_first, same_time_second)
+        } else {
+            (same_time_second, same_time_first)
+        };
+        let archived = ProjectId::new();
+        let deleted = ProjectId::new();
+        for (id, name, status, created_at, deleted_at) in [
+            (early, "early", "active", "1970-01-01T00:00:01Z", None),
+            (
+                higher_id,
+                "same-high",
+                "active",
+                "1970-01-01T00:00:02Z",
+                None,
+            ),
+            (lower_id, "same-low", "active", "1970-01-01T00:00:02Z", None),
+            (
+                archived,
+                "archived",
+                "archived",
+                "1970-01-01T00:00:03Z",
+                None,
+            ),
+            (
+                deleted,
+                "deleted",
+                "active",
+                "1970-01-01T00:00:00Z",
+                Some("1970-01-01T00:00:04Z"),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO project
+                 (id, name, description, status, version, created_at, updated_at, deleted_at)
+                 VALUES (?, ?, '', ?, 1, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(name)
+            .bind(status)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(deleted_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let active = repository
+            .list(ProjectListFilter::Status(ProjectStatus::Active), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            active.iter().map(|project| project.id).collect::<Vec<_>>(),
+            vec![early, lower_id, higher_id]
+        );
+        let all = repository.list(ProjectListFilter::All, 100).await.unwrap();
+        assert_eq!(
+            all.iter().map(|project| project.id).collect::<Vec<_>>(),
+            vec![early, lower_id, higher_id, archived]
+        );
+        assert_eq!(
+            repository
+                .list(ProjectListFilter::Status(ProjectStatus::Archived), 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            vec![archived]
+        );
+
+        let now = OffsetDateTime::from_unix_timestamp(100).unwrap();
+        assert_eq!(
+            repository.read(deleted).await,
+            Err(ProjectRepositoryError::NotFound)
+        );
+        assert_eq!(
+            repository
+                .update(
+                    deleted,
+                    1,
+                    &ProjectPatch::try_new(Some("still-deleted".into()), None).unwrap(),
+                    now,
+                )
+                .await,
+            Err(ProjectRepositoryError::NotFound)
+        );
+        assert_eq!(
+            repository.archive(deleted, 1, now).await,
+            Err(ProjectRepositoryError::NotFound)
+        );
+        pool.close().await;
+    }
 }

@@ -2,24 +2,26 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::{Extension, Path, RawQuery};
+use axum::body::{Body, to_bytes};
+use axum::extract::{Extension, RawQuery, Request};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use cellar_auth::EnrollmentStore;
 use cellar_core::{
     MAX_PROJECT_LIST_LIMIT, NewProject, OperationId, Project, ProjectId, ProjectListFilter,
     ProjectPatch, ProjectService, ProjectServiceError, ProjectStatus,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
 use super::session::{SessionState, require_json_content_type};
 
-pub const MAX_PROJECT_BODY_BYTES: usize = 16 * 1024;
+pub const MAX_PROJECT_JSON_BYTES: usize = 16 * 1024;
+pub const MAX_PROJECT_BODY_BYTES: usize = MAX_PROJECT_JSON_BYTES;
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 64;
 
@@ -60,6 +62,13 @@ where
             get(get_project).patch(update_project),
         )
         .route("/api/v1/projects/{id}/archive", post(archive_project))
+        .route("/api/v1/projects/", any(invalid_project_path))
+        .route("/api/v1/projects/{id}/", any(invalid_project_path))
+        .route("/api/v1/projects/{id}/{extra}", any(invalid_project_path))
+        .route(
+            "/api/v1/projects/{id}/{extra}/{*rest}",
+            any(invalid_project_path),
+        )
         .layer(Extension(state))
 }
 
@@ -115,12 +124,13 @@ impl TryFrom<Project> for ProjectBody {
 
 async fn create_project(
     Extension(state): Extension<ProjectsState>,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request,
 ) -> Result<impl IntoResponse, ProjectApiError> {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let request_id = request_id(&headers)?;
     require_json(&headers, &request_id)?;
-    let input: CreateBody = parse_body(&body, &request_id)?;
+    let input: CreateBody = parse_body(body, &request_id).await?;
     let input = NewProject::try_new(input.name, input.description)
         .map_err(|error| ProjectApiError::invalid(error.code(), request_id.clone()))?;
     let idempotency_key = idempotency_key(&headers, &request_id)?;
@@ -158,11 +168,11 @@ async fn list_projects(
 
 async fn get_project(
     Extension(state): Extension<ProjectsState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
+    request: Request,
 ) -> Result<impl IntoResponse, ProjectApiError> {
-    let request_id = request_id(&headers)?;
-    let id = parse_project_id(&id, &request_id)?;
+    let headers = request.headers();
+    let request_id = request_id(headers)?;
+    let id = parse_project_path(request.uri().path(), false, &request_id)?;
     let project = state
         .service
         .read(id)
@@ -176,14 +186,14 @@ async fn get_project(
 
 async fn update_project(
     Extension(state): Extension<ProjectsState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> Result<impl IntoResponse, ProjectApiError> {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let request_id = request_id(&headers)?;
     require_json(&headers, &request_id)?;
-    let id = parse_project_id(&id, &request_id)?;
-    let input: PatchBody = parse_body(&body, &request_id)?;
+    let id = parse_project_path(parts.uri.path(), false, &request_id)?;
+    let input: PatchBody = parse_body(body, &request_id).await?;
     let expected_version = parse_decimal_version(&input.expected_version)
         .map_err(|_| ProjectApiError::invalid("invalid_expected_version", request_id.clone()))?;
     let patch = ProjectPatch::try_new(input.name, input.description)
@@ -201,14 +211,14 @@ async fn update_project(
 
 async fn archive_project(
     Extension(state): Extension<ProjectsState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> Result<impl IntoResponse, ProjectApiError> {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
     let request_id = request_id(&headers)?;
     require_json(&headers, &request_id)?;
-    let id = parse_project_id(&id, &request_id)?;
-    let input: ArchiveBody = parse_body(&body, &request_id)?;
+    let id = parse_project_path(parts.uri.path(), true, &request_id)?;
+    let input: ArchiveBody = parse_body(body, &request_id).await?;
     let expected_version = parse_decimal_version(&input.expected_version)
         .map_err(|_| ProjectApiError::invalid("invalid_expected_version", request_id.clone()))?;
     let project = state
@@ -222,17 +232,20 @@ async fn archive_project(
     ))
 }
 
-fn parse_body<'a, T: Deserialize<'a>>(
-    body: &'a Bytes,
+async fn parse_body<T: DeserializeOwned>(
+    body: Body,
     request_id: &str,
 ) -> Result<T, ProjectApiError> {
-    if body.len() > MAX_PROJECT_BODY_BYTES {
+    let body = to_bytes(body, MAX_PROJECT_JSON_BYTES + 1)
+        .await
+        .map_err(|_| ProjectApiError::invalid("request_body_too_large", request_id.to_owned()))?;
+    if body.len() > MAX_PROJECT_JSON_BYTES {
         return Err(ProjectApiError::invalid(
-            "project_body_too_large",
+            "request_body_too_large",
             request_id.to_owned(),
         ));
     }
-    serde_json::from_slice(body)
+    serde_json::from_slice(&body)
         .map_err(|_| ProjectApiError::invalid("invalid_project_json", request_id.to_owned()))
 }
 
@@ -246,10 +259,68 @@ fn require_json(headers: &HeaderMap, request_id: &str) -> Result<(), ProjectApiE
     .map_err(|_| ProjectApiError::invalid("unsupported_media_type", request_id.to_owned()))
 }
 
-fn parse_project_id(value: &str, request_id: &str) -> Result<ProjectId, ProjectApiError> {
-    value
+fn parse_project_path(
+    path: &str,
+    archive: bool,
+    request_id: &str,
+) -> Result<ProjectId, ProjectApiError> {
+    let segment = path
+        .strip_prefix("/api/v1/projects/")
+        .and_then(|tail| {
+            if archive {
+                tail.strip_suffix("/archive")
+            } else {
+                Some(tail)
+            }
+        })
+        .filter(|segment| !segment.is_empty() && !segment.contains('/') && !segment.contains('\\'))
+        .ok_or_else(|| ProjectApiError::invalid("invalid_project_id", request_id.to_owned()))?;
+    let decoded = percent_decode_segment(segment)
+        .ok_or_else(|| ProjectApiError::invalid("invalid_project_id", request_id.to_owned()))?;
+    decoded
         .parse()
         .map_err(|_| ProjectApiError::invalid("invalid_project_id", request_id.to_owned()))
+}
+
+fn percent_decode_segment(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            let byte = (high << 4) | low;
+            if matches!(byte, b'/' | b'\\') {
+                return None;
+            }
+            decoded.push(byte);
+            index += 3;
+        } else {
+            if matches!(bytes[index], b'/' | b'\\') {
+                return None;
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+const fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+async fn invalid_project_path(headers: HeaderMap) -> ProjectApiError {
+    match request_id(&headers) {
+        Ok(request_id) => ProjectApiError::invalid("invalid_project_id", request_id),
+        Err(error) => error,
+    }
 }
 
 fn request_id(headers: &HeaderMap) -> Result<String, ProjectApiError> {

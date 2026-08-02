@@ -1,8 +1,9 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, Request, StatusCode, header};
 use cellar_api::routes::projects::{
     MAX_PROJECT_BODY_BYTES, parse_decimal_version, projects_router_with_clock,
@@ -14,10 +15,11 @@ use cellar_auth::{
 };
 use cellar_core::{
     DirectoryStoreError, MAX_PROJECT_DESCRIPTION_BYTES, MAX_PROJECT_NAME_BYTES, NewProject,
-    OperationId, ProjectDirectoryStore, ProjectPatch, ProjectService, ProjectServiceError,
-    ProjectStatus,
+    OperationId, ProjectDirectoryStore, ProjectId, ProjectPatch, ProjectService,
+    ProjectServiceError, ProjectStatus,
 };
 use cellar_db::{FilenameCollation, SqliteProjectRepository, migrate, open_pool};
+use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -128,6 +130,18 @@ fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {
 async fn response_json(response: axum::response::Response) -> Value {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&body).unwrap()
+}
+
+async fn assert_project_error(response: axum::response::Response, status: StatusCode, code: &str) {
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response.headers()[HeaderName::from_static("content-type")],
+        "application/json"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["code"], code);
+    assert!(body["requestId"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_eq!(body["details"], json!({}));
 }
 
 async fn app() -> (axum::Router, TempDir, SqlitePool, Arc<RecordingDirectories>) {
@@ -447,6 +461,218 @@ async fn malformed_json_headers_and_identifiers_are_stable_client_errors() {
         response_json(unavailable).await["code"],
         "project_service_unavailable"
     );
+}
+
+fn padded_json(value: &str, length: usize) -> Vec<u8> {
+    assert!(value.len() <= length);
+    let mut body = value.as_bytes().to_vec();
+    body.resize(length, b' ');
+    body
+}
+
+#[tokio::test]
+async fn json_body_limits_are_stable_at_the_real_router_boundary() {
+    let (app, _directory, pool, _directories) = app().await;
+    let token = csrf_token(&app).await;
+    let mut exact = request(
+        "POST",
+        "/api/v1/projects",
+        Body::from(padded_json(r#"{"name":"exact"}"#, MAX_PROJECT_BODY_BYTES)),
+        true,
+    );
+    exact
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    authorize_mutation(&mut exact, &token);
+    assert_eq!(
+        app.clone().oneshot(exact).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let id = ProjectId::new();
+    for (method, uri, valid) in [
+        (
+            "PATCH",
+            format!("/api/v1/projects/{id}"),
+            r#"{"expectedVersion":"1","name":"x"}"#,
+        ),
+        (
+            "POST",
+            format!("/api/v1/projects/{id}/archive"),
+            r#"{"expectedVersion":"1"}"#,
+        ),
+    ] {
+        let mut exact = request(
+            method,
+            &uri,
+            Body::from(padded_json(valid, MAX_PROJECT_BODY_BYTES)),
+            true,
+        );
+        exact
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        authorize_mutation(&mut exact, &token);
+        assert_project_error(
+            app.clone().oneshot(exact).await.unwrap(),
+            StatusCode::NOT_FOUND,
+            "project_not_found",
+        )
+        .await;
+    }
+
+    let chunked = stream::iter([
+        Ok::<_, Infallible>(Bytes::from(padded_json(
+            r#"{"name":"chunked"}"#,
+            MAX_PROJECT_BODY_BYTES,
+        ))),
+        Ok(Bytes::from_static(b" ")),
+    ]);
+    let mut chunked = request("POST", "/api/v1/projects", Body::from_stream(chunked), true);
+    assert!(chunked.headers().get(header::CONTENT_LENGTH).is_none());
+    chunked
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    authorize_mutation(&mut chunked, &token);
+    assert_project_error(
+        app.clone().oneshot(chunked).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        "request_body_too_large",
+    )
+    .await;
+
+    for (method, uri, valid) in [
+        ("POST", "/api/v1/projects".to_owned(), r#"{"name":"x"}"#),
+        (
+            "PATCH",
+            format!("/api/v1/projects/{id}"),
+            r#"{"expectedVersion":"1","name":"x"}"#,
+        ),
+        (
+            "POST",
+            format!("/api/v1/projects/{id}/archive"),
+            r#"{"expectedVersion":"1"}"#,
+        ),
+    ] {
+        for length in [MAX_PROJECT_BODY_BYTES + 1, 2 * 1024 * 1024 + 1] {
+            let mut oversized = request(method, &uri, Body::from(padded_json(valid, length)), true);
+            assert!(oversized.headers().get(header::CONTENT_LENGTH).is_none());
+            oversized
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            authorize_mutation(&mut oversized, &token);
+            assert_project_error(
+                app.clone().oneshot(oversized).await.unwrap(),
+                StatusCode::BAD_REQUEST,
+                "request_body_too_large",
+            )
+            .await;
+        }
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn malformed_raw_project_paths_and_nonexistent_ids_use_project_envelopes() {
+    let (app, _directory, pool, _directories) = app().await;
+    let token = csrf_token(&app).await;
+    let id = ProjectId::new();
+    for path in [
+        "%FF".to_owned(),
+        "%".to_owned(),
+        "%2F".to_owned(),
+        "%5C".to_owned(),
+        String::new(),
+        format!("{id}/"),
+        format!("{id}/extra"),
+        format!("{id}/extra/more"),
+    ] {
+        let uri = format!("/api/v1/projects/{path}");
+        assert_project_error(
+            app.clone()
+                .oneshot(request("GET", &uri, Body::empty(), true))
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            "invalid_project_id",
+        )
+        .await;
+    }
+
+    assert_project_error(
+        app.clone()
+            .oneshot(request(
+                "GET",
+                &format!("/api/v1/projects/{id}"),
+                Body::empty(),
+                true,
+            ))
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "project_not_found",
+    )
+    .await;
+    for (method, uri, body) in [
+        (
+            "PATCH",
+            format!("/api/v1/projects/{id}"),
+            json!({"expectedVersion":"1","name":"missing"}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/projects/{id}/archive"),
+            json!({"expectedVersion":"1"}),
+        ),
+    ] {
+        let mut missing = json_request(method, &uri, body);
+        authorize_mutation(&mut missing, &token);
+        assert_project_error(
+            app.clone().oneshot(missing).await.unwrap(),
+            StatusCode::NOT_FOUND,
+            "project_not_found",
+        )
+        .await;
+    }
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pending_and_fs_applied_replays_fail_closed_without_directory_mutation() {
+    let (_directory, pool, service, directories) = test_service(None).await;
+    let operation = OperationId::new();
+    let now = OffsetDateTime::from_unix_timestamp(NOW).unwrap();
+    let input = || NewProject::try_new("recovery", "same request").unwrap();
+    let created = service
+        .create(input(), Some(operation), now)
+        .await
+        .unwrap()
+        .project;
+    assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+
+    for state in ["pending", "fs_applied"] {
+        sqlx::query("UPDATE operation SET state = ? WHERE id = ?")
+            .bind(state)
+            .bind(operation.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            service.create(input(), Some(operation), now).await,
+            Err(ProjectServiceError::InProgress)
+        );
+        assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+    }
+
+    sqlx::query("UPDATE operation SET state = 'complete' WHERE id = ?")
+        .bind(operation.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let replay = service.create(input(), Some(operation), now).await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.project, created);
+    assert_eq!(directories.calls.load(Ordering::SeqCst), 1);
+    pool.close().await;
 }
 
 #[tokio::test]

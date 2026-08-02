@@ -19,6 +19,7 @@ time.workspace = true
 async-trait.workspace = true
 cellar-config = { path = "../cellar-config" }
 cellar-db = { path = "../cellar-db" }
+futures-util = "0.3.33"
 http-body-util = "=0.1.4"
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "sqlite"] }
 tempfile = "=3.27.0"
