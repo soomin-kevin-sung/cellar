@@ -275,8 +275,12 @@ async fn read_chunk_body(
     request_id: String,
 ) -> Result<Vec<u8>, UploadApiError> {
     let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
-        let frame = tokio::time::timeout(idle_timeout, body.frame())
+        if tokio::time::Instant::now() >= deadline {
+            return Err(UploadApiError::body_timeout(request_id));
+        }
+        let frame = tokio::time::timeout_at(deadline, body.frame())
             .await
             .map_err(|_| UploadApiError::body_timeout(request_id.clone()))?;
         let Some(frame) = frame else {
@@ -287,6 +291,13 @@ async fn read_chunk_body(
         let data = frame
             .into_data()
             .map_err(|_| UploadApiError::invalid("invalid_upload_body", request_id.clone()))?;
+        if data.is_empty() {
+            tokio::task::yield_now().await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(UploadApiError::body_timeout(request_id));
+            }
+            continue;
+        }
         if bytes
             .len()
             .checked_add(data.len())
@@ -295,6 +306,7 @@ async fn read_chunk_body(
             return Err(UploadApiError::too_large(request_id));
         }
         bytes.extend_from_slice(&data);
+        deadline = tokio::time::Instant::now() + idle_timeout;
     }
     Ok(bytes)
 }

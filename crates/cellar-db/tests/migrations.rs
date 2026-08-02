@@ -268,6 +268,41 @@ async fn upload_cleanup_extension_tampering_fails_closed() {
     ));
     assert!(previous_release_v2_accepts_schema_history(&object_pool).await);
     object_pool.close().await;
+
+    for replacement in ["'FAILED'", "'failed '"] {
+        let (_literal_db, literal_pool) = migrated_db().await;
+        let mut connection = literal_pool.acquire().await.unwrap();
+        sqlx::query("DROP TRIGGER upload_staging_cleanup_terminal")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let sql = format!(
+            "CREATE TRIGGER upload_staging_cleanup_terminal
+             AFTER UPDATE OF state ON upload_session
+             WHEN NEW.state IN ({replacement}, 'cancelled')
+              AND OLD.state NOT IN ('failed', 'cancelled')
+             BEGIN INSERT OR IGNORE INTO upload_staging_cleanup (upload_id)
+                   VALUES (NEW.id); END"
+        );
+        sqlx::query(&sql).execute(&mut *connection).await.unwrap();
+        drop(connection);
+        assert!(matches!(
+            migrate(&literal_pool).await,
+            Err(DbError::SchemaVersion)
+        ));
+        literal_pool.close().await;
+    }
+
+    let (_dropped_db, dropped_pool) = migrated_db().await;
+    sqlx::query("DROP TRIGGER upload_staging_cleanup_terminal")
+        .execute(&dropped_pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        migrate(&dropped_pool).await,
+        Err(DbError::SchemaVersion)
+    ));
+    dropped_pool.close().await;
 }
 
 #[tokio::test]

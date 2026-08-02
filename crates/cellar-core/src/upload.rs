@@ -376,6 +376,11 @@ impl UploadService {
         self.maintain_except(now, None).await
     }
 
+    /// Completes upload crash recovery before the service reports readiness.
+    pub async fn initialize(&self, now: OffsetDateTime) -> Result<(), UploadServiceError> {
+        self.maintain_except(now, None).await
+    }
+
     async fn maintain_except(
         &self,
         now: OffsetDateTime,
@@ -417,6 +422,13 @@ impl UploadService {
                     .map_err(map_repository)?
             {
                 let _ = self.staging.remove(id).await;
+                continue;
+            }
+            if let Err(error) = self.reconcile_locked(id, now).await {
+                match self.repository.read(id).await {
+                    Ok(session) if session.state == UploadState::Failed => continue,
+                    _ => return Err(error),
+                }
             }
         }
         for id in self

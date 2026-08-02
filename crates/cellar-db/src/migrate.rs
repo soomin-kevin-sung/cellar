@@ -132,11 +132,22 @@ async fn migrate_locked(transaction: &mut Transaction<'_, Sqlite>) -> Result<(),
         .await
         .map_err(DbError::Migration)?;
     validate_file_catalog_extension(transaction).await?;
-    sqlx::raw_sql(UPLOAD_CLEANUP_EXTENSION_SQL)
-        .execute(&mut **transaction)
-        .await
-        .map_err(DbError::Migration)?;
-    validate_upload_cleanup_extension(transaction).await?;
+    let upload_cleanup_marker: Option<String> = sqlx::query_scalar(
+        "SELECT fingerprint FROM cellar_schema_extension
+         WHERE name = 'upload_staging_cleanup'",
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(DbError::Migration)?;
+    if upload_cleanup_marker.is_some() {
+        validate_upload_cleanup_extension(transaction).await?;
+    } else {
+        sqlx::raw_sql(UPLOAD_CLEANUP_EXTENSION_SQL)
+            .execute(&mut **transaction)
+            .await
+            .map_err(DbError::Migration)?;
+        validate_upload_cleanup_extension(transaction).await?;
+    }
 
     let metadata: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM cellar_schema_metadata
@@ -204,13 +215,39 @@ async fn validate_upload_cleanup_extension(
 }
 
 fn sql_eq(left: &str, right: &str) -> bool {
-    left.chars()
-        .filter(|character| !character.is_ascii_whitespace())
-        .flat_map(char::to_lowercase)
-        .eq(right
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .flat_map(char::to_lowercase))
+    canonical_sql(left) == canonical_sql(right)
+}
+
+fn canonical_sql(sql: &str) -> String {
+    let mut canonical = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    let mut quoted_end = None;
+    while let Some(character) = characters.next() {
+        if let Some(end) = quoted_end {
+            canonical.push(character);
+            if character == end {
+                if end != ']' && characters.peek() == Some(&end) {
+                    canonical.push(characters.next().expect("peeked quoted escape"));
+                } else {
+                    quoted_end = None;
+                }
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => {
+                canonical.push(character);
+                quoted_end = Some(character);
+            }
+            '[' => {
+                canonical.push(character);
+                quoted_end = Some(']');
+            }
+            character if character.is_ascii_whitespace() => {}
+            character => canonical.extend(character.to_lowercase()),
+        }
+    }
+    canonical
 }
 
 async fn validate_file_catalog_extension(

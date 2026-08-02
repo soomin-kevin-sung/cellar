@@ -1191,3 +1191,154 @@ async fn partial_chunk_body_idle_timeout_is_bounded_and_does_not_record_pending_
     assert!(harness.staging.bytes(id).is_empty());
     harness.pool.close().await;
 }
+
+#[tokio::test]
+async fn startup_initialization_recovers_pending_tail_and_short_durable_sessions() {
+    let harness = make_harness(default_limits(), 1_000).await;
+    let token = csrf_token(&harness.app).await;
+    let pending_id = created_id(&harness, &token, "startup-pending.bin", "3").await;
+    let tail_id = created_id(&harness, &token, "startup-tail.bin", "5").await;
+    let short_id = created_id(&harness, &token, "startup-short.bin", "5").await;
+
+    sqlx::query(
+        "UPDATE upload_session SET state = 'uploading', pending_offset = 0,
+         pending_length = 3, pending_digest = ? WHERE id = ?",
+    )
+    .bind(Sha256::digest(b"abc").to_vec())
+    .bind(pending_id.to_string())
+    .execute(&harness.pool)
+    .await
+    .unwrap();
+    harness.staging.replace(pending_id, b"abc");
+
+    sqlx::query("UPDATE upload_session SET state = 'uploading', committed_offset = 2 WHERE id = ?")
+        .bind(tail_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    harness.staging.replace(tail_id, b"abTAIL");
+
+    sqlx::query("UPDATE upload_session SET state = 'uploading', committed_offset = 3 WHERE id = ?")
+        .bind(short_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    harness.staging.replace(short_id, b"ab");
+
+    let restarted = UploadService::new(
+        Arc::new(SqliteUploadRepository::new(harness.pool.clone())),
+        harness.staging.clone(),
+        default_limits(),
+    );
+    restarted
+        .initialize(OffsetDateTime::from_unix_timestamp(NOW).unwrap())
+        .await
+        .unwrap();
+
+    let pending: (i64, Option<i64>, String) = sqlx::query_as(
+        "SELECT committed_offset, pending_offset, state FROM upload_session WHERE id = ?",
+    )
+    .bind(pending_id.to_string())
+    .fetch_one(&harness.pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, (3, None, "uploading".to_owned()));
+    assert_eq!(harness.staging.bytes(pending_id), b"abc");
+    assert_eq!(harness.staging.bytes(tail_id), b"ab");
+    let short_state: String = sqlx::query_scalar("SELECT state FROM upload_session WHERE id = ?")
+        .bind(short_id.to_string())
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(short_state, "failed");
+    harness.pool.close().await;
+}
+
+#[tokio::test]
+async fn empty_frames_do_not_extend_idle_deadline_but_nonempty_progress_does() {
+    let harness = make_harness_with_idle_timeout(
+        default_limits(),
+        1_000,
+        Some(std::time::Duration::from_millis(25)),
+    )
+    .await;
+    let token = csrf_token(&harness.app).await;
+    let empty_id = created_id(&harness, &token, "empty-frames.bin", "1").await;
+    let empty_stream =
+        futures_util::stream::repeat_with(|| Ok::<_, std::io::Error>(axum::body::Bytes::new()));
+    let mut empty_request = request(
+        "PUT",
+        &format!("/api/v1/uploads/{empty_id}/chunk"),
+        Body::from_stream(empty_stream),
+    );
+    empty_request.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
+    empty_request
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, "1".parse().unwrap());
+    empty_request.headers_mut().insert(
+        HeaderName::from_static("upload-offset"),
+        "0".parse().unwrap(),
+    );
+    let digest = STANDARD.encode(Sha256::digest(b"x"));
+    empty_request.headers_mut().insert(
+        HeaderName::from_static("digest"),
+        format!("sha-256={digest}").parse().unwrap(),
+    );
+    authorize_mutation(&mut empty_request, &token);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        harness.app.clone().oneshot(empty_request),
+    )
+    .await
+    .expect("empty frames must not keep the request alive")
+    .unwrap();
+    assert_error(response, StatusCode::REQUEST_TIMEOUT, "upload_body_timeout").await;
+
+    let progress_id = created_id(&harness, &token, "progress.bin", "3").await;
+    let progress_stream = futures_util::stream::unfold(0_u8, |index| async move {
+        if index == 3 {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        Some((
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'a' + index])),
+            index + 1,
+        ))
+    });
+    let mut progress_request = request(
+        "PUT",
+        &format!("/api/v1/uploads/{progress_id}/chunk"),
+        Body::from_stream(progress_stream),
+    );
+    progress_request.headers_mut().insert(
+        header::CONTENT_TYPE,
+        "application/octet-stream".parse().unwrap(),
+    );
+    progress_request
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, "3".parse().unwrap());
+    progress_request.headers_mut().insert(
+        HeaderName::from_static("upload-offset"),
+        "0".parse().unwrap(),
+    );
+    let digest = STANDARD.encode(Sha256::digest(b"abc"));
+    progress_request.headers_mut().insert(
+        HeaderName::from_static("digest"),
+        format!("sha-256={digest}").parse().unwrap(),
+    );
+    authorize_mutation(&mut progress_request, &token);
+    assert_eq!(
+        harness
+            .app
+            .clone()
+            .oneshot(progress_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    harness.pool.close().await;
+}
