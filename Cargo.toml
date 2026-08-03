@@ -1,23 +1,37 @@
-[workspace]
-resolver = "2"
-members = ["crates/*"]
-
-[workspace.package]
+[package]
+name = "cellar"
 version = "0.1.0"
-publish = false
 edition = "2024"
 rust-version = "1.93"
-license = "MIT"
+publish = false
 
-[workspace.dependencies]
-axum = "0.8.9"
-tokio = { version = "1.53.1", features = ["full"] }
-serde = { version = "1.0.229", features = ["derive"] }
+[dependencies]
+axum = { version = "0.8.9", features = ["macros"] }
+bytes = "1"
+futures-util = "0.3"
+http = "1"
+http-body-util = "0.1"
+jsonwebtoken = "11.0"
+mime_guess = "2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+rust-embed = "8.12"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2"
+time = { version = "0.3", features = ["formatting", "serde"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "1.1"
+tower-http = { version = "0.7", features = ["request-id", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-uuid = { version = "1.24.0", features = ["v7", "serde"] }
-time = { version = "0.3.54", features = ["serde", "formatting", "parsing"] }
-async-trait = "0.1.89"
-sha2 = "0.10.9"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
