@@ -199,7 +199,7 @@ impl Config {
     }
 }
 
-fn normalize_owner_email(input: &str) -> Result<String, ConfigError> {
+pub(crate) fn normalize_owner_email(input: &str) -> Result<String, ConfigError> {
     let trimmed = input.trim();
     if trimmed
         .chars()

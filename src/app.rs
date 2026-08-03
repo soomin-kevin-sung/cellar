@@ -1,15 +1,23 @@
 //! Application assembly.
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use axum::{
     Router,
-    extract::Request,
-    http::{HeaderName, HeaderValue},
+    body::Body,
+    extract::{Request, State},
+    http::{HeaderName, HeaderValue, Method, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
 };
+use tower_http::trace::TraceLayer;
 use uuid::{Uuid, Version};
+
+use crate::{
+    auth::{AccessFailure, AccessVerifier},
+    config::CanonicalOrigin,
+    error::AppError,
+};
 
 pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -45,6 +53,172 @@ pub fn with_request_ids(router: Router) -> Router {
     router.layer(middleware::from_fn(request_id_middleware))
 }
 
+#[derive(Clone)]
+struct ApiSecurityState {
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: Arc<str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectionReason {
+    MissingAssertion,
+    InvalidAssertion,
+    AuthorizationMismatch,
+    JwksUnavailable,
+    OriginRejected,
+}
+
+impl RejectionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingAssertion => "missing_assertion",
+            Self::InvalidAssertion => "invalid_assertion",
+            Self::AuthorizationMismatch => "authorization_mismatch",
+            Self::JwksUnavailable => "jwks_unavailable",
+            Self::OriginRejected => "origin_rejected",
+        }
+    }
+}
+
+const fn rejection_reason(failure: AccessFailure) -> RejectionReason {
+    match failure {
+        AccessFailure::Unauthenticated => RejectionReason::InvalidAssertion,
+        AccessFailure::Forbidden => RejectionReason::AuthorizationMismatch,
+        AccessFailure::Unavailable => RejectionReason::JwksUnavailable,
+    }
+}
+
+fn record_access_rejection(reason: RejectionReason, request_id: &RequestId) {
+    if reason == RejectionReason::JwksUnavailable {
+        tracing::warn!(
+            reason = reason.as_str(),
+            request_id = %request_id,
+            "access request rejected"
+        );
+    } else {
+        tracing::debug!(
+            reason = reason.as_str(),
+            request_id = %request_id,
+            "access request rejected"
+        );
+    }
+}
+
+/// Applies the complete security boundary to the provided API router only.
+///
+/// Route templates are not yet available at this assembly boundary, so tracing
+/// intentionally records only method, status, and request ID. It never records
+/// raw URIs, headers, query strings, bodies, tokens, or identities.
+pub fn secure_api_router(
+    router: Router,
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: &CanonicalOrigin,
+) -> Router {
+    let state = ApiSecurityState {
+        verifier,
+        external_origin: Arc::from(external_origin.as_str()),
+    };
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(|request: &axum::http::Request<Body>| {
+            let request_id = request
+                .extensions()
+                .get::<RequestId>()
+                .map(RequestId::as_str)
+                .unwrap_or("missing");
+            tracing::info_span!(
+                "api_request",
+                method = %request.method(),
+                request_id = %request_id
+            )
+        })
+        .on_response(
+            |response: &Response, _latency: Duration, span: &tracing::Span| {
+                tracing::info!(parent: span, status = %response.status());
+            },
+        );
+
+    let secured = router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            origin_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(state, access_middleware))
+        .layer(trace);
+    with_request_ids(secured)
+}
+
+async fn access_middleware(
+    State(state): State<ApiSecurityState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .expect("secure API router installs request IDs before authentication");
+    let mut assertions = request.headers().get_all("Cf-Access-Jwt-Assertion").iter();
+    let Some(assertion) = assertions.next() else {
+        record_access_rejection(RejectionReason::MissingAssertion, &request_id);
+        return AppError::unauthorized(request_id).into_response();
+    };
+    if assertions.next().is_some() {
+        record_access_rejection(RejectionReason::InvalidAssertion, &request_id);
+        return AppError::unauthorized(request_id).into_response();
+    }
+    let Ok(assertion) = assertion.to_str() else {
+        record_access_rejection(RejectionReason::InvalidAssertion, &request_id);
+        return AppError::unauthorized(request_id).into_response();
+    };
+    let identity = match state.verifier.verify(assertion).await {
+        Ok(identity) => identity,
+        Err(error) => {
+            let classification = error.classification();
+            record_access_rejection(rejection_reason(classification), &request_id);
+            return match classification {
+                AccessFailure::Unauthenticated => AppError::unauthorized(request_id),
+                AccessFailure::Forbidden => AppError::forbidden(request_id),
+                AccessFailure::Unavailable => AppError::service_unavailable(
+                    request_id,
+                    "authentication_unavailable",
+                    "Authentication is temporarily unavailable.",
+                ),
+            }
+            .into_response();
+        }
+    };
+
+    request.extensions_mut().insert(identity);
+    next.run(request).await
+}
+
+async fn origin_middleware(
+    State(state): State<ApiSecurityState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        let request_id = request
+            .extensions()
+            .get::<RequestId>()
+            .cloned()
+            .expect("secure API router installs request IDs before origin checks");
+        let mut origins = request.headers().get_all(header::ORIGIN).iter();
+        let valid = origins.next().is_some_and(|origin| {
+            origin.as_bytes() == state.external_origin.as_bytes() && origins.next().is_none()
+        });
+        if !valid {
+            record_access_rejection(RejectionReason::OriginRejected, &request_id);
+            return AppError::forbidden(request_id).into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
 async fn request_id_middleware(mut request: Request, next: Next) -> Response {
     let request_id = RequestId::generate();
     request.extensions_mut().insert(request_id.clone());
@@ -69,7 +243,42 @@ mod tests {
     use uuid::{Uuid, Version};
 
     use super::{RequestId, X_REQUEST_ID, with_request_ids};
-    use crate::error::AppError;
+    use crate::{auth::AccessFailure, error::AppError};
+
+    use super::{RejectionReason, rejection_reason};
+
+    #[test]
+    fn authentication_log_reasons_are_closed_safe_literals() {
+        assert_eq!(
+            RejectionReason::MissingAssertion.as_str(),
+            "missing_assertion"
+        );
+        assert_eq!(
+            RejectionReason::InvalidAssertion.as_str(),
+            "invalid_assertion"
+        );
+        assert_eq!(
+            RejectionReason::AuthorizationMismatch.as_str(),
+            "authorization_mismatch"
+        );
+        assert_eq!(
+            RejectionReason::JwksUnavailable.as_str(),
+            "jwks_unavailable"
+        );
+        assert_eq!(RejectionReason::OriginRejected.as_str(), "origin_rejected");
+        assert_eq!(
+            rejection_reason(AccessFailure::Unauthenticated),
+            RejectionReason::InvalidAssertion
+        );
+        assert_eq!(
+            rejection_reason(AccessFailure::Forbidden),
+            RejectionReason::AuthorizationMismatch
+        );
+        assert_eq!(
+            rejection_reason(AccessFailure::Unavailable),
+            RejectionReason::JwksUnavailable
+        );
+    }
 
     #[tokio::test]
     async fn success_response_has_uuid_v7_request_id() {
