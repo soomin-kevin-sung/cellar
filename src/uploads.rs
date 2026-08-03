@@ -91,6 +91,19 @@ pub trait UploadRepository: Send + Sync {
     ) -> UploadRepositoryFuture<'a, ()> {
         Box::pin(async { Err(DbError::InvalidTransition) })
     }
+    fn mark_upload_finalizing<'a>(
+        &'a self,
+        _upload_id: Uuid,
+        _expected: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
+    fn mark_upload_complete<'a>(&'a self, _upload_id: Uuid) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
+    fn recoverable_uploads(&self) -> UploadRepositoryFuture<'_, Vec<UploadRow>> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
 }
 
 impl UploadRepository for Database {
@@ -125,9 +138,25 @@ impl UploadRepository for Database {
     ) -> UploadRepositoryFuture<'a, ()> {
         Box::pin(async move { self.mark_failed(upload_id, reason).await })
     }
+
+    fn mark_upload_finalizing<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move { self.mark_finalizing(upload_id, expected).await })
+    }
+
+    fn mark_upload_complete<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async move { self.mark_complete(upload_id).await })
+    }
+
+    fn recoverable_uploads(&self) -> UploadRepositoryFuture<'_, Vec<UploadRow>> {
+        Box::pin(async move { self.recoverable_uploads().await })
+    }
 }
 
-/// Filesystem operations needed to create upload sessions.
+/// Filesystem operations needed by upload session endpoints and startup recovery.
 pub trait UploadStorage: Send + Sync {
     fn destination_exists<'a>(
         &'a self,
@@ -159,6 +188,36 @@ pub trait UploadStorage: Send + Sync {
         Box::pin(async {
             Err(StorageError::Io {
                 source: io::Error::other("staging inspection is unavailable"),
+            })
+        })
+    }
+    fn sync_staging<'a>(&'a self, _upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other("staging sync is unavailable"),
+            })
+        })
+    }
+    fn finalize_no_replace<'a>(
+        &'a self,
+        _upload_id: Uuid,
+        _project_id: Uuid,
+        _file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other("upload finalization is unavailable"),
+            })
+        })
+    }
+    fn final_file_len<'a>(
+        &'a self,
+        _project_id: Uuid,
+        _file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other("final file inspection is unavailable"),
             })
         })
     }
@@ -196,6 +255,30 @@ impl UploadStorage for Storage {
 
     fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
         Box::pin(async move { self.staging_len(upload_id).await })
+    }
+
+    fn sync_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.sync_staging(upload_id).await })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        upload_id: Uuid,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move {
+            self.finalize_no_replace(upload_id, project_id, file_name)
+                .await
+        })
+    }
+
+    fn final_file_len<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move { self.final_file_len(project_id, file_name).await })
     }
 }
 
@@ -343,6 +426,565 @@ impl UploadService {
                 Err(UploadServiceError::StatusFailed)
             }
         }
+    }
+
+    async fn complete(
+        &self,
+        upload_id: Uuid,
+        request_id: &RequestId,
+    ) -> Result<UploadRow, UploadServiceError> {
+        let lock = self.lock_for(upload_id);
+        let _guard = lock.lock().await;
+        let upload = self
+            .repository
+            .get_upload(upload_id)
+            .await
+            .map_err(|_| {
+                record_completion_failure(
+                    CompletionFailureReason::DatabaseLookupFailed,
+                    request_id,
+                    upload_id,
+                    None,
+                );
+                UploadServiceError::FinalizeFailed
+            })?
+            .ok_or(UploadServiceError::UploadNotFound)?;
+        if upload.state() == UploadState::Complete {
+            return Ok(upload);
+        }
+        if upload.state() != UploadState::Active {
+            return Err(UploadServiceError::UploadInactive);
+        }
+        if upload.committed_offset() != upload.total_size() {
+            return Err(UploadServiceError::UploadIncomplete);
+        }
+        let project_id = upload.project_id();
+        let total_size = upload.total_size();
+        let file_name = SafeFileName::parse(upload.file_name()).map_err(|_| {
+            record_completion_failure(
+                CompletionFailureReason::InvalidStoredFileName,
+                request_id,
+                upload_id,
+                Some(project_id),
+            );
+            UploadServiceError::FinalizeFailed
+        })?;
+
+        match self.storage.staging_len(upload_id).await {
+            Ok(Some(len)) if len == total_size => {}
+            Ok(_) | Err(StorageError::UnsafeEntry) => {
+                if self
+                    .repository
+                    .mark_upload_failed(upload_id, "invalid staging evidence")
+                    .await
+                    .is_err()
+                {
+                    record_completion_failure(
+                        CompletionFailureReason::FailureMarkFailed,
+                        request_id,
+                        upload_id,
+                        Some(project_id),
+                    );
+                    return Err(UploadServiceError::FinalizeFailed);
+                }
+                record_completion_failure(
+                    CompletionFailureReason::StagingInvalid,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(UploadServiceError::InvalidStaging);
+            }
+            Err(error) => {
+                record_completion_failure(
+                    completion_storage_failure(&error),
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(finalization_storage_error(&error));
+            }
+        }
+        match self.storage.final_file_len(project_id, &file_name).await {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(StorageError::UnsafeEntry) => {
+                if self
+                    .repository
+                    .mark_upload_failed(upload_id, "final destination conflict")
+                    .await
+                    .is_err()
+                {
+                    record_completion_failure(
+                        CompletionFailureReason::FailureMarkFailed,
+                        request_id,
+                        upload_id,
+                        Some(project_id),
+                    );
+                    return Err(UploadServiceError::FinalizeFailed);
+                }
+                record_completion_failure(
+                    CompletionFailureReason::DestinationConflict,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(UploadServiceError::DestinationExists);
+            }
+            Err(error) => {
+                record_completion_failure(
+                    completion_storage_failure(&error),
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(finalization_storage_error(&error));
+            }
+        }
+
+        match self
+            .repository
+            .mark_upload_finalizing(upload_id, total_size)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.classify_finalizing_race(upload_id, request_id).await;
+            }
+            Err(_) => {
+                record_completion_failure(
+                    CompletionFailureReason::MarkFinalizingFailed,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(UploadServiceError::FinalizeFailed);
+            }
+        }
+
+        if let Err(error) = self.storage.sync_staging(upload_id).await {
+            if matches!(error, StorageError::UnsafeEntry) {
+                if self
+                    .repository
+                    .mark_upload_failed(upload_id, "unsafe staging after preflight")
+                    .await
+                    .is_err()
+                {
+                    record_completion_failure(
+                        CompletionFailureReason::FailureMarkFailed,
+                        request_id,
+                        upload_id,
+                        Some(project_id),
+                    );
+                    return Err(UploadServiceError::FinalizeFailed);
+                }
+                record_completion_failure(
+                    CompletionFailureReason::StagingInvalid,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(UploadServiceError::InvalidStaging);
+            }
+            record_completion_failure(
+                completion_storage_failure(&error),
+                request_id,
+                upload_id,
+                Some(project_id),
+            );
+            return Err(finalization_storage_error(&error));
+        }
+        if let Err(error) = self
+            .storage
+            .finalize_no_replace(upload_id, project_id, &file_name)
+            .await
+        {
+            if matches!(
+                error,
+                StorageError::AlreadyExists | StorageError::UnsafeEntry
+            ) {
+                if self
+                    .repository
+                    .mark_upload_failed(upload_id, "final destination conflict")
+                    .await
+                    .is_err()
+                {
+                    record_completion_failure(
+                        CompletionFailureReason::FailureMarkFailed,
+                        request_id,
+                        upload_id,
+                        Some(project_id),
+                    );
+                    return Err(UploadServiceError::FinalizeFailed);
+                }
+                record_completion_failure(
+                    CompletionFailureReason::DestinationConflict,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(UploadServiceError::DestinationExists);
+            }
+            record_completion_failure(
+                completion_storage_failure(&error),
+                request_id,
+                upload_id,
+                Some(project_id),
+            );
+            return Err(finalization_storage_error(&error));
+        }
+        match self.storage.final_file_len(project_id, &file_name).await {
+            Ok(Some(len)) if len == total_size => {}
+            Ok(_) => {
+                record_completion_failure(
+                    CompletionFailureReason::FinalSizeMismatch,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(UploadServiceError::FinalizeFailed);
+            }
+            Err(error) => {
+                if matches!(error, StorageError::UnsafeEntry) {
+                    if self
+                        .repository
+                        .mark_upload_failed(upload_id, "unsafe destination after publication")
+                        .await
+                        .is_err()
+                    {
+                        record_completion_failure(
+                            CompletionFailureReason::FailureMarkFailed,
+                            request_id,
+                            upload_id,
+                            Some(project_id),
+                        );
+                        return Err(UploadServiceError::FinalizeFailed);
+                    }
+                    record_completion_failure(
+                        CompletionFailureReason::DestinationConflict,
+                        request_id,
+                        upload_id,
+                        Some(project_id),
+                    );
+                    return Err(UploadServiceError::DestinationExists);
+                }
+                record_completion_failure(
+                    completion_storage_failure(&error),
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                return Err(finalization_storage_error(&error));
+            }
+        }
+        if self
+            .repository
+            .mark_upload_complete(upload_id)
+            .await
+            .is_err()
+        {
+            record_completion_failure(
+                CompletionFailureReason::CompleteTransitionFailed,
+                request_id,
+                upload_id,
+                Some(project_id),
+            );
+            return Err(UploadServiceError::FinalizeFailed);
+        }
+        match self.repository.get_upload(upload_id).await {
+            Ok(Some(upload)) if upload.state() == UploadState::Complete => Ok(upload),
+            _ => {
+                record_completion_failure(
+                    CompletionFailureReason::CompleteReloadFailed,
+                    request_id,
+                    upload_id,
+                    Some(project_id),
+                );
+                Err(UploadServiceError::FinalizeFailed)
+            }
+        }
+    }
+
+    async fn classify_finalizing_race(
+        &self,
+        upload_id: Uuid,
+        request_id: &RequestId,
+    ) -> Result<UploadRow, UploadServiceError> {
+        match self.repository.get_upload(upload_id).await {
+            Ok(Some(upload)) if upload.state() == UploadState::Complete => Ok(upload),
+            Ok(Some(upload)) if upload.state() == UploadState::Active => {
+                if upload.committed_offset() == upload.total_size() {
+                    record_completion_failure(
+                        CompletionFailureReason::RaceReloadFailed,
+                        request_id,
+                        upload_id,
+                        Some(upload.project_id()),
+                    );
+                    Err(UploadServiceError::FinalizeFailed)
+                } else {
+                    Err(UploadServiceError::UploadIncomplete)
+                }
+            }
+            Ok(Some(_)) => Err(UploadServiceError::UploadInactive),
+            Ok(None) => Err(UploadServiceError::UploadNotFound),
+            Err(_) => {
+                record_completion_failure(
+                    CompletionFailureReason::RaceReloadFailed,
+                    request_id,
+                    upload_id,
+                    None,
+                );
+                Err(UploadServiceError::FinalizeFailed)
+            }
+        }
+    }
+
+    async fn complete_owned(
+        &self,
+        upload_id: Uuid,
+        request_id: RequestId,
+    ) -> Result<UploadRow, UploadServiceError> {
+        let supervisor_service = self.clone();
+        let supervisor_request_id = request_id.clone();
+        let supervisor = tokio::spawn(async move {
+            let operation_service = supervisor_service.clone();
+            let operation_request_id = supervisor_request_id.clone();
+            let operation = tokio::spawn(async move {
+                operation_service
+                    .complete(upload_id, &operation_request_id)
+                    .await
+            });
+            match operation.await {
+                Ok(result) => result,
+                Err(_) => {
+                    record_completion_failure(
+                        CompletionFailureReason::TaskFailed,
+                        &supervisor_request_id,
+                        upload_id,
+                        None,
+                    );
+                    Err(UploadServiceError::FinalizeFailed)
+                }
+            }
+        });
+        match supervisor.await {
+            Ok(result) => result,
+            Err(_) => {
+                record_completion_failure(
+                    CompletionFailureReason::SupervisorFailed,
+                    &request_id,
+                    upload_id,
+                    None,
+                );
+                Err(UploadServiceError::FinalizeFailed)
+            }
+        }
+    }
+
+    /// Reconciles upload sessions left active or finalizing by an interrupted process.
+    /// Call after database/storage initialization and before accepting requests.
+    pub async fn recover_uploads(&self) -> Result<(), UploadRecoveryError> {
+        let recoverable = match self.repository.recoverable_uploads().await {
+            Ok(recoverable) => recoverable,
+            Err(_) => {
+                record_recovery_error("recoverable_query_failed", None, None);
+                return Err(UploadRecoveryError);
+            }
+        };
+        for upload in recoverable {
+            if self.recover(upload.id()).await.is_err() {
+                record_recovery_error(
+                    "ambiguous_recovery_failure",
+                    Some(upload.id()),
+                    Some(upload.project_id()),
+                );
+                return Err(UploadRecoveryError);
+            }
+        }
+        Ok(())
+    }
+
+    async fn recover(&self, upload_id: Uuid) -> Result<(), UploadRecoveryError> {
+        let lock = self.lock_for(upload_id);
+        let _guard = lock.lock().await;
+        let Some(upload) = self
+            .repository
+            .get_upload(upload_id)
+            .await
+            .map_err(|_| UploadRecoveryError)?
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            upload.state(),
+            UploadState::Active | UploadState::Finalizing
+        ) {
+            return Ok(());
+        }
+        let file_name = match SafeFileName::parse(upload.file_name()) {
+            Ok(file_name) => file_name,
+            Err(_) => {
+                return self
+                    .recovery_mark_failed(&upload, "invalid_stored_file_name")
+                    .await;
+            }
+        };
+        let destination_len = match self
+            .storage
+            .final_file_len(upload.project_id(), &file_name)
+            .await
+        {
+            Ok(len) => len,
+            Err(StorageError::UnsafeEntry) => {
+                return self
+                    .recovery_mark_failed(&upload, "unsafe_recovery_entry")
+                    .await;
+            }
+            Err(_) => return Err(UploadRecoveryError),
+        };
+        let staging_len = match self.storage.staging_len(upload_id).await {
+            Ok(len) => len,
+            Err(StorageError::UnsafeEntry) => {
+                return self
+                    .recovery_mark_failed(&upload, "unsafe_recovery_entry")
+                    .await;
+            }
+            Err(_) => return Err(UploadRecoveryError),
+        };
+        match upload.state() {
+            UploadState::Active => {
+                self.recover_active(&upload, destination_len, staging_len)
+                    .await
+            }
+            UploadState::Finalizing => {
+                self.recover_finalizing(&upload, &file_name, destination_len, staging_len)
+                    .await
+            }
+            UploadState::Complete | UploadState::Failed => Ok(()),
+        }
+    }
+
+    async fn recover_active(
+        &self,
+        upload: &UploadRow,
+        destination_len: Option<u64>,
+        staging_len: Option<u64>,
+    ) -> Result<(), UploadRecoveryError> {
+        if destination_len.is_some() {
+            return self
+                .recovery_mark_failed(upload, "active_destination_conflict")
+                .await;
+        }
+        match staging_len {
+            Some(len) if len == upload.committed_offset() => Ok(()),
+            Some(len) if len > upload.committed_offset() => {
+                self.storage
+                    .truncate_staging(upload.id(), upload.committed_offset())
+                    .await
+                    .map_err(|_| UploadRecoveryError)?;
+                self.storage
+                    .sync_staging(upload.id())
+                    .await
+                    .map_err(|_| UploadRecoveryError)?;
+                record_recovery_outcome(upload, "repaired", "active_staging_truncated");
+                Ok(())
+            }
+            Some(_) => {
+                self.recovery_mark_failed(upload, "active_staging_short")
+                    .await
+            }
+            None => {
+                self.recovery_mark_failed(upload, "active_staging_missing")
+                    .await
+            }
+        }
+    }
+
+    async fn recover_finalizing(
+        &self,
+        upload: &UploadRow,
+        file_name: &SafeFileName,
+        destination_len: Option<u64>,
+        staging_len: Option<u64>,
+    ) -> Result<(), UploadRecoveryError> {
+        match (destination_len, staging_len) {
+            (Some(len), None) if len == upload.total_size() => {
+                self.recovery_mark_complete(upload, "final_destination_completed")
+                    .await
+            }
+            (Some(_), _) => {
+                self.recovery_mark_failed(upload, "final_destination_conflict")
+                    .await
+            }
+            (None, Some(len)) if len == upload.total_size() => {
+                self.storage
+                    .sync_staging(upload.id())
+                    .await
+                    .map_err(|_| UploadRecoveryError)?;
+                match self
+                    .storage
+                    .finalize_no_replace(upload.id(), upload.project_id(), file_name)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(StorageError::AlreadyExists) => {
+                        return self
+                            .recovery_mark_failed(upload, "final_move_conflict")
+                            .await;
+                    }
+                    Err(_) => return Err(UploadRecoveryError),
+                }
+                match self
+                    .storage
+                    .final_file_len(upload.project_id(), file_name)
+                    .await
+                    .map_err(|_| UploadRecoveryError)?
+                {
+                    Some(len) if len == upload.total_size() => {
+                        self.recovery_mark_complete(upload, "final_staging_published")
+                            .await
+                    }
+                    Some(_) => {
+                        self.recovery_mark_failed(upload, "published_size_mismatch")
+                            .await
+                    }
+                    None => Err(UploadRecoveryError),
+                }
+            }
+            (None, Some(_)) => {
+                self.recovery_mark_failed(upload, "final_staging_size_mismatch")
+                    .await
+            }
+            (None, None) => {
+                self.recovery_mark_failed(upload, "final_files_missing")
+                    .await
+            }
+        }
+    }
+
+    async fn recovery_mark_failed(
+        &self,
+        upload: &UploadRow,
+        reason: &'static str,
+    ) -> Result<(), UploadRecoveryError> {
+        self.repository
+            .mark_upload_failed(upload.id(), reason)
+            .await
+            .map_err(|_| UploadRecoveryError)?;
+        record_recovery_outcome(upload, "failed", reason);
+        Ok(())
+    }
+
+    async fn recovery_mark_complete(
+        &self,
+        upload: &UploadRow,
+        reason: &'static str,
+    ) -> Result<(), UploadRecoveryError> {
+        self.repository
+            .mark_upload_complete(upload.id())
+            .await
+            .map_err(|_| UploadRecoveryError)?;
+        record_recovery_outcome(upload, "repaired", reason);
+        Ok(())
     }
 
     async fn write_chunk(
@@ -796,10 +1438,120 @@ enum UploadServiceError {
     ProjectNotFound,
     UploadNotFound,
     DestinationExists,
+    InvalidStaging,
+    UploadIncomplete,
+    UploadInactive,
     InsufficientStorage,
     CreateFailed,
     StatusFailed,
+    FinalizeFailed,
     CleanupFailed,
+}
+
+/// A closed startup error indicating recovery could not safely determine or persist state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UploadRecoveryError;
+
+impl std::fmt::Display for UploadRecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("upload recovery could not be completed safely")
+    }
+}
+
+impl std::error::Error for UploadRecoveryError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionFailureReason {
+    DatabaseLookupFailed,
+    InvalidStoredFileName,
+    MarkFinalizingFailed,
+    DestinationConflict,
+    StagingInvalid,
+    InsufficientSpace,
+    StorageUnavailable,
+    FinalSizeMismatch,
+    FailureMarkFailed,
+    CompleteTransitionFailed,
+    CompleteReloadFailed,
+    RaceReloadFailed,
+    TaskFailed,
+    SupervisorFailed,
+}
+
+impl CompletionFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DatabaseLookupFailed => "database_upload_lookup_failed",
+            Self::InvalidStoredFileName => "invalid_stored_file_name",
+            Self::MarkFinalizingFailed => "mark_finalizing_failed",
+            Self::DestinationConflict => "destination_conflict",
+            Self::StagingInvalid => "staging_invalid",
+            Self::InsufficientSpace => "insufficient_space",
+            Self::StorageUnavailable => "storage_unavailable",
+            Self::FinalSizeMismatch => "final_size_mismatch",
+            Self::FailureMarkFailed => "failure_mark_failed",
+            Self::CompleteTransitionFailed => "complete_transition_failed",
+            Self::CompleteReloadFailed => "complete_reload_failed",
+            Self::RaceReloadFailed => "race_reload_failed",
+            Self::TaskFailed => "finalization_task_failed",
+            Self::SupervisorFailed => "finalization_supervisor_failed",
+        }
+    }
+}
+
+fn completion_storage_failure(error: &StorageError) -> CompletionFailureReason {
+    match error {
+        StorageError::InsufficientSpace => CompletionFailureReason::InsufficientSpace,
+        _ => CompletionFailureReason::StorageUnavailable,
+    }
+}
+
+fn finalization_storage_error(error: &StorageError) -> UploadServiceError {
+    match error {
+        StorageError::InsufficientSpace => UploadServiceError::InsufficientStorage,
+        _ => UploadServiceError::FinalizeFailed,
+    }
+}
+
+fn record_completion_failure(
+    reason: CompletionFailureReason,
+    request_id: &RequestId,
+    upload_id: Uuid,
+    project_id: Option<Uuid>,
+) {
+    tracing::warn!(
+        reason = reason.as_str(),
+        request_id = %request_id,
+        upload_id = %upload_id,
+        project_id = project_id.map(|id| id.to_string()).as_deref().unwrap_or("unknown"),
+        "upload finalization failed"
+    );
+}
+
+fn record_recovery_outcome(upload: &UploadRow, outcome: &'static str, reason: &'static str) {
+    tracing::info!(
+        outcome,
+        reason,
+        upload_id = %upload.id(),
+        project_id = %upload.project_id(),
+        "upload startup recovery outcome"
+    );
+}
+
+fn record_recovery_error(reason: &'static str, upload_id: Option<Uuid>, project_id: Option<Uuid>) {
+    tracing::error!(
+        outcome = "error",
+        reason,
+        upload_id = upload_id
+            .map(|id| id.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
+        project_id = project_id
+            .map(|id| id.to_string())
+            .as_deref()
+            .unwrap_or("unknown"),
+        "upload startup recovery stopped"
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -920,6 +1672,10 @@ pub fn upload_router(service: UploadService) -> Router {
         .route("/api/v1/projects/{project_id}/uploads", post(create_upload))
         .route("/api/v1/uploads/{upload_id}", get(upload_status))
         .route("/api/v1/uploads/{upload_id}/chunk", put(upload_chunk))
+        .route(
+            "/api/v1/uploads/{upload_id}/complete",
+            post(complete_upload),
+        )
         .with_state(service)
 }
 
@@ -955,6 +1711,21 @@ async fn upload_status(
         parse_canonical_uuid(&upload_id).ok_or_else(|| invalid_request(request_id.clone()))?;
     service
         .status(upload_id, &request_id)
+        .await
+        .map(|upload| Json(upload.into()))
+        .map_err(|error| map_service_error(error, request_id))
+}
+
+async fn complete_upload(
+    State(service): State<UploadService>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(_owner): Extension<OwnerIdentity>,
+    Path(upload_id): Path<String>,
+) -> Result<Json<UploadResponse>, AppError> {
+    let upload_id =
+        parse_canonical_uuid(&upload_id).ok_or_else(|| invalid_request(request_id.clone()))?;
+    service
+        .complete_owned(upload_id, request_id.clone())
         .await
         .map(|upload| Json(upload.into()))
         .map_err(|error| map_service_error(error, request_id))
@@ -1111,6 +1882,24 @@ fn map_service_error(error: UploadServiceError, request_id: RequestId) -> AppErr
             "A file with that name already exists.",
             None,
         ),
+        UploadServiceError::InvalidStaging => AppError::conflict(
+            request_id,
+            "upload_staging_invalid",
+            "The upload staging data is inconsistent.",
+            None,
+        ),
+        UploadServiceError::UploadIncomplete => AppError::conflict(
+            request_id,
+            "upload_incomplete",
+            "The upload has not received all expected bytes.",
+            None,
+        ),
+        UploadServiceError::UploadInactive => AppError::conflict(
+            request_id,
+            "upload_not_active",
+            "The upload cannot be completed from its current state.",
+            None,
+        ),
         UploadServiceError::InsufficientStorage => AppError::insufficient_storage(request_id),
         UploadServiceError::CreateFailed => AppError::service_unavailable(
             request_id,
@@ -1121,6 +1910,11 @@ fn map_service_error(error: UploadServiceError, request_id: RequestId) -> AppErr
             request_id,
             "upload_status_failed",
             "Upload status is temporarily unavailable.",
+        ),
+        UploadServiceError::FinalizeFailed => AppError::service_unavailable(
+            request_id,
+            "upload_finalize_failed",
+            "The upload could not be finalized safely.",
         ),
         UploadServiceError::CleanupFailed => AppError::service_unavailable(
             request_id,

@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -53,6 +53,10 @@ fn upload_chunk(upload_id: Uuid) -> String {
     format!("/api/v1/uploads/{upload_id}/chunk")
 }
 
+fn upload_complete(upload_id: Uuid) -> String {
+    format!("/api/v1/uploads/{upload_id}/complete")
+}
+
 async fn create_upload_session(context: &TestContext, project_id: Uuid, total_size: u64) -> Uuid {
     let response = context
         .app()
@@ -65,6 +69,1299 @@ async fn create_upload_session(context: &TestContext, project_id: Uuid, total_si
     let (status, _, body) = json_response(response).await;
     assert_eq!(status, 201);
     Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn upload_completion_publishes_exact_bytes_and_is_idempotent() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+
+    for _ in 0..2 {
+        let response = context
+            .app()
+            .oneshot(
+                authenticated_write_request(&upload_complete(upload_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = json_response(response).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["id"], upload_id.to_string());
+        assert_eq!(body["projectId"], project_id.to_string());
+        assert_eq!(body["fileName"], "chunk.bin");
+        assert_eq!(body["totalSize"], "4");
+        assert_eq!(body["committedOffset"], "4");
+        assert_eq!(body["state"], "complete");
+    }
+
+    assert_eq!(
+        std::fs::read(context.project_path(project_id).join("files/chunk.bin")).unwrap(),
+        b"data"
+    );
+    assert_eq!(context.storage.staging_len(upload_id).await.unwrap(), None);
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Complete
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_completion_rejects_incomplete_session_without_changes() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+
+    let response = context
+        .app()
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, _, body) = json_response(response).await;
+    assert_eq!(status, 409);
+    assert_eq!(body["error"]["code"], "upload_incomplete");
+    let row = context
+        .database
+        .get_upload(upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state(), cellar::db::UploadState::Active);
+    assert_eq!(row.committed_offset(), 0);
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0)
+    );
+    assert!(
+        !context
+            .project_path(project_id)
+            .join("files/chunk.bin")
+            .exists()
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_complete_rejects_missing_short_and_long_staging_before_finalizing() {
+    for (case, mutate) in [("missing", 0_u8), ("short", 1_u8), ("long", 2_u8)] {
+        let context = TestContext::new().await;
+        let project_id = create_project(&context).await;
+        let upload_id = create_upload_session(&context, project_id, 4).await;
+        assert_eq!(
+            context
+                .app()
+                .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        match mutate {
+            0 => context.storage.remove_staging(upload_id).await.unwrap(),
+            1 => context
+                .storage
+                .truncate_staging(upload_id, 3)
+                .await
+                .unwrap(),
+            2 => {
+                context
+                    .storage
+                    .write_chunk(upload_id, 4, &b"x"[..])
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let response = context
+            .app()
+            .oneshot(
+                authenticated_write_request(&upload_complete(upload_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = json_response(response).await;
+        assert_eq!(status, 409, "unexpected status for {case}");
+        assert_eq!(body["error"]["code"], "upload_staging_invalid");
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            cellar::db::UploadState::Failed
+        );
+        assert!(
+            !context
+                .project_path(project_id)
+                .join("files/chunk.bin")
+                .exists()
+        );
+        context.close().await;
+    }
+}
+
+#[tokio::test]
+async fn upload_complete_accepts_exact_zero_byte_staging() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 0).await;
+
+    let response = context
+        .app()
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, _, body) = json_response(response).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["state"], "complete");
+    assert_eq!(
+        std::fs::metadata(context.project_path(project_id).join("files/chunk.bin"))
+            .unwrap()
+            .len(),
+        0
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_complete_preserves_unsafe_exact_entries_and_marks_failed_before_finalizing() {
+    for unsafe_destination in [false, true] {
+        let context = TestContext::new().await;
+        let project_id = create_project(&context).await;
+        let upload_id = create_upload_session(&context, project_id, 0).await;
+        let unsafe_path = if unsafe_destination {
+            context.project_path(project_id).join("files/chunk.bin")
+        } else {
+            let path = context
+                .temp
+                .path()
+                .join(".cellar/uploads")
+                .join(format!("{upload_id}.part"));
+            context.storage.remove_staging(upload_id).await.unwrap();
+            path
+        };
+        std::fs::create_dir(&unsafe_path).unwrap();
+
+        let response = context
+            .app()
+            .oneshot(
+                authenticated_write_request(&upload_complete(upload_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = json_response(response).await;
+        assert_eq!(status, 409);
+        assert_eq!(
+            body["error"]["code"],
+            if unsafe_destination {
+                "destination_exists"
+            } else {
+                "upload_staging_invalid"
+            }
+        );
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            cellar::db::UploadState::Failed
+        );
+        assert!(std::fs::metadata(unsafe_path).unwrap().is_dir());
+        context.close().await;
+    }
+}
+
+struct PreflightOrderingRepository {
+    database: Database,
+    staging_checked: Arc<AtomicBool>,
+    destination_checked: Arc<AtomicBool>,
+}
+
+impl UploadRepository for PreflightOrderingRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        Box::pin(async move { self.database.get_upload(upload_id).await })
+    }
+
+    fn mark_upload_finalizing<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move {
+            assert!(self.staging_checked.load(Ordering::SeqCst));
+            assert!(self.destination_checked.load(Ordering::SeqCst));
+            self.database.mark_finalizing(upload_id, expected).await
+        })
+    }
+
+    fn mark_upload_complete<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async move { self.database.mark_complete(upload_id).await })
+    }
+}
+
+struct PreflightOrderingStorage {
+    storage: Arc<Storage>,
+    staging_checked: Arc<AtomicBool>,
+    destination_checked: Arc<AtomicBool>,
+}
+
+impl UploadStorage for PreflightOrderingStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            let result = self.storage.staging_len(upload_id).await;
+            self.staging_checked.store(true, Ordering::SeqCst);
+            result
+        })
+    }
+
+    fn final_file_len<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            let result = self.storage.final_file_len(project_id, file_name).await;
+            self.destination_checked.store(true, Ordering::SeqCst);
+            result
+        })
+    }
+
+    fn sync_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.sync_staging(upload_id).await })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        upload_id: Uuid,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move {
+            self.storage
+                .finalize_no_replace(upload_id, project_id, file_name)
+                .await
+        })
+    }
+}
+
+#[tokio::test]
+async fn upload_complete_inspects_exact_staging_and_destination_before_mark_finalizing() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 0).await;
+    let staging_checked = Arc::new(AtomicBool::new(false));
+    let destination_checked = Arc::new(AtomicBool::new(false));
+    let service = UploadService::new(
+        Arc::new(PreflightOrderingRepository {
+            database: context.database.clone(),
+            staging_checked: staging_checked.clone(),
+            destination_checked: destination_checked.clone(),
+        }),
+        Arc::new(PreflightOrderingStorage {
+            storage: context.storage.clone(),
+            staging_checked,
+            destination_checked,
+        }),
+    );
+
+    let response = context
+        .secure_upload(service)
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_completion_conflict_preserves_destination_and_marks_failed() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let destination = context.project_path(project_id).join("files/chunk.bin");
+    std::fs::write(&destination, b"keep").unwrap();
+
+    let response = context
+        .app()
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, _, body) = json_response(response).await;
+    assert_eq!(status, 409);
+    assert_eq!(body["error"]["code"], "destination_exists");
+    assert_eq!(std::fs::read(destination).unwrap(), b"keep");
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Failed
+    );
+    context.close().await;
+}
+
+struct FinalizeObservingStorage {
+    storage: Arc<Storage>,
+    database: Database,
+    move_started: Mutex<Option<oneshot::Sender<()>>>,
+    release_move: Option<Arc<Semaphore>>,
+}
+
+impl UploadStorage for FinalizeObservingStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move { self.storage.staging_len(upload_id).await })
+    }
+
+    fn sync_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.sync_staging(upload_id).await })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        upload_id: Uuid,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        let started = self.move_started.lock().unwrap().take();
+        Box::pin(async move {
+            assert_eq!(
+                self.database
+                    .get_upload(upload_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state(),
+                cellar::db::UploadState::Finalizing
+            );
+            if let Some(started) = started {
+                let _ = started.send(());
+            }
+            if let Some(release) = &self.release_move {
+                release.acquire().await.unwrap().forget();
+            }
+            self.storage
+                .finalize_no_replace(upload_id, project_id, file_name)
+                .await
+        })
+    }
+
+    fn final_file_len<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move { self.storage.final_file_len(project_id, file_name).await })
+    }
+}
+
+#[tokio::test]
+async fn upload_completion_marks_finalizing_before_move() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        Arc::new(FinalizeObservingStorage {
+            storage: context.storage.clone(),
+            database: context.database.clone(),
+            move_started: Mutex::new(None),
+            release_move: None,
+        }),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_completion_request_abort_after_finalizing_finishes_detached_operation() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let (started_tx, started_rx) = oneshot::channel();
+    let release = Arc::new(Semaphore::new(0));
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        Arc::new(FinalizeObservingStorage {
+            storage: context.storage.clone(),
+            database: context.database.clone(),
+            move_started: Mutex::new(Some(started_tx)),
+            release_move: Some(release.clone()),
+        }),
+    );
+    let request = tokio::spawn(
+        context.secure_upload(service).oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Finalizing
+    );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    release.add_permits(1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state()
+                == cellar::db::UploadState::Complete
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached finalization did not complete");
+    assert_eq!(
+        std::fs::read(context.project_path(project_id).join("files/chunk.bin")).unwrap(),
+        b"data"
+    );
+    context.close().await;
+}
+
+#[derive(Clone, Copy)]
+enum FinalizeFailureMode {
+    SyncFull,
+    SyncUnsafe,
+    MoveUnavailable,
+    MoveUnsafe,
+    VerifyMismatch,
+    VerifyUnsafe,
+    PanicAfterMove,
+}
+
+struct FailingFinalizeStorage {
+    storage: Arc<Storage>,
+    mode: FinalizeFailureMode,
+    final_len_calls: AtomicUsize,
+}
+
+impl UploadStorage for FailingFinalizeStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move { self.storage.staging_len(upload_id).await })
+    }
+
+    fn sync_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move {
+            if matches!(self.mode, FinalizeFailureMode::SyncFull) {
+                Err(StorageError::InsufficientSpace)
+            } else if matches!(self.mode, FinalizeFailureMode::SyncUnsafe) {
+                Err(StorageError::UnsafeEntry)
+            } else {
+                self.storage.sync_staging(upload_id).await
+            }
+        })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        upload_id: Uuid,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move {
+            if matches!(self.mode, FinalizeFailureMode::MoveUnavailable) {
+                Err(StorageError::Io {
+                    source: io::Error::other("private move failure"),
+                })
+            } else if matches!(self.mode, FinalizeFailureMode::MoveUnsafe) {
+                Err(StorageError::UnsafeEntry)
+            } else if matches!(self.mode, FinalizeFailureMode::PanicAfterMove) {
+                self.storage
+                    .finalize_no_replace(upload_id, project_id, file_name)
+                    .await?;
+                panic!("deterministic panic after final move")
+            } else {
+                self.storage
+                    .finalize_no_replace(upload_id, project_id, file_name)
+                    .await
+            }
+        })
+    }
+
+    fn final_file_len<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            let call = self.final_len_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(self.mode, FinalizeFailureMode::VerifyMismatch) && call > 0 {
+                Ok(Some(99))
+            } else if matches!(self.mode, FinalizeFailureMode::VerifyUnsafe) && call > 0 {
+                Err(StorageError::UnsafeEntry)
+            } else {
+                self.storage.final_file_len(project_id, file_name).await
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn upload_completion_storage_failures_leave_recoverable_evidence() {
+    for (mode, expected_status, staging_exists, destination_exists) in [
+        (FinalizeFailureMode::SyncFull, 507, true, false),
+        (FinalizeFailureMode::MoveUnavailable, 503, true, false),
+        (FinalizeFailureMode::VerifyMismatch, 503, false, true),
+    ] {
+        let context = TestContext::new().await;
+        let project_id = create_project(&context).await;
+        let upload_id = create_upload_session(&context, project_id, 4).await;
+        assert_eq!(
+            context
+                .app()
+                .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+                .await
+                .unwrap()
+                .status(),
+            204
+        );
+        let service = UploadService::new(
+            Arc::new(context.database.clone()),
+            Arc::new(FailingFinalizeStorage {
+                storage: context.storage.clone(),
+                mode,
+                final_len_calls: AtomicUsize::new(0),
+            }),
+        );
+        let response = context
+            .secure_upload(service)
+            .oneshot(
+                authenticated_write_request(&upload_complete(upload_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            cellar::db::UploadState::Finalizing
+        );
+        assert_eq!(
+            context
+                .storage
+                .staging_len(upload_id)
+                .await
+                .unwrap()
+                .is_some(),
+            staging_exists
+        );
+        assert_eq!(
+            context
+                .project_path(project_id)
+                .join("files/chunk.bin")
+                .exists(),
+            destination_exists
+        );
+        context.close().await;
+    }
+}
+
+#[tokio::test]
+async fn upload_complete_late_unsafe_entries_mark_failed_and_return_409() {
+    for (mode, staging_exists, destination_exists, expected_code) in [
+        (
+            FinalizeFailureMode::SyncUnsafe,
+            true,
+            false,
+            "upload_staging_invalid",
+        ),
+        (
+            FinalizeFailureMode::MoveUnsafe,
+            true,
+            false,
+            "destination_exists",
+        ),
+        (
+            FinalizeFailureMode::VerifyUnsafe,
+            false,
+            true,
+            "destination_exists",
+        ),
+    ] {
+        let context = TestContext::new().await;
+        let project_id = create_project(&context).await;
+        let upload_id = create_upload_session(&context, project_id, 0).await;
+        let response = context
+            .secure_upload(UploadService::new(
+                Arc::new(context.database.clone()),
+                Arc::new(FailingFinalizeStorage {
+                    storage: context.storage.clone(),
+                    mode,
+                    final_len_calls: AtomicUsize::new(0),
+                }),
+            ))
+            .oneshot(
+                authenticated_write_request(&upload_complete(upload_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, body) = json_response(response).await;
+
+        assert_eq!(status, 409);
+        assert_eq!(body["error"]["code"], expected_code);
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            cellar::db::UploadState::Failed
+        );
+        assert_eq!(
+            context
+                .storage
+                .staging_len(upload_id)
+                .await
+                .unwrap()
+                .is_some(),
+            staging_exists
+        );
+        assert_eq!(
+            context
+                .project_path(project_id)
+                .join("files/chunk.bin")
+                .exists(),
+            destination_exists
+        );
+        context.close().await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreflightDiskFullMode {
+    Staging,
+    Destination,
+}
+
+struct PreflightDiskFullStorage {
+    storage: Arc<Storage>,
+    mode: PreflightDiskFullMode,
+}
+
+impl UploadStorage for PreflightDiskFullStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            if matches!(self.mode, PreflightDiskFullMode::Staging) {
+                Err(StorageError::InsufficientSpace)
+            } else {
+                self.storage.staging_len(upload_id).await
+            }
+        })
+    }
+
+    fn final_file_len<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move {
+            if matches!(self.mode, PreflightDiskFullMode::Destination) {
+                Err(StorageError::InsufficientSpace)
+            } else {
+                self.storage.final_file_len(project_id, file_name).await
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn upload_complete_preflight_disk_full_is_507_without_transition_or_mutation() {
+    for mode in [
+        PreflightDiskFullMode::Staging,
+        PreflightDiskFullMode::Destination,
+    ] {
+        let context = TestContext::new().await;
+        let project_id = create_project(&context).await;
+        let upload_id = create_upload_session(&context, project_id, 0).await;
+        let response = context
+            .secure_upload(UploadService::new(
+                Arc::new(context.database.clone()),
+                Arc::new(PreflightDiskFullStorage {
+                    storage: context.storage.clone(),
+                    mode,
+                }),
+            ))
+            .oneshot(
+                authenticated_write_request(&upload_complete(upload_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 507);
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            cellar::db::UploadState::Active
+        );
+        assert_eq!(
+            context.storage.staging_len(upload_id).await.unwrap(),
+            Some(0)
+        );
+        assert!(
+            !context
+                .project_path(project_id)
+                .join("files/chunk.bin")
+                .exists()
+        );
+        context.close().await;
+    }
+}
+
+struct CompleteFailingRepository {
+    database: Database,
+}
+
+struct CompletionFailureMarkFailingRepository {
+    database: Database,
+}
+
+impl UploadRepository for CompletionFailureMarkFailingRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        Box::pin(async move { self.database.get_upload(upload_id).await })
+    }
+
+    fn mark_upload_failed<'a>(&'a self, _: Uuid, _: &'a str) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
+
+    fn mark_upload_finalizing<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move { self.database.mark_finalizing(upload_id, expected).await })
+    }
+}
+
+#[tokio::test]
+async fn upload_complete_preflight_failure_transition_error_returns_503_without_false_state() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 0).await;
+    let destination = context.project_path(project_id).join("files/chunk.bin");
+    std::fs::create_dir(&destination).unwrap();
+    let service = UploadService::new(
+        Arc::new(CompletionFailureMarkFailingRepository {
+            database: context.database.clone(),
+        }),
+        context.storage.clone(),
+    );
+
+    let response = context
+        .secure_upload(service)
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Active
+    );
+    assert!(std::fs::metadata(destination).unwrap().is_dir());
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_complete_managed_directory_inspection_error_returns_503_without_state_claim() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 0).await;
+    context.storage.remove_staging(upload_id).await.unwrap();
+    let uploads_dir = context.temp.path().join(".cellar/uploads");
+    std::fs::remove_dir(&uploads_dir).unwrap();
+    std::fs::write(&uploads_dir, b"preserve managed corruption").unwrap();
+
+    let response = context
+        .app()
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Active
+    );
+    assert_eq!(
+        std::fs::read(uploads_dir).unwrap(),
+        b"preserve managed corruption"
+    );
+    assert!(
+        !context
+            .project_path(project_id)
+            .join("files/chunk.bin")
+            .exists()
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_complete_late_unsafe_failure_transition_error_returns_503_without_false_claim() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 0).await;
+    let response = context
+        .secure_upload(UploadService::new(
+            Arc::new(CompletionFailureMarkFailingRepository {
+                database: context.database.clone(),
+            }),
+            Arc::new(FailingFinalizeStorage {
+                storage: context.storage.clone(),
+                mode: FinalizeFailureMode::SyncUnsafe,
+                final_len_calls: AtomicUsize::new(0),
+            }),
+        ))
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Finalizing
+    );
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0)
+    );
+    assert!(
+        !context
+            .project_path(project_id)
+            .join("files/chunk.bin")
+            .exists()
+    );
+    context.close().await;
+}
+
+impl UploadRepository for CompleteFailingRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        Box::pin(async move { self.database.get_upload(upload_id).await })
+    }
+
+    fn mark_upload_finalizing<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move { self.database.mark_finalizing(upload_id, expected).await })
+    }
+
+    fn mark_upload_complete<'a>(&'a self, _: Uuid) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
+}
+
+#[tokio::test]
+async fn upload_completion_database_complete_failure_keeps_published_finalizing_evidence() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let service = UploadService::new(
+        Arc::new(CompleteFailingRepository {
+            database: context.database.clone(),
+        }),
+        context.storage.clone(),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Finalizing
+    );
+    assert_eq!(context.storage.staging_len(upload_id).await.unwrap(), None);
+    assert_eq!(
+        std::fs::read(context.project_path(project_id).join("files/chunk.bin")).unwrap(),
+        b"data"
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_complete_panic_after_move_leaves_evidence_for_focused_recovery() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let response = context
+        .secure_upload(UploadService::new(
+            Arc::new(context.database.clone()),
+            Arc::new(FailingFinalizeStorage {
+                storage: context.storage.clone(),
+                mode: FinalizeFailureMode::PanicAfterMove,
+                final_len_calls: AtomicUsize::new(0),
+            }),
+        ))
+        .oneshot(
+            authenticated_write_request(&upload_complete(upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Finalizing
+    );
+    assert_eq!(context.storage.staging_len(upload_id).await.unwrap(), None);
+    assert_eq!(
+        std::fs::read(context.project_path(project_id).join("files/chunk.bin")).unwrap(),
+        b"data"
+    );
+
+    UploadService::new(Arc::new(context.database.clone()), context.storage.clone())
+        .recover_uploads()
+        .await
+        .unwrap();
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        cellar::db::UploadState::Complete
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_completion_requires_canonical_path_authentication_and_exact_origin() {
+    let context = TestContext::new().await;
+    let unknown = Uuid::now_v7();
+    let noncanonical = unknown.simple().to_string();
+    let canonical = upload_complete(unknown);
+
+    for (request, expected) in [
+        (
+            authenticated_write_request(&format!("/api/v1/uploads/{noncanonical}/complete"))
+                .body(Body::empty())
+                .unwrap(),
+            400,
+        ),
+        (
+            http::Request::builder()
+                .method("POST")
+                .uri(&canonical)
+                .header("origin", common::EXTERNAL_ORIGIN)
+                .body(Body::empty())
+                .unwrap(),
+            401,
+        ),
+        (
+            authenticated_request("POST", &canonical)
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+            403,
+        ),
+    ] {
+        let status = context.app().oneshot(request).await.unwrap().status();
+        assert_eq!(status, expected);
+    }
+    let response = context
+        .app()
+        .oneshot(
+            authenticated_write_request(&canonical)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    context.close().await;
 }
 
 fn chunk_request(

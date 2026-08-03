@@ -448,7 +448,7 @@ impl Storage {
         let Some(metadata) = optional_metadata(&self.staging_path(upload_id)).await? else {
             return Ok(None);
         };
-        require_safe_regular_file_metadata(&metadata)?;
+        require_safe_exact_entry_metadata(&metadata)?;
         Ok(Some(metadata.len()))
     }
 
@@ -533,12 +533,12 @@ impl Storage {
         self.require_uploads_dir().await?;
         let source = self.staging_path(upload_id);
         let source_metadata = fs::symlink_metadata(&source).await.map_err(map_io)?;
-        require_safe_regular_file_metadata(&source_metadata)?;
+        require_safe_exact_entry_metadata(&source_metadata)?;
 
         let files_dir = self.require_project_files_dir(project_id).await?;
         let destination = files_dir.join(name.as_str());
         if let Some(metadata) = optional_metadata(&destination).await? {
-            require_safe_regular_file_metadata(&metadata)?;
+            require_safe_exact_entry_metadata(&metadata)?;
         }
 
         atomic_move_no_replace(source, destination).await
@@ -553,7 +553,7 @@ impl Storage {
         let Some(metadata) = optional_metadata(&files_dir.join(name.as_str())).await? else {
             return Ok(None);
         };
-        require_safe_regular_file_metadata(&metadata)?;
+        require_safe_exact_entry_metadata(&metadata)?;
         Ok(Some(metadata.len()))
     }
 
@@ -645,7 +645,7 @@ impl Storage {
         self.require_uploads_dir().await?;
         let path = self.staging_path(upload_id);
         let metadata = fs::symlink_metadata(&path).await.map_err(map_io)?;
-        require_safe_regular_file_metadata(&metadata)?;
+        require_safe_exact_entry_metadata(&metadata)?;
         fs::OpenOptions::new()
             .write(true)
             .open(path)
@@ -691,11 +691,13 @@ async fn atomic_move_no_replace(source: PathBuf, destination: PathBuf) -> Result
 
 #[cfg(not(windows))]
 async fn atomic_move_no_replace(source: PathBuf, destination: PathBuf) -> Result<(), StorageError> {
-    fs::hard_link(&source, &destination).await.map_err(map_io)?;
-    if let Err(source) = fs::remove_file(&source).await {
-        return Err(StorageError::AmbiguousCleanup { source });
-    }
-    Ok(())
+    let _ = (source, destination);
+    Err(StorageError::Io {
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic upload publication is unsupported on this platform",
+        ),
+    })
 }
 
 async fn optional_metadata(path: &Path) -> Result<Option<std::fs::Metadata>, StorageError> {
@@ -740,6 +742,13 @@ async fn cleanup_project_creation(project_dir: &Path, files_created: bool) -> io
 fn require_safe_regular_file_metadata(metadata: &std::fs::Metadata) -> Result<(), StorageError> {
     if !metadata.is_file() || is_reparse_or_symlink(metadata) {
         return Err(StorageError::UnsafeManagedEntry);
+    }
+    Ok(())
+}
+
+fn require_safe_exact_entry_metadata(metadata: &std::fs::Metadata) -> Result<(), StorageError> {
+    if !metadata.is_file() || is_reparse_or_symlink(metadata) {
+        return Err(StorageError::UnsafeEntry);
     }
     Ok(())
 }
@@ -1238,6 +1247,7 @@ mod tests {
         assert_eq!(storage.staging_len(upload_id).await.unwrap(), Some(3));
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     async fn finalize_no_replace_moves_exact_staging_bytes() {
         let temp = tempdir().unwrap();
@@ -1272,6 +1282,39 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn finalize_no_replace_fails_closed_without_linking_on_unsupported_platform() {
+        let temp = tempdir().unwrap();
+        let root = existing_root(&temp);
+        let storage = Storage::new(root.clone()).unwrap();
+        storage.initialize().await.unwrap();
+        let project_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000007").unwrap();
+        let upload_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000008").unwrap();
+        let name = SafeFileName::parse("Report Final.pdf").unwrap();
+        storage.create_project_dir(project_id).await.unwrap();
+        storage.create_staging(upload_id).await.unwrap();
+        storage
+            .write_chunk(upload_id, 0, &b"final bytes"[..])
+            .await
+            .unwrap();
+
+        let error = storage
+            .finalize_no_replace(upload_id, project_id, &name)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageError::Io { source } if source.kind() == io::ErrorKind::Unsupported
+        ));
+        assert_eq!(storage.staging_len(upload_id).await.unwrap(), Some(11));
+        assert_eq!(
+            storage.final_file_len(project_id, &name).await.unwrap(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn finalize_conflict_preserves_destination_and_staging() {
         let temp = tempdir().unwrap();
@@ -1302,6 +1345,57 @@ mod tests {
         ));
         assert_eq!(std::fs::read(destination).unwrap(), b"original");
         assert_eq!(storage.staging_len(upload_id).await.unwrap(), Some(11));
+    }
+
+    #[tokio::test]
+    async fn finalize_classifies_unsafe_exact_leaves_without_changing_them() {
+        let temp = tempdir().unwrap();
+        let root = existing_root(&temp);
+        let storage = Storage::new(root.clone()).unwrap();
+        storage.initialize().await.unwrap();
+        let project_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000019").unwrap();
+        storage.create_project_dir(project_id).await.unwrap();
+
+        let unsafe_staging = Uuid::parse_str("018f1010-7b2a-7000-8000-00000000001a").unwrap();
+        storage.create_staging(unsafe_staging).await.unwrap();
+        let unsafe_staging_path = root
+            .join(".cellar/uploads")
+            .join(format!("{unsafe_staging}.part"));
+        std::fs::remove_file(&unsafe_staging_path).unwrap();
+        std::fs::create_dir(&unsafe_staging_path).unwrap();
+        let staging_name = SafeFileName::parse("staging.txt").unwrap();
+        assert!(matches!(
+            storage
+                .finalize_no_replace(unsafe_staging, project_id, &staging_name)
+                .await,
+            Err(StorageError::UnsafeEntry)
+        ));
+        assert!(std::fs::metadata(&unsafe_staging_path).unwrap().is_dir());
+
+        let unsafe_destination = Uuid::parse_str("018f1010-7b2a-7000-8000-00000000001b").unwrap();
+        storage.create_staging(unsafe_destination).await.unwrap();
+        let destination_name = SafeFileName::parse("destination.txt").unwrap();
+        let unsafe_destination_path = root
+            .join("projects")
+            .join(project_id.to_string())
+            .join("files")
+            .join(destination_name.as_str());
+        std::fs::create_dir(&unsafe_destination_path).unwrap();
+        assert!(matches!(
+            storage
+                .finalize_no_replace(unsafe_destination, project_id, &destination_name)
+                .await,
+            Err(StorageError::UnsafeEntry)
+        ));
+        assert!(
+            std::fs::metadata(&unsafe_destination_path)
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(
+            storage.staging_len(unsafe_destination).await.unwrap(),
+            Some(0)
+        );
     }
 
     #[tokio::test]
