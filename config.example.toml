@@ -1,0 +1,9 @@
+bind = "127.0.0.1:8787"
+external_origin = "https://files.example.com"
+data_root = "D:/CellarData"
+database_path = "D:/CellarData/.cellar/cellar.db"
+
+[access]
+team_domain = "https://example.cloudflareaccess.com"
+audience = "replace-with-access-application-aud"
+owner_email = "owner@example.com"
