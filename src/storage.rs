@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::SystemTime;
 
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 /// A single filename component validated for portable Windows storage.
@@ -151,6 +151,7 @@ pub enum StorageError {
     UnsafeManagedEntry,
     UnsafeEntry,
     NonEmptyStaging,
+    InvalidBody,
     OffsetMismatch { expected: u64, actual: u64 },
     InsufficientSpace,
     ProjectCleanupFailed { source: io::Error },
@@ -167,6 +168,7 @@ impl fmt::Display for StorageError {
             Self::UnsafeManagedEntry => formatter.write_str("unsafe managed storage entry"),
             Self::UnsafeEntry => formatter.write_str("unsafe or corrupt storage entry"),
             Self::NonEmptyStaging => formatter.write_str("staging file is not empty"),
+            Self::InvalidBody => formatter.write_str("request body stream failed"),
             Self::OffsetMismatch { expected, actual } => write!(
                 formatter,
                 "staging offset mismatch: expected {expected}, actual {actual}"
@@ -473,9 +475,21 @@ impl Storage {
         file.seek(io::SeekFrom::Start(offset))
             .await
             .map_err(map_io)?;
-        let written = tokio::io::copy(&mut reader, &mut file)
-            .await
-            .map_err(map_io)?;
+        let mut written = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|_| StorageError::InvalidBody)?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read]).await.map_err(map_io)?;
+            written = written
+                .checked_add(read as u64)
+                .ok_or(StorageError::InvalidBody)?;
+        }
         file.sync_data().await.map_err(map_io)?;
         Ok(written)
     }

@@ -1,14 +1,25 @@
 //! Upload session creation and status operations.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{Arc, Mutex as StdMutex, Weak},
+};
 
 use axum::{
     Extension, Json, Router,
+    body::Body,
     extract::{Path, State, rejection::JsonRejection},
-    http::StatusCode,
-    routing::{get, post},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
 };
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio_util::io::StreamReader;
 use uuid::Uuid;
 
 use crate::{
@@ -55,6 +66,7 @@ pub type UploadRepositoryFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DbError>> + Send + 'a>>;
 pub type UploadStorageFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, StorageError>> + Send + 'a>>;
+pub type UploadBodyReader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// Database operations needed by upload session endpoints.
 pub trait UploadRepository: Send + Sync {
@@ -64,6 +76,21 @@ pub trait UploadRepository: Send + Sync {
     ) -> UploadRepositoryFuture<'a, Option<ProjectRow>>;
     fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow>;
     fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>>;
+    fn advance_upload_offset<'a>(
+        &'a self,
+        _upload_id: Uuid,
+        _expected: u64,
+        _next: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
+    fn mark_upload_failed<'a>(
+        &'a self,
+        _upload_id: Uuid,
+        _reason: &'a str,
+    ) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async { Err(DbError::InvalidTransition) })
+    }
 }
 
 impl UploadRepository for Database {
@@ -81,6 +108,23 @@ impl UploadRepository for Database {
     fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
         Box::pin(async move { self.get_upload(upload_id).await })
     }
+
+    fn advance_upload_offset<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+        next: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move { self.advance_offset(upload_id, expected, next).await })
+    }
+
+    fn mark_upload_failed<'a>(
+        &'a self,
+        upload_id: Uuid,
+        reason: &'a str,
+    ) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async move { self.mark_failed(upload_id, reason).await })
+    }
 }
 
 /// Filesystem operations needed to create upload sessions.
@@ -92,6 +136,32 @@ pub trait UploadStorage: Send + Sync {
     ) -> UploadStorageFuture<'a, bool>;
     fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()>;
     fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()>;
+    fn write_staging_chunk<'a>(
+        &'a self,
+        _upload_id: Uuid,
+        _offset: u64,
+        _reader: UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other("chunk writes are unavailable"),
+            })
+        })
+    }
+    fn truncate_staging<'a>(&'a self, _upload_id: Uuid, _len: u64) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other("staging rollback is unavailable"),
+            })
+        })
+    }
+    fn staging_len<'a>(&'a self, _upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other("staging inspection is unavailable"),
+            })
+        })
+    }
 }
 
 impl UploadStorage for Storage {
@@ -110,12 +180,33 @@ impl UploadStorage for Storage {
     fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
         Box::pin(async move { self.remove_empty_staging(upload_id).await })
     }
+
+    fn write_staging_chunk<'a>(
+        &'a self,
+        upload_id: Uuid,
+        offset: u64,
+        reader: UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async move { self.write_chunk(upload_id, offset, reader).await })
+    }
+
+    fn truncate_staging<'a>(&'a self, upload_id: Uuid, len: u64) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.truncate_staging(upload_id, len).await })
+    }
+
+    fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move { self.staging_len(upload_id).await })
+    }
 }
+
+type UploadLock = tokio::sync::Mutex<()>;
+type UploadLockRegistry = StdMutex<HashMap<Uuid, Weak<UploadLock>>>;
 
 #[derive(Clone)]
 pub struct UploadService {
     repository: Arc<dyn UploadRepository>,
     storage: Arc<dyn UploadStorage>,
+    upload_locks: Arc<UploadLockRegistry>,
 }
 
 impl UploadService {
@@ -123,7 +214,22 @@ impl UploadService {
         Self {
             repository,
             storage,
+            upload_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    fn lock_for(&self, upload_id: Uuid) -> Arc<UploadLock> {
+        let mut locks = self
+            .upload_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&upload_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(UploadLock::new(()));
+        locks.insert(upload_id, Arc::downgrade(&lock));
+        lock
     }
 
     async fn create(
@@ -238,6 +344,321 @@ impl UploadService {
             }
         }
     }
+
+    async fn write_chunk(
+        &self,
+        upload_id: Uuid,
+        requested_offset: u64,
+        declared_len: u64,
+        reader: UploadBodyReader,
+        request_id: &RequestId,
+    ) -> Result<u64, ChunkError> {
+        let lock = self.lock_for(upload_id);
+        let _guard = lock.lock().await;
+        let upload = self
+            .repository
+            .get_upload(upload_id)
+            .await
+            .map_err(|_| ChunkError::Unavailable { offset: None })?
+            .ok_or(ChunkError::NotFound)?;
+        let committed = upload.committed_offset();
+        if declared_len > MAX_CHUNK_SIZE {
+            return Err(ChunkError::PayloadTooLarge { offset: committed });
+        }
+        if upload.state() != UploadState::Active {
+            return Err(ChunkError::Inactive { offset: committed });
+        }
+        if requested_offset < committed {
+            return if retry_fully_committed(requested_offset, declared_len, committed) {
+                Ok(committed)
+            } else {
+                Err(ChunkError::OffsetConflict { offset: committed })
+            };
+        }
+        if requested_offset > committed {
+            return Err(ChunkError::OffsetConflict { offset: committed });
+        }
+        let next = committed
+            .checked_add(declared_len)
+            .filter(|next| *next <= upload.total_size())
+            .ok_or(ChunkError::TooLargeForUpload { offset: committed })?;
+        let written = match self
+            .storage
+            .write_staging_chunk(upload_id, committed, reader)
+            .await
+        {
+            Ok(written) => written,
+            Err(error) => {
+                return Err(self
+                    .rollback_after_chunk_error(upload_id, committed, &error, request_id)
+                    .await);
+            }
+        };
+        if written != declared_len {
+            return Err(self
+                .rollback_after_length_error(upload_id, committed, request_id)
+                .await);
+        }
+        let advance = self
+            .repository
+            .advance_upload_offset(upload_id, committed, next)
+            .await;
+        if matches!(advance, Ok(true)) {
+            return Ok(next);
+        }
+        self.reconcile_conditional_advance(upload_id, committed, next, request_id)
+            .await
+    }
+
+    async fn reconcile_conditional_advance(
+        &self,
+        upload_id: Uuid,
+        previous: u64,
+        next: u64,
+        request_id: &RequestId,
+    ) -> Result<u64, ChunkError> {
+        let authoritative = match self.repository.get_upload(upload_id).await {
+            Ok(Some(upload)) => upload,
+            Ok(None) | Err(_) => {
+                return Err(ChunkError::Unavailable { offset: None });
+            }
+        };
+        let offset = authoritative.committed_offset();
+        let staging_len = match self.storage.staging_len(upload_id).await {
+            Ok(Some(len)) => len,
+            _ => {
+                self.mark_failed_after_recovery_error(
+                    upload_id,
+                    "staging inspection failed",
+                    request_id,
+                )
+                .await;
+                return Err(ChunkError::Unavailable {
+                    offset: Some(offset),
+                });
+            }
+        };
+        if offset == next && staging_len == next {
+            return Ok(next);
+        }
+        if staging_len < offset {
+            self.mark_failed_after_recovery_error(upload_id, "staging offset mismatch", request_id)
+                .await;
+            return Err(ChunkError::Unavailable {
+                offset: Some(offset),
+            });
+        }
+        if self
+            .storage
+            .truncate_staging(upload_id, offset)
+            .await
+            .is_err()
+        {
+            self.mark_failed_after_recovery_error(upload_id, "chunk rollback failed", request_id)
+                .await;
+            return Err(ChunkError::Unavailable {
+                offset: Some(offset),
+            });
+        }
+        if offset == previous {
+            Err(ChunkError::Unavailable {
+                offset: Some(offset),
+            })
+        } else {
+            Err(ChunkError::OffsetConflict { offset })
+        }
+    }
+
+    async fn write_chunk_owned(
+        &self,
+        upload_id: Uuid,
+        requested_offset: u64,
+        declared_len: u64,
+        reader: UploadBodyReader,
+        request_id: RequestId,
+    ) -> Result<u64, ChunkError> {
+        let supervisor_service = self.clone();
+        let supervisor_request_id = request_id.clone();
+        let supervisor = tokio::spawn(async move {
+            let operation_service = supervisor_service.clone();
+            let operation_request_id = supervisor_request_id.clone();
+            let operation = tokio::spawn(async move {
+                operation_service
+                    .write_chunk(
+                        upload_id,
+                        requested_offset,
+                        declared_len,
+                        reader,
+                        &operation_request_id,
+                    )
+                    .await
+            });
+            match operation.await {
+                Ok(result) => result,
+                Err(_) => {
+                    supervisor_service
+                        .reconcile_chunk_task_failure(upload_id, &supervisor_request_id)
+                        .await
+                }
+            }
+        });
+        match supervisor.await {
+            Ok(result) => result,
+            Err(_) => Err(ChunkError::Unavailable { offset: None }),
+        }
+    }
+
+    async fn reconcile_chunk_task_failure(
+        &self,
+        upload_id: Uuid,
+        request_id: &RequestId,
+    ) -> Result<u64, ChunkError> {
+        let lock = self.lock_for(upload_id);
+        let _guard = lock.lock().await;
+        let upload = self
+            .repository
+            .get_upload(upload_id)
+            .await
+            .map_err(|_| ChunkError::Unavailable { offset: None })?
+            .ok_or(ChunkError::NotFound)?;
+        let committed = upload.committed_offset();
+        if self
+            .storage
+            .truncate_staging(upload_id, committed)
+            .await
+            .is_err()
+        {
+            self.mark_failed_after_recovery_error(upload_id, "chunk rollback failed", request_id)
+                .await;
+        }
+        Err(ChunkError::Unavailable {
+            offset: Some(committed),
+        })
+    }
+
+    async fn rollback_after_chunk_error(
+        &self,
+        upload_id: Uuid,
+        committed: u64,
+        error: &StorageError,
+        request_id: &RequestId,
+    ) -> ChunkError {
+        let kind = match error {
+            StorageError::InvalidBody => ChunkRollbackKind::InvalidBody,
+            StorageError::InsufficientSpace => ChunkRollbackKind::InsufficientStorage,
+            _ => ChunkRollbackKind::Unavailable,
+        };
+        self.rollback_result(upload_id, committed, kind, request_id)
+            .await
+    }
+
+    async fn rollback_after_length_error(
+        &self,
+        upload_id: Uuid,
+        committed: u64,
+        request_id: &RequestId,
+    ) -> ChunkError {
+        self.rollback_result(
+            upload_id,
+            committed,
+            ChunkRollbackKind::InvalidBody,
+            request_id,
+        )
+        .await
+    }
+
+    async fn rollback_result(
+        &self,
+        upload_id: Uuid,
+        committed: u64,
+        kind: ChunkRollbackKind,
+        request_id: &RequestId,
+    ) -> ChunkError {
+        if self
+            .storage
+            .truncate_staging(upload_id, committed)
+            .await
+            .is_err()
+        {
+            self.mark_failed_after_recovery_error(upload_id, "chunk rollback failed", request_id)
+                .await;
+            return ChunkError::Unavailable {
+                offset: Some(committed),
+            };
+        }
+        match kind {
+            ChunkRollbackKind::InvalidBody => ChunkError::InvalidLength { offset: committed },
+            ChunkRollbackKind::InsufficientStorage => {
+                ChunkError::InsufficientStorage { offset: committed }
+            }
+            ChunkRollbackKind::Unavailable => ChunkError::Unavailable {
+                offset: Some(committed),
+            },
+        }
+    }
+
+    async fn mark_failed_after_recovery_error(
+        &self,
+        upload_id: Uuid,
+        reason: &'static str,
+        request_id: &RequestId,
+    ) {
+        if self
+            .repository
+            .mark_upload_failed(upload_id, reason)
+            .await
+            .is_err()
+        {
+            record_chunk_failure(ChunkFailureReason::FailureMarkFailed, request_id, upload_id);
+        }
+    }
+}
+
+fn retry_fully_committed(requested_offset: u64, declared_len: u64, committed: u64) -> bool {
+    requested_offset
+        .checked_add(declared_len)
+        .is_some_and(|end| end <= committed)
+}
+
+#[derive(Clone, Copy)]
+enum ChunkRollbackKind {
+    InvalidBody,
+    InsufficientStorage,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkFailureReason {
+    FailureMarkFailed,
+}
+
+impl ChunkFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FailureMarkFailed => "failure_mark_failed",
+        }
+    }
+}
+
+fn record_chunk_failure(reason: ChunkFailureReason, request_id: &RequestId, upload_id: Uuid) {
+    tracing::warn!(
+        reason = reason.as_str(),
+        request_id = %request_id,
+        upload_id = %upload_id,
+        "upload chunk recovery failed"
+    );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChunkError {
+    NotFound,
+    PayloadTooLarge { offset: u64 },
+    Inactive { offset: u64 },
+    OffsetConflict { offset: u64 },
+    TooLargeForUpload { offset: u64 },
+    InvalidLength { offset: u64 },
+    InsufficientStorage { offset: u64 },
+    Unavailable { offset: Option<u64> },
 }
 
 async fn run_reconciliation_task(
@@ -432,6 +853,7 @@ fn storage_failure_reason(error: &StorageError) -> UploadFailureReason {
         StorageError::InvalidRoot(_)
         | StorageError::UnsafeManagedEntry
         | StorageError::UnsafeEntry
+        | StorageError::InvalidBody
         | StorageError::NonEmptyStaging => UploadFailureReason::UnsafeStorage,
         StorageError::NotFound
         | StorageError::OffsetMismatch { .. }
@@ -497,6 +919,7 @@ pub fn upload_router(service: UploadService) -> Router {
     Router::new()
         .route("/api/v1/projects/{project_id}/uploads", post(create_upload))
         .route("/api/v1/uploads/{upload_id}", get(upload_status))
+        .route("/api/v1/uploads/{upload_id}/chunk", put(upload_chunk))
         .with_state(service)
 }
 
@@ -535,6 +958,140 @@ async fn upload_status(
         .await
         .map(|upload| Json(upload.into()))
         .map_err(|error| map_service_error(error, request_id))
+}
+
+const MAX_CHUNK_SIZE: u64 = 32 * 1024 * 1024;
+
+async fn upload_chunk(
+    State(service): State<UploadService>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(_owner): Extension<OwnerIdentity>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(upload_id) = parse_canonical_uuid(&upload_id) else {
+        return invalid_request(request_id).into_response();
+    };
+    let Some(requested_offset) = parse_single_decimal_header(&headers, "upload-offset") else {
+        return invalid_request(request_id).into_response();
+    };
+    let Some(declared_len) = parse_single_decimal_header(&headers, header::CONTENT_LENGTH) else {
+        return invalid_request(request_id).into_response();
+    };
+    if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
+        || headers.get(header::CONTENT_TYPE)
+            != Some(&HeaderValue::from_static("application/octet-stream"))
+    {
+        return invalid_request(request_id).into_response();
+    }
+    let stream = body
+        .into_data_stream()
+        .map_err(|error| io::Error::other(error.to_string()));
+    let reader: UploadBodyReader = Box::pin(StreamReader::new(stream).take(declared_len + 1));
+    match service
+        .write_chunk_owned(
+            upload_id,
+            requested_offset,
+            declared_len,
+            reader,
+            request_id.clone(),
+        )
+        .await
+    {
+        Ok(offset) => response_with_upload_offset(StatusCode::NO_CONTENT.into_response(), offset),
+        Err(error) => map_chunk_error(error, request_id),
+    }
+}
+
+fn parse_single_decimal_header(
+    headers: &HeaderMap,
+    name: impl axum::http::header::AsHeaderName,
+) -> Option<u64> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?;
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    let value = value.parse::<u64>().ok()?;
+    (value <= i64::MAX as u64).then_some(value)
+}
+
+fn map_chunk_error(error: ChunkError, request_id: RequestId) -> Response {
+    let offset = match error {
+        ChunkError::NotFound => {
+            return AppError::not_found(
+                request_id,
+                "upload_not_found",
+                "The upload was not found.",
+            )
+            .into_response();
+        }
+        ChunkError::PayloadTooLarge { offset } => offset,
+        ChunkError::Inactive { offset } => offset,
+        ChunkError::OffsetConflict { offset } => offset,
+        ChunkError::TooLargeForUpload { offset } => offset,
+        ChunkError::InvalidLength { offset } => offset,
+        ChunkError::InsufficientStorage { offset } => offset,
+        ChunkError::Unavailable { offset: None } => {
+            return AppError::service_unavailable(
+                request_id,
+                "upload_chunk_failed",
+                "The upload chunk could not be stored safely.",
+            )
+            .into_response();
+        }
+        ChunkError::Unavailable {
+            offset: Some(offset),
+        } => offset,
+    };
+    let response = match error {
+        ChunkError::PayloadTooLarge { .. } => AppError::payload_too_large(request_id),
+        ChunkError::Inactive { .. } => AppError::conflict(
+            request_id,
+            "upload_not_active",
+            "The upload is not active.",
+            None,
+        ),
+        ChunkError::OffsetConflict { .. } => AppError::conflict(
+            request_id,
+            "upload_offset_conflict",
+            "The upload offset does not match the committed offset.",
+            Some(crate::error::SafeErrorDetails::expected_offset(offset)),
+        ),
+        ChunkError::TooLargeForUpload { .. } => AppError::conflict(
+            request_id,
+            "upload_size_exceeded",
+            "The chunk would exceed the upload size.",
+            None,
+        ),
+        ChunkError::InvalidLength { .. } => invalid_request(request_id),
+        ChunkError::InsufficientStorage { .. } => AppError::insufficient_storage(request_id),
+        ChunkError::Unavailable { .. } => AppError::service_unavailable(
+            request_id,
+            "upload_chunk_failed",
+            "The upload chunk could not be stored safely.",
+        ),
+        ChunkError::NotFound => unreachable!("handled above"),
+    }
+    .into_response();
+    response_with_upload_offset(response, offset)
+}
+
+fn response_with_upload_offset(mut response: Response, offset: u64) -> Response {
+    response.headers_mut().insert(
+        "upload-offset",
+        HeaderValue::from_str(&offset.to_string())
+            .expect("a nonnegative integer is a valid header value"),
+    );
+    response
 }
 
 fn map_service_error(error: UploadServiceError, request_id: RequestId) -> AppError {
@@ -584,10 +1141,21 @@ fn parse_canonical_uuid(value: &str) -> Option<Uuid> {
 
 #[cfg(test)]
 mod tests {
-    use super::UploadFailureReason;
+    use super::{ChunkFailureReason, UploadFailureReason, retry_fully_committed};
+
+    #[test]
+    fn committed_retry_span_checks_boundary_and_overflow() {
+        assert!(retry_fully_committed(1, 3, 4));
+        assert!(!retry_fully_committed(1, 4, 4));
+        assert!(!retry_fully_committed(u64::MAX - 1, 2, u64::MAX));
+    }
 
     #[test]
     fn failure_reasons_are_closed_safe_literals() {
+        assert_eq!(
+            ChunkFailureReason::FailureMarkFailed.as_str(),
+            "failure_mark_failed"
+        );
         assert_eq!(
             [
                 UploadFailureReason::ProjectLookupFailed,

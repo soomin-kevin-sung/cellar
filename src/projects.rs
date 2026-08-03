@@ -206,6 +206,7 @@ fn storage_failure_reason(error: &StorageError) -> ProjectFailureReason {
         StorageError::ProjectCleanupFailed { .. } => ProjectFailureReason::DirectoryCleanupFailed,
         StorageError::NotFound
         | StorageError::NonEmptyStaging
+        | StorageError::InvalidBody
         | StorageError::OffsetMismatch { .. }
         | StorageError::AmbiguousCleanup { .. }
         | StorageError::Io { .. } => ProjectFailureReason::StorageUnavailable,

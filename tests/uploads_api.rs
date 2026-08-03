@@ -18,7 +18,7 @@ use cellar::{
     },
 };
 use serde_json::json;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Barrier, Semaphore, oneshot};
 use tower::ServiceExt;
 use uuid::{Uuid, Version};
 
@@ -47,6 +47,1270 @@ fn uploads(project_id: Uuid) -> String {
 
 fn upload(upload_id: Uuid) -> String {
     format!("/api/v1/uploads/{upload_id}")
+}
+
+fn upload_chunk(upload_id: Uuid) -> String {
+    format!("/api/v1/uploads/{upload_id}/chunk")
+}
+
+async fn create_upload_session(context: &TestContext, project_id: Uuid, total_size: u64) -> Uuid {
+    let response = context
+        .app()
+        .oneshot(json_request(
+            authenticated_write_request(&uploads(project_id)),
+            &format!(r#"{{"fileName":"chunk.bin","totalSize":"{total_size}"}}"#),
+        ))
+        .await
+        .unwrap();
+    let (status, _, body) = json_response(response).await;
+    assert_eq!(status, 201);
+    Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+fn chunk_request(
+    upload_id: Uuid,
+    offset: &str,
+    declared_len: u64,
+    body: Body,
+) -> http::Request<Body> {
+    authenticated_request("PUT", &upload_chunk(upload_id))
+        .header("origin", common::EXTERNAL_ORIGIN)
+        .header("content-type", "application/octet-stream")
+        .header("upload-offset", offset)
+        .header("content-length", declared_len)
+        .body(body)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn upload_chunk_at_exact_offset_streams_and_advances_durable_offset() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 10).await;
+
+    let response = context
+        .app()
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 204);
+    assert_eq!(response.headers()["upload-offset"], "4");
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .committed_offset(),
+        4
+    );
+    assert_eq!(
+        std::fs::read(
+            context
+                .temp
+                .path()
+                .join(".cellar")
+                .join("uploads")
+                .join(format!("{upload_id}.part"))
+        )
+        .unwrap(),
+        b"data"
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_accepts_exact_maximum_and_classifies_larger_after_session_lookup() {
+    const MAX: usize = 32 * 1024 * 1024;
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, MAX as u64).await;
+    let response = context
+        .app()
+        .oneshot(chunk_request(
+            upload_id,
+            "0",
+            MAX as u64,
+            Body::from(vec![0x5a; MAX]),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(response.headers()["upload-offset"], MAX.to_string());
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(MAX as u64)
+    );
+
+    let oversized_upload = create_upload_session(&context, project_id, MAX as u64 + 1).await;
+    let oversized = context
+        .app()
+        .oneshot(chunk_request(
+            oversized_upload,
+            "0",
+            MAX as u64 + 1,
+            Body::from_stream(futures_util::stream::once(async {
+                Err::<bytes::Bytes, _>(io::Error::other("oversized body must not be read"))
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), 413);
+    assert_eq!(oversized.headers()["upload-offset"], "0");
+    let (_, _, body) = json_response(oversized).await;
+    assert_eq!(body["error"]["code"], "payload_too_large");
+    assert_eq!(
+        context.storage.staging_len(oversized_upload).await.unwrap(),
+        Some(0)
+    );
+
+    let missing = context
+        .app()
+        .oneshot(chunk_request(
+            Uuid::now_v7(),
+            "0",
+            MAX as u64 + 1,
+            Body::from_stream(futures_util::stream::once(async {
+                Err::<bytes::Bytes, _>(io::Error::other("unknown body must not be read"))
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_earlier_retry_must_not_cross_committed_offset() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 8).await;
+    assert_eq!(
+        context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+
+    let boundary = context
+        .app()
+        .oneshot(chunk_request(upload_id, "1", 3, Body::from("old")))
+        .await
+        .unwrap();
+    assert_eq!(boundary.status(), 204);
+    assert_eq!(boundary.headers()["upload-offset"], "4");
+
+    let crossing = context
+        .app()
+        .oneshot(chunk_request(
+            upload_id,
+            "1",
+            4,
+            Body::from_stream(futures_util::stream::once(async {
+                Err::<bytes::Bytes, _>(io::Error::other("crossing retry body must not be read"))
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(crossing.status(), 409);
+    assert_eq!(crossing.headers()["upload-offset"], "4");
+    let (_, _, body) = json_response(crossing).await;
+    assert_eq!(body["error"]["details"]["expectedOffset"], "4");
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(4)
+    );
+
+    let huge_id = create_upload_session(&context, project_id, i64::MAX as u64).await;
+    assert!(
+        context
+            .database
+            .advance_offset(huge_id, 0, i64::MAX as u64)
+            .await
+            .unwrap()
+    );
+    let last_offset = i64::MAX as u64 - 1;
+    let upper_boundary = context
+        .app()
+        .oneshot(chunk_request(
+            huge_id,
+            &last_offset.to_string(),
+            1,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upper_boundary.status(), 204);
+    assert_eq!(
+        upper_boundary.headers()["upload-offset"],
+        i64::MAX.to_string()
+    );
+    let upper_crossing = context
+        .app()
+        .oneshot(chunk_request(
+            huge_id,
+            &last_offset.to_string(),
+            2,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(upper_crossing.status(), 409);
+    assert_eq!(
+        upper_crossing.headers()["upload-offset"],
+        i64::MAX.to_string()
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_short_or_long_body_rolls_back_without_advancing() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 20).await;
+
+    for (declared, body) in [(5, "four"), (3, "four")] {
+        let response = context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", declared, Body::from(body)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.headers()["upload-offset"], "0");
+        assert_eq!(
+            context.storage.staging_len(upload_id).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .committed_offset(),
+            0
+        );
+    }
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_offset_retry_and_conflicts_are_authoritative_without_writes() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 12).await;
+    let first = context
+        .app()
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 204);
+
+    let retry = context
+        .app()
+        .oneshot(chunk_request(
+            upload_id,
+            "0",
+            4,
+            Body::from_stream(futures_util::stream::once(async {
+                Err::<bytes::Bytes, _>(io::Error::other("retry body must not be read"))
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), 204);
+    assert_eq!(retry.headers()["upload-offset"], "4");
+
+    let future = context
+        .app()
+        .oneshot(chunk_request(upload_id, "6", 2, Body::from("xx")))
+        .await
+        .unwrap();
+    assert_eq!(future.status(), 409);
+    assert_eq!(future.headers()["upload-offset"], "4");
+    let (_, _, body) = json_response(future).await;
+    assert_eq!(body["error"]["code"], "upload_offset_conflict");
+    assert_eq!(body["error"]["details"]["expectedOffset"], "4");
+
+    let exceeds_total = context
+        .app()
+        .oneshot(chunk_request(upload_id, "4", 9, Body::from("123456789")))
+        .await
+        .unwrap();
+    assert_eq!(exceeds_total.status(), 409);
+    assert_eq!(exceeds_total.headers()["upload-offset"], "4");
+    assert_eq!(
+        std::fs::read(
+            context
+                .temp
+                .path()
+                .join(".cellar/uploads")
+                .join(format!("{upload_id}.part"))
+        )
+        .unwrap(),
+        b"data"
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_rejects_inactive_and_unknown_sessions() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let failed_id = create_upload_session(&context, project_id, 4).await;
+    context
+        .database
+        .mark_failed(failed_id, "test inactive")
+        .await
+        .unwrap();
+    let finalizing_id = create_upload_session(&context, project_id, 0).await;
+    assert!(
+        context
+            .database
+            .mark_finalizing(finalizing_id, 0)
+            .await
+            .unwrap()
+    );
+    let complete_id = create_upload_session(&context, project_id, 0).await;
+    assert!(
+        context
+            .database
+            .mark_finalizing(complete_id, 0)
+            .await
+            .unwrap()
+    );
+    context.database.mark_complete(complete_id).await.unwrap();
+
+    for upload_id in [failed_id, finalizing_id, complete_id] {
+        let inactive = context
+            .app()
+            .oneshot(chunk_request(upload_id, "0", 0, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(inactive.status(), 409);
+        assert_eq!(inactive.headers()["upload-offset"], "0");
+    }
+
+    let unknown = context
+        .app()
+        .oneshot(chunk_request(Uuid::now_v7(), "0", 1, Body::from("x")))
+        .await
+        .unwrap();
+    let (status, _, body) = json_response(unknown).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["error"]["code"], "upload_not_found");
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_requires_canonical_path_and_exact_single_headers() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 20).await;
+
+    let invalid_requests = [
+        authenticated_request("PUT", &upload_chunk(upload_id))
+            .header("origin", common::EXTERNAL_ORIGIN)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", "1")
+            .body(Body::from("x"))
+            .unwrap(),
+        authenticated_request("PUT", &upload_chunk(upload_id))
+            .header("origin", common::EXTERNAL_ORIGIN)
+            .header("upload-offset", "0")
+            .header("content-length", "1")
+            .body(Body::from("x"))
+            .unwrap(),
+        authenticated_request("PUT", &upload_chunk(upload_id))
+            .header("origin", common::EXTERNAL_ORIGIN)
+            .header("content-type", "application/octet-stream")
+            .header("upload-offset", "0")
+            .body(Body::from("x"))
+            .unwrap(),
+        authenticated_request("PUT", &upload_chunk(upload_id))
+            .header("origin", common::EXTERNAL_ORIGIN)
+            .header("content-type", "application/octet-stream; charset=binary")
+            .header("upload-offset", "0")
+            .header("content-length", "1")
+            .body(Body::from("x"))
+            .unwrap(),
+        chunk_request(upload_id, "00", 1, Body::from("x")),
+        chunk_request(upload_id, "+0", 1, Body::from("x")),
+        chunk_request(upload_id, "9223372036854775808", 1, Body::from("x")),
+        authenticated_request(
+            "PUT",
+            &format!(
+                "/api/v1/uploads/{}/chunk",
+                upload_id.to_string().to_uppercase()
+            ),
+        )
+        .header("origin", common::EXTERNAL_ORIGIN)
+        .header("content-type", "application/octet-stream")
+        .header("upload-offset", "0")
+        .header("content-length", "1")
+        .body(Body::from("x"))
+        .unwrap(),
+    ];
+    for request in invalid_requests {
+        let response = context.app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 400);
+    }
+
+    let mut duplicate = chunk_request(upload_id, "0", 1, Body::from("x"));
+    duplicate
+        .headers_mut()
+        .append("upload-offset", "0".parse().unwrap());
+    assert_eq!(
+        context.app().oneshot(duplicate).await.unwrap().status(),
+        400
+    );
+    let mut duplicate_type = chunk_request(upload_id, "0", 1, Body::from("x"));
+    duplicate_type
+        .headers_mut()
+        .append("content-type", "application/octet-stream".parse().unwrap());
+    assert_eq!(
+        context
+            .app()
+            .oneshot(duplicate_type)
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+
+    let mut duplicate_length = chunk_request(upload_id, "0", 1, Body::from("x"));
+    duplicate_length
+        .headers_mut()
+        .append("content-length", "1".parse().unwrap());
+    assert_eq!(
+        context
+            .app()
+            .oneshot(duplicate_length)
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0)
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_route_remains_behind_authentication_and_exact_origin() {
+    let context = TestContext::new().await;
+    let upload_id = Uuid::now_v7();
+    let unauthenticated = http::Request::builder()
+        .method("PUT")
+        .uri(upload_chunk(upload_id))
+        .header("origin", common::EXTERNAL_ORIGIN)
+        .header("content-type", "application/octet-stream")
+        .header("upload-offset", "0")
+        .header("content-length", "0")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        context
+            .app()
+            .oneshot(unauthenticated)
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let wrong_origin = authenticated_request("PUT", &upload_chunk(upload_id))
+        .header("origin", "https://evil.example")
+        .header("content-type", "application/octet-stream")
+        .header("upload-offset", "0")
+        .header("content-length", "0")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        context.app().oneshot(wrong_origin).await.unwrap().status(),
+        403
+    );
+    context.close().await;
+}
+
+#[derive(Clone, Copy)]
+enum ChunkStorageFault {
+    FailAfterWrite,
+    InsufficientSpace,
+}
+
+struct FaultyChunkStorage {
+    storage: Arc<Storage>,
+    fault: ChunkStorageFault,
+    fail_rollback: bool,
+}
+
+impl UploadStorage for FaultyChunkStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn write_staging_chunk<'a>(
+        &'a self,
+        upload_id: Uuid,
+        offset: u64,
+        reader: cellar::uploads::UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async move {
+            match self.fault {
+                ChunkStorageFault::FailAfterWrite => {
+                    self.storage.write_chunk(upload_id, offset, reader).await?;
+                    Err(StorageError::Io {
+                        source: io::Error::other("private simulated sync failure"),
+                    })
+                }
+                ChunkStorageFault::InsufficientSpace => Err(StorageError::InsufficientSpace),
+            }
+        })
+    }
+
+    fn truncate_staging<'a>(&'a self, upload_id: Uuid, len: u64) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move {
+            if self.fail_rollback {
+                Err(StorageError::Io {
+                    source: io::Error::other("private simulated rollback failure"),
+                })
+            } else {
+                self.storage.truncate_staging(upload_id, len).await
+            }
+        })
+    }
+}
+
+struct AdvanceFailingRepository {
+    database: Database,
+}
+
+struct AdvanceAndRereadFailingRepository {
+    database: Database,
+    get_calls: AtomicUsize,
+    commit_before_error: bool,
+}
+
+impl UploadRepository for AdvanceAndRereadFailingRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        let call = self.get_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if call == 0 {
+                self.database.get_upload(upload_id).await
+            } else {
+                Err(DbError::CorruptData)
+            }
+        })
+    }
+
+    fn advance_upload_offset<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+        next: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move {
+            if self.commit_before_error {
+                assert!(
+                    self.database
+                        .advance_offset(upload_id, expected, next)
+                        .await?
+                );
+            }
+            Err(DbError::CorruptData)
+        })
+    }
+
+    fn mark_upload_failed<'a>(
+        &'a self,
+        upload_id: Uuid,
+        reason: &'a str,
+    ) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async move { self.database.mark_failed(upload_id, reason).await })
+    }
+}
+
+struct RecordingRollbackStorage {
+    storage: Arc<Storage>,
+    rollback_calls: Arc<AtomicUsize>,
+}
+
+impl UploadStorage for RecordingRollbackStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn write_staging_chunk<'a>(
+        &'a self,
+        upload_id: Uuid,
+        offset: u64,
+        reader: cellar::uploads::UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async move { self.storage.write_chunk(upload_id, offset, reader).await })
+    }
+
+    fn truncate_staging<'a>(&'a self, upload_id: Uuid, len: u64) -> UploadStorageFuture<'a, ()> {
+        self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { self.storage.truncate_staging(upload_id, len).await })
+    }
+
+    fn staging_len<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, Option<u64>> {
+        Box::pin(async move { self.storage.staging_len(upload_id).await })
+    }
+}
+
+#[tokio::test]
+async fn upload_chunk_advance_and_reread_failure_preserves_synced_ambiguous_bytes() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 10).await;
+    let rollback_calls = Arc::new(AtomicUsize::new(0));
+    let service = UploadService::new(
+        Arc::new(AdvanceAndRereadFailingRepository {
+            database: context.database.clone(),
+            get_calls: AtomicUsize::new(0),
+            commit_before_error: false,
+        }),
+        Arc::new(RecordingRollbackStorage {
+            storage: context.storage.clone(),
+            rollback_calls: rollback_calls.clone(),
+        }),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.headers().get("upload-offset").is_none());
+    assert_eq!(rollback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(4)
+    );
+    let row = context
+        .database
+        .get_upload(upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.committed_offset(), 0);
+    assert_eq!(row.state(), cellar::db::UploadState::Active);
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_committed_advance_error_and_reread_failure_preserves_synced_commit() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 10).await;
+    let rollback_calls = Arc::new(AtomicUsize::new(0));
+    let service = UploadService::new(
+        Arc::new(AdvanceAndRereadFailingRepository {
+            database: context.database.clone(),
+            get_calls: AtomicUsize::new(0),
+            commit_before_error: true,
+        }),
+        Arc::new(RecordingRollbackStorage {
+            storage: context.storage.clone(),
+            rollback_calls: rollback_calls.clone(),
+        }),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(response.headers().get("upload-offset").is_none());
+    assert_eq!(rollback_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        std::fs::read(
+            context
+                .temp
+                .path()
+                .join(".cellar/uploads")
+                .join(format!("{upload_id}.part"))
+        )
+        .unwrap(),
+        b"data"
+    );
+    let row = context
+        .database
+        .get_upload(upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.committed_offset(), 4);
+    assert_eq!(row.state(), cellar::db::UploadState::Active);
+    context.close().await;
+}
+
+struct AmbiguousAdvanceRepository {
+    database: Database,
+}
+
+impl UploadRepository for AmbiguousAdvanceRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        Box::pin(async move { self.database.get_upload(upload_id).await })
+    }
+
+    fn advance_upload_offset<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+        next: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move {
+            assert!(
+                self.database
+                    .advance_offset(upload_id, expected, next)
+                    .await?
+            );
+            Ok(false)
+        })
+    }
+
+    fn mark_upload_failed<'a>(
+        &'a self,
+        upload_id: Uuid,
+        reason: &'a str,
+    ) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async move { self.database.mark_failed(upload_id, reason).await })
+    }
+}
+
+#[tokio::test]
+async fn upload_chunk_ambiguous_conditional_advance_recovers_authoritative_commit() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    let service = UploadService::new(
+        Arc::new(AmbiguousAdvanceRepository {
+            database: context.database.clone(),
+        }),
+        context.storage.clone(),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(response.headers()["upload-offset"], "4");
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .committed_offset(),
+        4
+    );
+    context.close().await;
+}
+
+impl UploadRepository for AdvanceFailingRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        Box::pin(async move { self.database.get_upload(upload_id).await })
+    }
+
+    fn advance_upload_offset<'a>(
+        &'a self,
+        _: Uuid,
+        _: u64,
+        _: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async { Err(DbError::CorruptData) })
+    }
+
+    fn mark_upload_failed<'a>(
+        &'a self,
+        upload_id: Uuid,
+        reason: &'a str,
+    ) -> UploadRepositoryFuture<'a, ()> {
+        Box::pin(async move { self.database.mark_failed(upload_id, reason).await })
+    }
+}
+
+#[tokio::test]
+async fn upload_chunk_storage_stream_and_database_failures_never_advance_and_roll_back() {
+    for fault in [
+        ChunkStorageFault::FailAfterWrite,
+        ChunkStorageFault::InsufficientSpace,
+    ] {
+        let context = TestContext::new().await;
+        let project_id = create_project(&context).await;
+        let upload_id = create_upload_session(&context, project_id, 10).await;
+        let service = UploadService::new(
+            Arc::new(context.database.clone()),
+            Arc::new(FaultyChunkStorage {
+                storage: context.storage.clone(),
+                fault,
+                fail_rollback: false,
+            }),
+        );
+        let response = context
+            .secure_upload(service)
+            .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if matches!(fault, ChunkStorageFault::InsufficientSpace) {
+                507
+            } else {
+                503
+            }
+        );
+        assert_eq!(
+            context.storage.staging_len(upload_id).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .committed_offset(),
+            0
+        );
+        context.close().await;
+    }
+
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 10).await;
+    let service = UploadService::new(
+        Arc::new(AdvanceFailingRepository {
+            database: context.database.clone(),
+        }),
+        context.storage.clone(),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["upload-offset"], "0");
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .committed_offset(),
+        0
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_stream_error_rolls_back_exactly() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 10).await;
+    let stream = futures_util::stream::iter([
+        Ok::<_, io::Error>(bytes::Bytes::from_static(b"ab")),
+        Err(io::Error::other("private body failure")),
+    ]);
+    let response = context
+        .app()
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from_stream(stream)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(response.headers()["upload-offset"], "0");
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .committed_offset(),
+        0
+    );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn upload_chunk_rollback_failure_marks_session_failed() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 10).await;
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        Arc::new(FaultyChunkStorage {
+            storage: context.storage.clone(),
+            fault: ChunkStorageFault::FailAfterWrite,
+            fail_rollback: true,
+        }),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("data")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["upload-offset"], "0");
+    let row = context
+        .database
+        .get_upload(upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.committed_offset(), 0);
+    assert_eq!(row.state(), cellar::db::UploadState::Failed);
+    assert_eq!(row.failure_reason(), Some("chunk rollback failed"));
+    context.close().await;
+}
+
+struct MarkFailedFailingRepository {
+    database: Database,
+    mark_calls: Arc<AtomicUsize>,
+}
+
+impl UploadRepository for MarkFailedFailingRepository {
+    fn get_project<'a>(
+        &'a self,
+        project_id: Uuid,
+    ) -> UploadRepositoryFuture<'a, Option<ProjectRow>> {
+        Box::pin(async move { self.database.get_project(project_id).await })
+    }
+
+    fn create_upload<'a>(&'a self, upload: NewUpload) -> UploadRepositoryFuture<'a, UploadRow> {
+        Box::pin(async move { self.database.create_upload(upload).await })
+    }
+
+    fn get_upload<'a>(&'a self, upload_id: Uuid) -> UploadRepositoryFuture<'a, Option<UploadRow>> {
+        Box::pin(async move { self.database.get_upload(upload_id).await })
+    }
+
+    fn advance_upload_offset<'a>(
+        &'a self,
+        upload_id: Uuid,
+        expected: u64,
+        next: u64,
+    ) -> UploadRepositoryFuture<'a, bool> {
+        Box::pin(async move {
+            self.database
+                .advance_offset(upload_id, expected, next)
+                .await
+        })
+    }
+
+    fn mark_upload_failed<'a>(&'a self, _: Uuid, _: &'a str) -> UploadRepositoryFuture<'a, ()> {
+        self.mark_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(DbError::CorruptData) })
+    }
+}
+
+#[tokio::test]
+async fn upload_chunk_failed_state_transition_error_is_observed_and_logged_closed_safe() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 20).await;
+    let logs = captured_logs();
+    let mark_calls = Arc::new(AtomicUsize::new(0));
+    let service = UploadService::new(
+        Arc::new(MarkFailedFailingRepository {
+            database: context.database.clone(),
+            mark_calls: mark_calls.clone(),
+        }),
+        Arc::new(FaultyChunkStorage {
+            storage: context.storage.clone(),
+            fault: ChunkStorageFault::FailAfterWrite,
+            fail_rollback: true,
+        }),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(chunk_request(
+            upload_id,
+            "0",
+            16,
+            Body::from("SECRET_BODY_7391"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["upload-offset"], "0");
+    let (status, request_id, body) = json_response(response).await;
+    assert_eq!(status, 503);
+    assert_eq!(mark_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(body["error"]["code"], "upload_chunk_failed");
+    let row = context
+        .database
+        .get_upload(upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.committed_offset(), 0);
+    assert_eq!(row.state(), cellar::db::UploadState::Active);
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.lines().any(|line| {
+        line.contains("failure_mark_failed")
+            && line.contains(&request_id)
+            && line.contains(&upload_id.to_string())
+    }));
+    for secret in [
+        "private simulated rollback failure",
+        "SECRET_BODY_7391",
+        OWNER_EMAIL,
+    ] {
+        assert!(!logs.contains(secret));
+        assert!(!body.to_string().contains(secret));
+    }
+    context.close().await;
+}
+
+#[tokio::test]
+async fn concurrent_upload_chunks_at_zero_serialize_without_interleaving_or_duplication() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    let app = context.app();
+    let barrier = Arc::new(Barrier::new(3));
+    let first = {
+        let app = app.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            app.oneshot(chunk_request(upload_id, "0", 4, Body::from("AAAA")))
+                .await
+                .unwrap()
+        })
+    };
+    let second = {
+        let app = app.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            app.oneshot(chunk_request(upload_id, "0", 4, Body::from("BBBB")))
+                .await
+                .unwrap()
+        })
+    };
+    barrier.wait().await;
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.unwrap().status(), 204);
+    assert_eq!(second.unwrap().status(), 204);
+    let bytes = std::fs::read(
+        context
+            .temp
+            .path()
+            .join(".cellar/uploads")
+            .join(format!("{upload_id}.part")),
+    )
+    .unwrap();
+    assert!(bytes == b"AAAA" || bytes == b"BBBB", "stored {bytes:?}");
+    assert_eq!(
+        context
+            .database
+            .get_upload(upload_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .committed_offset(),
+        4
+    );
+    context.close().await;
+}
+
+struct PausingChunkStorage {
+    storage: Arc<Storage>,
+    written: Mutex<Option<oneshot::Sender<()>>>,
+    release: Arc<Semaphore>,
+}
+
+impl UploadStorage for PausingChunkStorage {
+    fn destination_exists<'a>(
+        &'a self,
+        project_id: Uuid,
+        file_name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, bool> {
+        Box::pin(async move { self.storage.destination_exists(project_id, file_name).await })
+    }
+
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn remove_empty_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_empty_staging(upload_id).await })
+    }
+
+    fn write_staging_chunk<'a>(
+        &'a self,
+        upload_id: Uuid,
+        offset: u64,
+        reader: cellar::uploads::UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        let written = self.written.lock().unwrap().take();
+        Box::pin(async move {
+            let count = self.storage.write_chunk(upload_id, offset, reader).await?;
+            if let Some(written) = written {
+                let _ = written.send(());
+            }
+            self.release.acquire().await.unwrap().forget();
+            Ok(count)
+        })
+    }
+
+    fn truncate_staging<'a>(&'a self, upload_id: Uuid, len: u64) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.truncate_staging(upload_id, len).await })
+    }
+}
+
+#[tokio::test]
+async fn cancelled_chunk_request_finishes_owned_commit_and_retry_cannot_duplicate() {
+    let context = TestContext::new().await;
+    let project_id = create_project(&context).await;
+    let upload_id = create_upload_session(&context, project_id, 4).await;
+    let (written_tx, written_rx) = oneshot::channel();
+    let release = Arc::new(Semaphore::new(0));
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        Arc::new(PausingChunkStorage {
+            storage: context.storage.clone(),
+            written: Mutex::new(Some(written_tx)),
+            release: release.clone(),
+        }),
+    );
+    let app = context.secure_upload(service);
+    let request =
+        tokio::spawn(
+            app.clone()
+                .oneshot(chunk_request(upload_id, "0", 4, Body::from("data"))),
+        );
+    written_rx.await.unwrap();
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    release.add_permits(1);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if context
+                .database
+                .get_upload(upload_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .committed_offset()
+                == 4
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned chunk operation did not finish after cancellation");
+
+    let retry = app
+        .oneshot(chunk_request(upload_id, "0", 4, Body::from("EVIL")))
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), 204);
+    assert_eq!(retry.headers()["upload-offset"], "4");
+    assert_eq!(
+        std::fs::read(
+            context
+                .temp
+                .path()
+                .join(".cellar/uploads")
+                .join(format!("{upload_id}.part"))
+        )
+        .unwrap(),
+        b"data"
+    );
+    context.close().await;
 }
 
 #[test]
@@ -420,25 +1684,6 @@ async fn upload_session_routes_are_authenticated_and_origin_protected() {
         .await
         .unwrap();
     assert_eq!(missing_assertion.status(), 401);
-    context.close().await;
-}
-
-#[tokio::test]
-async fn upload_session_chunk_put_is_not_implemented() {
-    let context = TestContext::new().await;
-    let upload_id = Uuid::now_v7();
-    let response = context
-        .app()
-        .oneshot(
-            authenticated_request("PUT", &format!("{}/chunk", upload(upload_id)))
-                .header("origin", common::EXTERNAL_ORIGIN)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 404);
-    assert_eq!(context.storage.staging_len(upload_id).await.unwrap(), None);
     context.close().await;
 }
 
