@@ -17,6 +17,7 @@ use crate::{
     auth::{AccessFailure, AccessVerifier},
     config::CanonicalOrigin,
     error::AppError,
+    projects::{ProjectService, project_router},
 };
 
 pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -145,6 +146,15 @@ pub fn secure_api_router(
         .layer(middleware::from_fn_with_state(state, access_middleware))
         .layer(trace);
     with_request_ids(secured)
+}
+
+/// Production composition point for the project API security boundary.
+pub fn secure_project_api_router(
+    service: ProjectService,
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: &CanonicalOrigin,
+) -> Router {
+    secure_api_router(project_router(service), verifier, external_origin)
 }
 
 async fn access_middleware(
