@@ -16,8 +16,11 @@ use uuid::{Uuid, Version};
 use crate::{
     auth::{AccessFailure, AccessVerifier},
     config::CanonicalOrigin,
+    db::Database,
     error::AppError,
     projects::{ProjectService, project_router},
+    storage::Storage,
+    uploads::{UploadService, upload_router},
 };
 
 pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -155,6 +158,27 @@ pub fn secure_project_api_router(
     external_origin: &CanonicalOrigin,
 ) -> Router {
     secure_api_router(project_router(service), verifier, external_origin)
+}
+
+/// Production composition point for all currently implemented API routes.
+pub fn secure_cellar_api_router(
+    database: Arc<Database>,
+    storage: Arc<Storage>,
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: &CanonicalOrigin,
+) -> Router {
+    let projects = project_router(ProjectService::new(database.clone(), storage.clone()));
+    let uploads = upload_router(UploadService::new(database, storage));
+    secure_api_router(projects.merge(uploads), verifier, external_origin)
+}
+
+/// Secures an upload router assembled with injected service dependencies.
+pub fn secure_upload_api_router(
+    service: UploadService,
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: &CanonicalOrigin,
+) -> Router {
+    secure_api_router(upload_router(service), verifier, external_origin)
 }
 
 async fn access_middleware(

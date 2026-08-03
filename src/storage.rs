@@ -150,6 +150,7 @@ pub enum StorageError {
     NotFound,
     UnsafeManagedEntry,
     UnsafeEntry,
+    NonEmptyStaging,
     OffsetMismatch { expected: u64, actual: u64 },
     InsufficientSpace,
     ProjectCleanupFailed { source: io::Error },
@@ -165,6 +166,7 @@ impl fmt::Display for StorageError {
             Self::NotFound => formatter.write_str("storage entry not found"),
             Self::UnsafeManagedEntry => formatter.write_str("unsafe managed storage entry"),
             Self::UnsafeEntry => formatter.write_str("unsafe or corrupt storage entry"),
+            Self::NonEmptyStaging => formatter.write_str("staging file is not empty"),
             Self::OffsetMismatch { expected, actual } => write!(
                 formatter,
                 "staging offset mismatch: expected {expected}, actual {actual}"
@@ -417,6 +419,25 @@ impl Storage {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(map_io(error)),
+        }
+    }
+
+    /// Removes one exact UUID staging file only when it is a safe empty regular file.
+    /// A file absent before inspection is an idempotent success.
+    pub async fn remove_empty_staging(&self, upload_id: Uuid) -> Result<(), StorageError> {
+        let _guard = self.mutation_lock.lock().await;
+        self.require_uploads_dir().await?;
+        let path = self.staging_path(upload_id);
+        let Some(metadata) = optional_metadata(&path).await? else {
+            return Ok(());
+        };
+        require_safe_regular_file_metadata(&metadata)?;
+        if metadata.len() != 0 {
+            return Err(StorageError::NonEmptyStaging);
+        }
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(source) => Err(StorageError::AmbiguousCleanup { source }),
         }
     }
 
@@ -1017,6 +1038,43 @@ mod tests {
         storage.remove_staging(upload_id).await.unwrap();
         storage.remove_staging(upload_id).await.unwrap();
         assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn empty_staging_compensation_removes_only_exact_file_and_missing_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let root = existing_root(&temp);
+        let storage = Storage::new(root.clone()).unwrap();
+        storage.initialize().await.unwrap();
+        let upload_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000103").unwrap();
+        let sibling = root.join(".cellar").join("uploads").join("keep.part");
+        std::fs::write(&sibling, b"keep").unwrap();
+
+        storage.create_staging(upload_id).await.unwrap();
+        storage.remove_empty_staging(upload_id).await.unwrap();
+        storage.remove_empty_staging(upload_id).await.unwrap();
+
+        assert_eq!(storage.staging_len(upload_id).await.unwrap(), None);
+        assert_eq!(std::fs::read(sibling).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn empty_staging_compensation_refuses_and_preserves_nonempty_file() {
+        let temp = tempdir().unwrap();
+        let storage = Storage::new(existing_root(&temp)).unwrap();
+        storage.initialize().await.unwrap();
+        let upload_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000104").unwrap();
+        storage.create_staging(upload_id).await.unwrap();
+        storage
+            .write_chunk(upload_id, 0, &b"important"[..])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage.remove_empty_staging(upload_id).await,
+            Err(StorageError::NonEmptyStaging)
+        ));
+        assert_eq!(storage.staging_len(upload_id).await.unwrap(), Some(9));
     }
 
     #[tokio::test]

@@ -6,12 +6,13 @@ use std::{path::Path, sync::Arc};
 
 use axum::{Router, body::Body, http::Request};
 use cellar::{
-    app::{X_REQUEST_ID, secure_project_api_router},
+    app::{X_REQUEST_ID, secure_cellar_api_router, secure_upload_api_router},
     auth::{AccessError, AccessVerifier, OwnerIdentity},
     config::Config,
     db::Database,
     projects::ProjectService,
     storage::Storage,
+    uploads::UploadService,
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -82,14 +83,24 @@ owner_email = "{OWNER_EMAIL}"
     }
 
     pub fn app(&self) -> Router {
-        self.secure(ProjectService::new(
+        secure_cellar_api_router(
             Arc::new(self.database.clone()),
             self.storage.clone(),
-        ))
+            Arc::new(FakeAccessVerifier),
+            self.config.external_origin(),
+        )
     }
 
     pub fn secure(&self, service: ProjectService) -> Router {
-        secure_project_api_router(
+        cellar::app::secure_project_api_router(
+            service,
+            Arc::new(FakeAccessVerifier),
+            self.config.external_origin(),
+        )
+    }
+
+    pub fn secure_upload(&self, service: UploadService) -> Router {
+        secure_upload_api_router(
             service,
             Arc::new(FakeAccessVerifier),
             self.config.external_origin(),
