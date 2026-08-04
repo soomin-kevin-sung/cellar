@@ -563,15 +563,17 @@ impl Storage {
         project_id: Uuid,
         name: &SafeFileName,
     ) -> Result<fs::File, StorageError> {
-        let files_dir = self.require_project_files_dir(project_id).await?;
+        let files_dir = self
+            .require_project_files_dir(project_id)
+            .await
+            .map_err(|error| match error {
+                StorageError::NotFound => StorageError::UnsafeManagedEntry,
+                error => error,
+            })?;
         let path = files_dir.join(name.as_str());
         let metadata = fs::symlink_metadata(&path).await.map_err(map_io)?;
-        require_safe_regular_file_metadata(&metadata)?;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .open(path)
-            .await
-            .map_err(map_io)?;
+        require_safe_exact_entry_metadata(&metadata)?;
+        let file = open_final_leaf_no_follow(path).await?;
         let metadata = file.metadata().await.map_err(map_io)?;
         require_safe_regular_file_metadata(&metadata)?;
         Ok(file)
@@ -586,11 +588,10 @@ impl Storage {
             if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
                 continue;
             }
-            let raw_name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| StorageError::UnsafeEntry)?;
-            let name = SafeFileName::parse(raw_name).map_err(|_| StorageError::UnsafeEntry)?;
+            let raw_name = entry.file_name().into_string().ok();
+            let Some(name) = raw_name.and_then(|name| SafeFileName::parse(name).ok()) else {
+                continue;
+            };
             let modified_at = metadata.modified().map_err(map_io)?;
             files.push(DiskFile {
                 name,
@@ -652,6 +653,25 @@ impl Storage {
             .await
             .map_err(map_io)
     }
+}
+
+async fn open_final_leaf_no_follow(path: PathBuf) -> Result<fs::File, StorageError> {
+    final_leaf_open_options().open(path).await.map_err(map_io)
+}
+
+fn final_leaf_open_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(final_leaf_custom_flags());
+    options
+}
+
+#[cfg(windows)]
+const fn final_leaf_custom_flags() -> u32 {
+    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
 }
 
 #[cfg(windows)]
@@ -792,6 +812,22 @@ mod tests {
     use super::*;
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(windows)]
+    #[test]
+    fn final_leaf_open_flags_are_reparse_safe_and_non_destructive() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let flags = final_leaf_custom_flags();
+        assert_eq!(
+            flags & FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_FLAG_OPEN_REPARSE_POINT
+        );
+        assert_eq!(flags & FILE_FLAG_DELETE_ON_CLOSE, 0);
+        assert_eq!(flags, FILE_FLAG_OPEN_REPARSE_POINT);
+    }
 
     #[test]
     fn safe_file_name_accepts_and_preserves_exact_input() {
@@ -1421,7 +1457,7 @@ mod tests {
         std::fs::create_dir(files_dir.join("nested")).unwrap();
         let target = root.join("target.txt");
         std::fs::write(&target, b"linked").unwrap();
-        let _ = try_symlink_file(&target, &files_dir.join("linked.txt"));
+        let symlink_created = try_symlink_file(&target, &files_dir.join("linked.txt"));
 
         assert!(
             storage
@@ -1445,10 +1481,18 @@ mod tests {
         assert!(listed[0].modified_at() <= SystemTime::now());
         assert_eq!(listed[1].name().as_str(), "Beta.bin");
         assert_eq!(listed[1].size(), 7);
+        if symlink_created {
+            let linked = SafeFileName::parse("linked.txt").unwrap();
+            assert!(matches!(
+                storage.open_final_file(project_id, &linked).await,
+                Err(StorageError::UnsafeEntry)
+            ));
+            assert_eq!(std::fs::read(target).unwrap(), b"linked");
+        }
     }
 
     #[tokio::test]
-    async fn listing_rejects_regular_disk_file_with_invalid_safe_name() {
+    async fn listing_ignores_regular_disk_file_with_invalid_safe_name() {
         let temp = tempdir().unwrap();
         let root = existing_root(&temp);
         let storage = Storage::new(root.clone()).unwrap();
@@ -1462,10 +1506,7 @@ mod tests {
             .join("invalid\u{7f}.txt");
         std::fs::write(invalid, b"unsafe").unwrap();
 
-        assert!(matches!(
-            storage.list_files(project_id).await,
-            Err(StorageError::UnsafeEntry)
-        ));
+        assert!(storage.list_files(project_id).await.unwrap().is_empty());
     }
 
     #[test]
@@ -1511,21 +1552,40 @@ mod tests {
 
     #[cfg(windows)]
     fn try_symlink_file(target: &Path, link: &Path) -> bool {
-        std::os::windows::fs::symlink_file(target, link).is_ok()
+        classify_windows_symlink_result(std::os::windows::fs::symlink_file(target, link))
     }
 
     #[cfg(windows)]
     fn try_symlink_dir(target: &Path, link: &Path) -> bool {
-        std::os::windows::fs::symlink_dir(target, link).is_ok()
+        classify_windows_symlink_result(std::os::windows::fs::symlink_dir(target, link))
+    }
+
+    #[cfg(windows)]
+    fn classify_windows_symlink_result(result: io::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 1314)) => {
+                eprintln!(
+                    "skipping symlink assertions: Windows privilege or symlink support unavailable ({:?})",
+                    error.raw_os_error()
+                );
+                false
+            }
+            Err(error) => panic!("unexpected test symlink creation failure: {error}"),
+        }
     }
 
     #[cfg(unix)]
     fn try_symlink_file(target: &Path, link: &Path) -> bool {
-        std::os::unix::fs::symlink(target, link).is_ok()
+        std::os::unix::fs::symlink(target, link)
+            .unwrap_or_else(|error| panic!("unexpected test symlink creation failure: {error}"));
+        true
     }
 
     #[cfg(unix)]
     fn try_symlink_dir(target: &Path, link: &Path) -> bool {
-        std::os::unix::fs::symlink(target, link).is_ok()
+        std::os::unix::fs::symlink(target, link)
+            .unwrap_or_else(|error| panic!("unexpected test symlink creation failure: {error}"));
+        true
     }
 }

@@ -17,6 +17,7 @@ use cellar::{
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tempfile::TempDir;
+use tower::ServiceExt;
 
 pub const ASSERTION_HEADER: &str = "Cf-Access-Jwt-Assertion";
 pub const VALID_ASSERTION: &str = "fixture-valid-assertion";
@@ -109,6 +110,20 @@ owner_email = "{OWNER_EMAIL}"
 
     pub fn project_path(&self, id: uuid::Uuid) -> std::path::PathBuf {
         self.temp.path().join("projects").join(id.to_string())
+    }
+
+    pub async fn create_project(&self, name: &str) -> uuid::Uuid {
+        let response = self
+            .app()
+            .oneshot(json_request(
+                authenticated_write_request("/api/v1/projects"),
+                &serde_json::json!({"name": name}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let (status, _, body) = json_response(response).await;
+        assert_eq!(status, http::StatusCode::CREATED);
+        uuid::Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
     }
 
     pub async fn close(self) {

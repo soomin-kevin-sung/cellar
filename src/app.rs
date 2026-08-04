@@ -18,6 +18,7 @@ use crate::{
     config::CanonicalOrigin,
     db::Database,
     error::AppError,
+    files::{FileService, file_router},
     projects::{ProjectService, project_router},
     storage::Storage,
     uploads::{UploadService, upload_router},
@@ -168,8 +169,13 @@ pub fn secure_cellar_api_router(
     external_origin: &CanonicalOrigin,
 ) -> Router {
     let projects = project_router(ProjectService::new(database.clone(), storage.clone()));
-    let uploads = upload_router(UploadService::new(database, storage));
-    secure_api_router(projects.merge(uploads), verifier, external_origin)
+    let uploads = upload_router(UploadService::new(database.clone(), storage.clone()));
+    let files = file_router(FileService::new(database, storage));
+    secure_api_router(
+        projects.merge(uploads).merge(files),
+        verifier,
+        external_origin,
+    )
 }
 
 /// Secures an upload router assembled with injected service dependencies.
