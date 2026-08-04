@@ -119,6 +119,30 @@ cargo build --release
 Repeat both build steps after any frontend change. The release executable is
 `target\release\cellar.exe`.
 
+## Deploy on Windows
+
+Build and deploy a standalone runtime under `D:\Cellar`:
+
+```powershell
+.\deploy.ps1 -Destination 'D:\Cellar' -VercelProject 'cellar-entry'
+```
+
+The installed layout keeps the executable, tunnel helper, configuration, data,
+and logs beneath `D:\Cellar`. The deployment records the port and Vercel project
+in `config\launcher.json`. Start it with:
+
+```powershell
+& 'D:\Cellar\cellar.ps1' -Password '<at-least-16-characters>'
+```
+
+The start script downloads `cloudflared` when needed, creates a Quick Tunnel,
+updates the Vercel fixed entry URL, writes the runtime configuration, and starts
+Cellar. `CELLAR_PASSWORD` can be used instead of the `-Password` argument.
+
+Running `deploy.ps1` again updates the executable and start script without
+deleting the existing `data` directory. `install.ps1` remains as a compatibility
+wrapper for the same deployment flow.
+
 ## Start locally
 
 For development, the helper rebuilds the frontend, temporarily sets

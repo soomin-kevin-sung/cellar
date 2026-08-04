@@ -3,9 +3,9 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8787,
 
-    [string]$DataRoot = (Join-Path $env:LOCALAPPDATA 'Cellar\data'),
+    [string]$DataRoot,
 
-    [string]$Password,
+    [string]$Password = $env:CELLAR_PASSWORD,
 
     [ValidatePattern('^[a-z0-9](?:[a-z0-9-]{0,50}[a-z0-9])?$')]
     [string]$VercelProject = $env:CELLAR_VERCEL_PROJECT
@@ -13,8 +13,51 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = $PSScriptRoot
-$cellarExe = Join-Path $repositoryRoot 'target\release\cellar.exe'
-$managedBinRoot = Join-Path $env:LOCALAPPDATA 'Cellar\bin'
+$installedExe = Join-Path $repositoryRoot 'app\cellar.exe'
+$developmentExe = Join-Path $repositoryRoot 'target\release\cellar.exe'
+$installedLayout = Test-Path -LiteralPath $installedExe -PathType Leaf
+$cellarExe = if ($installedLayout) { $installedExe } else { $developmentExe }
+$launcherConfigPath = Join-Path $repositoryRoot 'config\launcher.json'
+
+if (Test-Path -LiteralPath $launcherConfigPath -PathType Leaf) {
+    try {
+        $launcherConfig = Get-Content -LiteralPath $launcherConfigPath -Raw -Encoding utf8 |
+            ConvertFrom-Json
+    }
+    catch {
+        throw "Invalid launcher configuration: $launcherConfigPath"
+    }
+
+    if (-not $PSBoundParameters.ContainsKey('Port') -and
+        $launcherConfig.PSObject.Properties.Name -contains 'port') {
+        $configuredPort = [int]$launcherConfig.port
+        if ($configuredPort -lt 1024 -or $configuredPort -gt 65535) {
+            throw 'Configured port must be between 1024 and 65535.'
+        }
+        $Port = $configuredPort
+    }
+
+    if ([string]::IsNullOrWhiteSpace($VercelProject) -and
+        $launcherConfig.PSObject.Properties.Name -contains 'vercelProject') {
+        $VercelProject = [string]$launcherConfig.vercelProject
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($DataRoot)) {
+    $DataRoot = if ($installedLayout) {
+        Join-Path $repositoryRoot 'data'
+    }
+    else {
+        Join-Path $env:LOCALAPPDATA 'Cellar\data'
+    }
+}
+
+$managedBinRoot = if ($installedLayout) {
+    Join-Path $repositoryRoot 'bin'
+}
+else {
+    Join-Path $env:LOCALAPPDATA 'Cellar\bin'
+}
 $managedCloudflared = Join-Path $managedBinRoot 'cloudflared.exe'
 $cloudflaredVersion = '2026.7.3'
 $cloudflaredSha256 = '8635da433b6df8194746e88ed9d2589566c20e38bfc2a80e431a348b7c765841'
@@ -113,9 +156,20 @@ $cellarDirectory = Join-Path $resolvedDataRoot '.cellar'
 
 $runtimeRoot = Join-Path ([IO.Path]::GetTempPath()) ('cellar-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($runtimeRoot) | Out-Null
-$tunnelOut = Join-Path $runtimeRoot 'cloudflared.out.log'
-$tunnelErr = Join-Path $runtimeRoot 'cloudflared.err.log'
-$runtimeConfig = Join-Path $runtimeRoot 'config.toml'
+if ($installedLayout) {
+    $configRoot = Join-Path $repositoryRoot 'config'
+    $logsRoot = Join-Path $repositoryRoot 'logs'
+    [IO.Directory]::CreateDirectory($configRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($logsRoot) | Out-Null
+    $tunnelOut = Join-Path $logsRoot 'cloudflared.out.log'
+    $tunnelErr = Join-Path $logsRoot 'cloudflared.err.log'
+    $runtimeConfig = Join-Path $configRoot 'runtime.toml'
+}
+else {
+    $tunnelOut = Join-Path $runtimeRoot 'cloudflared.out.log'
+    $tunnelErr = Join-Path $runtimeRoot 'cloudflared.err.log'
+    $runtimeConfig = Join-Path $runtimeRoot 'config.toml'
+}
 $tunnelProcess = $null
 $previousConfig = [Environment]::GetEnvironmentVariable('CELLAR_CONFIG', 'Process')
 $previousPassword = [Environment]::GetEnvironmentVariable('CELLAR_QUICK_PASSWORD', 'Process')
@@ -162,7 +216,8 @@ try {
         }
     }
 
-    if ([string]::IsNullOrEmpty($Password)) {
+    $passwordWasGenerated = [string]::IsNullOrEmpty($Password)
+    if ($passwordWasGenerated) {
         $passwordBytes = New-Object byte[] 18
         $random = [Security.Cryptography.RandomNumberGenerator]::Create()
         try {
@@ -197,7 +252,12 @@ owner_email = "owner@localhost.invalid"
     Write-Host 'Cellar가 외부에 연결되었습니다.' -ForegroundColor Green
     Write-Host "주소: $publicUrl"
     Write-Host '초기 관리자: cellar'
-    Write-Host "초기 관리자 암호: $Password"
+    if ($passwordWasGenerated) {
+        Write-Host "초기 관리자 암호: $Password"
+    }
+    else {
+        Write-Host 'Initial admin password: provided by the execution environment'
+    }
     Write-Host '관리자 계정이 이미 생성되었다면 기존 암호로 로그인하세요.'
     Write-Host '종료: Ctrl+C (다시 실행하면 임시 주소가 바뀝니다.)'
     Write-Host ''
