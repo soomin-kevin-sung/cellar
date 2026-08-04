@@ -139,63 +139,103 @@ impl UploadService {
             }
         }
 
-        let upload_id = Uuid::now_v7();
-        let mut cleanup = StagingCleanup::new(self.storage.clone(), upload_id);
-        if let Err(error) = self.storage.create_staging(upload_id).await {
-            cleanup.disarm();
-            return Err(map_internal_storage_error(&error));
-        }
-
-        let size = match self.storage.write_upload(upload_id, reader).await {
-            Ok(size) => size,
-            Err(error) => {
-                let mapped = map_write_error(&error);
-                record_storage_failure(&error, request_id, project_id);
-                cleanup.cleanup().await;
-                return Err(mapped);
-            }
-        };
-        if size == 0 {
-            cleanup.cleanup().await;
-            return Err(UploadServiceError::InvalidRequest);
-        }
-
-        if let Err(error) = self.storage.sync_staging(upload_id).await {
-            let mapped = map_internal_storage_error(&error);
-            record_storage_failure(&error, request_id, project_id);
-            cleanup.cleanup().await;
-            return Err(mapped);
-        }
-
         let storage = self.storage.clone();
-        let final_name = name.clone();
-        let cleanup_gate = cleanup.gate();
-        let finalization = tokio::spawn(async move {
-            let _guard = cleanup_gate.lock().await;
-            storage
-                .finalize_no_replace(upload_id, project_id, &final_name)
-                .await
+        let request_id = request_id.clone();
+        let operation = tokio::spawn(async move {
+            run_owned_upload(storage, project_id, name, reader, request_id).await
         });
-        let finalization = match finalization.await {
+        match operation.await {
             Ok(result) => result,
-            Err(_) => {
-                record_failure("finalization_task_failed", request_id, project_id);
-                cleanup.cleanup().await;
-                return Err(UploadServiceError::Unavailable);
-            }
-        };
-        if let Err(error) = finalization {
-            let mapped = map_finalization_error(&error);
-            record_storage_failure(&error, request_id, project_id);
-            cleanup.cleanup().await;
-            return Err(mapped);
+            Err(_) => Err(UploadServiceError::Unavailable),
         }
+    }
+}
 
+async fn run_owned_upload(
+    storage: Arc<dyn UploadStorage>,
+    project_id: Uuid,
+    name: SafeFileName,
+    reader: UploadBodyReader,
+    request_id: RequestId,
+) -> Result<UploadResponse, UploadServiceError> {
+    let upload_id = Uuid::now_v7();
+    let mut cleanup = StagingCleanup::new(storage.clone(), upload_id);
+    if let Err(error) = storage.create_staging(upload_id).await {
         cleanup.disarm();
-        Ok(UploadResponse {
-            name: name.as_str().to_owned(),
-            size: DecimalU64(size),
-        })
+        return Err(map_internal_storage_error(&error));
+    }
+
+    let size = match storage.write_upload(upload_id, reader).await {
+        Ok(size) => size,
+        Err(error) => {
+            let mapped = map_write_error(&error);
+            record_storage_failure(&error, &request_id, project_id);
+            return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+        }
+    };
+    if size == 0 {
+        return Err(cleanup_result(
+            &mut cleanup,
+            UploadServiceError::InvalidRequest,
+            &request_id,
+            project_id,
+        )
+        .await);
+    }
+
+    if let Err(error) = storage.sync_staging(upload_id).await {
+        let mapped = map_internal_storage_error(&error);
+        record_storage_failure(&error, &request_id, project_id);
+        return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+    }
+
+    let final_storage = storage.clone();
+    let final_name = name.clone();
+    let cleanup_gate = cleanup.gate();
+    let finalization = tokio::spawn(async move {
+        let _guard = cleanup_gate.lock().await;
+        final_storage
+            .finalize_no_replace(upload_id, project_id, &final_name)
+            .await
+    });
+    let finalization = match finalization.await {
+        Ok(result) => result,
+        Err(_) => {
+            record_failure("finalization_task_failed", &request_id, project_id);
+            return Err(cleanup_result(
+                &mut cleanup,
+                UploadServiceError::Unavailable,
+                &request_id,
+                project_id,
+            )
+            .await);
+        }
+    };
+    if let Err(error) = finalization {
+        let mapped = map_finalization_error(&error);
+        record_storage_failure(&error, &request_id, project_id);
+        return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+    }
+
+    cleanup.disarm();
+    Ok(UploadResponse {
+        name: name.as_str().to_owned(),
+        size: DecimalU64(size),
+    })
+}
+
+async fn cleanup_result(
+    cleanup: &mut StagingCleanup,
+    original: UploadServiceError,
+    request_id: &RequestId,
+    project_id: Uuid,
+) -> UploadServiceError {
+    match cleanup.cleanup().await {
+        Ok(()) => original,
+        Err(_) => {
+            record_failure("staging_cleanup_failed", request_id, project_id);
+            UploadServiceError::Unavailable
+        }
     }
 }
 
@@ -227,11 +267,15 @@ impl StagingCleanup {
         }
     }
 
-    async fn cleanup(&mut self) {
+    async fn cleanup(&mut self) -> Result<(), StorageError> {
         let cleanup_gate = self.cleanup_gate.clone();
         let _guard = cleanup_gate.lock().await;
-        if self.storage.remove_staging(self.upload_id).await.is_ok() {
-            self.disarm();
+        match self.storage.remove_staging(self.upload_id).await {
+            Ok(()) => {
+                self.disarm();
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 

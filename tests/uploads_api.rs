@@ -18,6 +18,7 @@ use cellar::{
         UploadStorageFuture,
     },
 };
+use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -494,35 +495,50 @@ async fn database_failure_returns_safe_service_unavailable_before_staging() {
 struct CreatedThenPendingStorage {
     storage: Arc<cellar::storage::Storage>,
     created: Mutex<Option<tokio::sync::oneshot::Sender<Uuid>>>,
+    continued: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 impl UploadStorage for CreatedThenPendingStorage {
     fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
         let created = self.created.lock().unwrap().take();
+        let continued = self.continued.lock().unwrap().take();
         Box::pin(async move {
             self.storage.create_staging(upload_id).await?;
             if let Some(created) = created {
                 let _ = created.send(upload_id);
             }
-            std::future::pending().await
+            self.release.acquire().await.unwrap().forget();
+            if let Some(continued) = continued {
+                let _ = continued.send(());
+            }
+            Ok(())
         })
     }
 
-    fn write_upload<'a>(&'a self, _: Uuid, _: UploadBodyReader) -> UploadStorageFuture<'a, u64> {
-        Box::pin(async { panic!("write must wait for staging creation") })
+    fn write_upload<'a>(
+        &'a self,
+        upload_id: Uuid,
+        reader: UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async move { self.storage.write_chunk(upload_id, 0, reader).await })
     }
 
-    fn sync_staging<'a>(&'a self, _: Uuid) -> UploadStorageFuture<'a, ()> {
-        Box::pin(async { panic!("sync must wait for staging creation") })
+    fn sync_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.sync_staging(upload_id).await })
     }
 
     fn finalize_no_replace<'a>(
         &'a self,
-        _: Uuid,
-        _: Uuid,
-        _: &'a SafeFileName,
+        upload_id: Uuid,
+        project_id: Uuid,
+        name: &'a SafeFileName,
     ) -> UploadStorageFuture<'a, ()> {
-        Box::pin(async { panic!("finalization must wait for staging creation") })
+        Box::pin(async move {
+            self.storage
+                .finalize_no_replace(upload_id, project_id, name)
+                .await
+        })
     }
 
     fn remove_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
@@ -531,21 +547,29 @@ impl UploadStorage for CreatedThenPendingStorage {
 }
 
 #[tokio::test]
-async fn cancellation_during_staging_creation_schedules_exact_cleanup() {
+async fn cancellation_during_staging_creation_is_supervised_until_ordered_cleanup() {
     let context = TestContext::new().await;
     let project_id = context.create_project("Reports").await;
     let (created_tx, created_rx) = tokio::sync::oneshot::channel();
+    let (continued_tx, continued_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
     let service = UploadService::new(
         Arc::new(context.database.clone()),
         Arc::new(CreatedThenPendingStorage {
             storage: context.storage.clone(),
             created: Mutex::new(Some(created_tx)),
+            continued: Mutex::new(Some(continued_tx)),
+            release: release.clone(),
         }),
     );
+    let body = Body::from_stream(futures_util::stream::iter([
+        Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
+        Err(io::Error::other("incomplete body")),
+    ]));
     let request = tokio::spawn(context.secure_upload(service).oneshot(upload_request(
         project_id,
         "fileName=cancelled.bin",
-        Body::from("data"),
+        body,
     )));
     let upload_id = tokio::time::timeout(std::time::Duration::from_secs(2), created_rx)
         .await
@@ -558,6 +582,16 @@ async fn cancellation_during_staging_creation_schedules_exact_cleanup() {
 
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0),
+        "handler cancellation must not race cleanup ahead of paused creation"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), continued_rx)
+        .await
+        .expect("server-owned staging creation was cancelled with its waiter")
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while context
             .storage
@@ -571,6 +605,194 @@ async fn cancellation_during_staging_creation_schedules_exact_cleanup() {
     })
     .await
     .expect("cancelled upload did not remove its exact staging file");
+    assert!(
+        !context
+            .project_path(project_id)
+            .join("files/cancelled.bin")
+            .exists()
+    );
     assert!(canonical_staging_files(&context).is_empty());
+    context.close().await;
+}
+
+struct WriteObservingStorage {
+    storage: Arc<cellar::storage::Storage>,
+    started: Mutex<Option<tokio::sync::oneshot::Sender<Uuid>>>,
+}
+
+impl UploadStorage for WriteObservingStorage {
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn write_upload<'a>(
+        &'a self,
+        upload_id: Uuid,
+        reader: UploadBodyReader,
+    ) -> UploadStorageFuture<'a, u64> {
+        let started = self.started.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(started) = started {
+                let _ = started.send(upload_id);
+            }
+            self.storage.write_chunk(upload_id, 0, reader).await
+        })
+    }
+
+    fn sync_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.sync_staging(upload_id).await })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        upload_id: Uuid,
+        project_id: Uuid,
+        name: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move {
+            self.storage
+                .finalize_no_replace(upload_id, project_id, name)
+                .await
+        })
+    }
+
+    fn remove_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.remove_staging(upload_id).await })
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_write_is_supervised_until_body_failure_cleanup() {
+    let context = TestContext::new().await;
+    let project_id = context.create_project("Reports").await;
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (continued_tx, continued_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        Arc::new(WriteObservingStorage {
+            storage: context.storage.clone(),
+            started: Mutex::new(Some(started_tx)),
+        }),
+    );
+    let body_release = release.clone();
+    let stream = futures_util::stream::once(async {
+        Ok::<Bytes, io::Error>(Bytes::from_static(b"partial"))
+    })
+    .chain(futures_util::stream::once(async move {
+        body_release.acquire().await.unwrap().forget();
+        let _ = continued_tx.send(());
+        Err::<Bytes, io::Error>(io::Error::other("incomplete body"))
+    }));
+    let request = tokio::spawn(context.secure_upload(service).oneshot(upload_request(
+        project_id,
+        "fileName=write-cancelled.bin",
+        Body::from_stream(stream),
+    )));
+    let upload_id = tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while context.storage.staging_len(upload_id).await.unwrap() != Some(7) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upload did not reach the paused partial write");
+
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(7)
+    );
+    release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), continued_rx)
+        .await
+        .expect("server-owned body write was cancelled with its waiter")
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while context
+            .storage
+            .staging_len(upload_id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervised failed write did not clean staging");
+    assert!(
+        !context
+            .project_path(project_id)
+            .join("files/write-cancelled.bin")
+            .exists()
+    );
+    context.close().await;
+}
+
+struct CleanupFailingStorage {
+    storage: Arc<cellar::storage::Storage>,
+}
+
+impl UploadStorage for CleanupFailingStorage {
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async move { self.storage.create_staging(upload_id).await })
+    }
+
+    fn write_upload<'a>(&'a self, _: Uuid, _: UploadBodyReader) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async { Err(StorageError::InvalidBody) })
+    }
+
+    fn sync_staging<'a>(&'a self, _: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async { panic!("sync must not follow failed body") })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        _: Uuid,
+        _: Uuid,
+        _: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async { panic!("finalization must not follow failed body") })
+    }
+
+    fn remove_staging<'a>(&'a self, _: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async {
+            Err(StorageError::Io {
+                source: io::Error::other(r"D:\private\cleanup\upload.part"),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn body_failure_with_failed_cleanup_returns_safe_service_unavailable() {
+    let context = TestContext::new().await;
+    let project_id = context.create_project("Reports").await;
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        Arc::new(CleanupFailingStorage {
+            storage: context.storage.clone(),
+        }),
+    );
+    let response = context
+        .secure_upload(service)
+        .oneshot(upload_request(
+            project_id,
+            "fileName=cleanup-failure.bin",
+            Body::from("data"),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = response_json(response).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "upload_unavailable");
+    assert!(!body.to_string().contains("private"));
+    assert!(!body.to_string().contains("upload.part"));
     context.close().await;
 }
