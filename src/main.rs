@@ -225,10 +225,175 @@ impl StartupSteps for RuntimeStartup {
     }
 }
 
-async fn shutdown_signal() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        tracing::warn!("shutdown signal listener stopped");
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlatformShutdownSignal {
+    CtrlC,
+    CtrlBreak,
+    ConsoleClose,
+    SystemShutdown,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlatformShutdownSignal {
+    CtrlC,
+    Terminate,
+}
+
+#[cfg(windows)]
+const PLATFORM_SHUTDOWN_SIGNALS: &[PlatformShutdownSignal] = &[
+    PlatformShutdownSignal::CtrlC,
+    PlatformShutdownSignal::CtrlBreak,
+    PlatformShutdownSignal::ConsoleClose,
+    PlatformShutdownSignal::SystemShutdown,
+];
+
+#[cfg(unix)]
+const PLATFORM_SHUTDOWN_SIGNALS: &[PlatformShutdownSignal] = &[
+    PlatformShutdownSignal::CtrlC,
+    PlatformShutdownSignal::Terminate,
+];
+
+impl PlatformShutdownSignal {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::CtrlC => "ctrl_c",
+            #[cfg(windows)]
+            Self::CtrlBreak => "ctrl_break",
+            #[cfg(windows)]
+            Self::ConsoleClose => "console_close",
+            #[cfg(windows)]
+            Self::SystemShutdown => "system_shutdown",
+            #[cfg(unix)]
+            Self::Terminate => "terminate",
+        }
     }
+}
+
+struct RegisteredShutdownSignal {
+    kind: &'static str,
+    wait: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+}
+
+impl RegisteredShutdownSignal {
+    #[cfg(test)]
+    fn for_test<F>(kind: &'static str, wait: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            kind,
+            wait: Box::pin(wait),
+        }
+    }
+}
+
+fn register_shutdown_signal<F>(
+    signals: &mut Vec<RegisteredShutdownSignal>,
+    kind: &'static str,
+    registration: std::io::Result<F>,
+) where
+    F: Future<Output = Option<()>> + Send + 'static,
+{
+    match registration {
+        Ok(wait) => signals.push(RegisteredShutdownSignal {
+            kind,
+            wait: Box::pin(async move {
+                if wait.await.is_none() {
+                    tracing::warn!(
+                        signal = kind,
+                        reason = "listener_closed",
+                        "shutdown signal listener stopped"
+                    );
+                    std::future::pending::<()>().await;
+                }
+            }),
+        }),
+        Err(_) => tracing::warn!(
+            signal = kind,
+            reason = "registration_failed",
+            "shutdown signal listener unavailable"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn platform_shutdown_signals() -> Vec<RegisteredShutdownSignal> {
+    use tokio::signal::windows;
+
+    let mut signals = Vec::with_capacity(PLATFORM_SHUTDOWN_SIGNALS.len());
+    for kind in PLATFORM_SHUTDOWN_SIGNALS {
+        match kind {
+            PlatformShutdownSignal::CtrlC => register_shutdown_signal(
+                &mut signals,
+                kind.name(),
+                windows::ctrl_c().map(|mut signal| async move { signal.recv().await }),
+            ),
+            PlatformShutdownSignal::CtrlBreak => register_shutdown_signal(
+                &mut signals,
+                kind.name(),
+                windows::ctrl_break().map(|mut signal| async move { signal.recv().await }),
+            ),
+            PlatformShutdownSignal::ConsoleClose => register_shutdown_signal(
+                &mut signals,
+                kind.name(),
+                windows::ctrl_close().map(|mut signal| async move { signal.recv().await }),
+            ),
+            PlatformShutdownSignal::SystemShutdown => register_shutdown_signal(
+                &mut signals,
+                kind.name(),
+                windows::ctrl_shutdown().map(|mut signal| async move { signal.recv().await }),
+            ),
+        }
+    }
+    signals
+}
+
+#[cfg(unix)]
+fn platform_shutdown_signals() -> Vec<RegisteredShutdownSignal> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut signals = Vec::with_capacity(PLATFORM_SHUTDOWN_SIGNALS.len());
+    for kind in PLATFORM_SHUTDOWN_SIGNALS {
+        let signal_kind = match kind {
+            PlatformShutdownSignal::CtrlC => SignalKind::interrupt(),
+            PlatformShutdownSignal::Terminate => SignalKind::terminate(),
+        };
+        register_shutdown_signal(
+            &mut signals,
+            kind.name(),
+            signal(signal_kind).map(|mut signal| async move { signal.recv().await }),
+        );
+    }
+    signals
+}
+
+async fn wait_for_shutdown_signal(signals: Vec<RegisteredShutdownSignal>) {
+    if signals.is_empty() {
+        tracing::error!(
+            reason = "no_signal_listeners",
+            "graceful shutdown signals are unavailable"
+        );
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    let waits: Vec<Pin<Box<dyn Future<Output = &'static str> + Send>>> = signals
+        .into_iter()
+        .map(|signal| {
+            Box::pin(async move {
+                signal.wait.await;
+                signal.kind
+            }) as Pin<Box<dyn Future<Output = &'static str> + Send>>
+        })
+        .collect();
+    let (kind, _, _) = futures_util::future::select_all(waits).await;
+    tracing::info!(signal = kind, "graceful shutdown requested");
+}
+
+async fn shutdown_signal() {
+    wait_for_shutdown_signal(platform_shutdown_signals()).await;
 }
 
 async fn serve_until_shutdown<S>(
@@ -270,8 +435,9 @@ mod tests {
     };
 
     use super::{
-        StartupError, StartupFuture, StartupSteps, required_config_path, run_startup,
-        serve_until_shutdown,
+        RegisteredShutdownSignal, StartupError, StartupFuture, StartupSteps,
+        platform_shutdown_signals, register_shutdown_signal, required_config_path, run_startup,
+        serve_until_shutdown, wait_for_shutdown_signal,
     };
 
     struct FakeSteps {
@@ -462,6 +628,81 @@ mod tests {
         assert_eq!(
             required_config_path(Some(OsString::from("C:/path with spaces/cellar.toml"))).unwrap(),
             std::path::PathBuf::from("C:/path with spaces/cellar.toml")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_runtime_registers_every_supported_shutdown_signal() {
+        let registered = platform_shutdown_signals();
+        assert_eq!(
+            registered
+                .iter()
+                .map(|signal| signal.kind)
+                .collect::<Vec<_>>(),
+            ["ctrl_c", "ctrl_break", "console_close", "system_shutdown"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_runtime_registers_interrupt_and_terminate_signals() {
+        let registered = platform_shutdown_signals();
+        assert_eq!(
+            registered
+                .iter()
+                .map(|signal| signal.kind)
+                .collect::<Vec<_>>(),
+            ["ctrl_c", "terminate"]
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aggregation_completes_when_any_registered_signal_fires() {
+        let (first_tx, first_rx) = oneshot::channel::<()>();
+        let (_second_tx, second_rx) = oneshot::channel::<()>();
+        let signals = vec![
+            RegisteredShutdownSignal::for_test("first", async move {
+                let _ = first_rx.await;
+            }),
+            RegisteredShutdownSignal::for_test("second", async move {
+                let _ = second_rx.await;
+            }),
+        ];
+
+        first_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), wait_for_shutdown_signal(signals))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_or_closed_signal_registration_never_busy_loops_or_stops_the_server() {
+        let mut signals = Vec::new();
+        register_shutdown_signal(
+            &mut signals,
+            "registration_failure",
+            Err::<std::future::Pending<Option<()>>, _>(std::io::Error::other("fixture")),
+        );
+        register_shutdown_signal(
+            &mut signals,
+            "closed_listener",
+            Ok(std::future::ready(None)),
+        );
+
+        assert_eq!(signals.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), wait_for_shutdown_signal(signals),)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                wait_for_shutdown_signal(Vec::new()),
+            )
+            .await
+            .is_err()
         );
     }
 
