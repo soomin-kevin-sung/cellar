@@ -208,6 +208,7 @@ fn build_cellar_app_with_web(
     let api_fallback = secure_api_router(
         Router::new()
             .route("/api", any(api_not_found))
+            .route("/api/", any(api_not_found))
             .route("/api/{*path}", any(api_not_found)),
         verifier,
         external_origin,
@@ -583,6 +584,86 @@ owner_email = "owner@example.com"
             assert!(response.headers().contains_key(&X_REQUEST_ID));
             assert_security_headers(&response);
         }
+        fixture.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn api_trailing_slash_stays_inside_auth_origin_and_json_fallback_boundary() {
+        let fixture = AppFixture::new().await;
+
+        let unauthenticated = fixture
+            .app
+            .clone()
+            .oneshot(Request::builder().uri("/api/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthenticated.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_security_headers(&unauthenticated);
+
+        let authenticated = fixture
+            .app
+            .clone()
+            .oneshot(
+                api_request(Method::GET, "/api/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            authenticated.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_security_headers(&authenticated);
+        let request_id = authenticated.headers()[&X_REQUEST_ID]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body: Value = serde_json::from_slice(
+            &to_bytes(authenticated.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], "api_not_found");
+        assert_eq!(body["error"]["requestId"], request_id);
+
+        let missing_origin = fixture
+            .app
+            .clone()
+            .oneshot(
+                api_request(Method::POST, "/api/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+        assert_security_headers(&missing_origin);
+
+        let exact_origin = fixture
+            .app
+            .clone()
+            .oneshot(
+                api_request(Method::POST, "/api/")
+                    .header(header::ORIGIN, "https://files.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_origin.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            exact_origin.headers()[header::CONTENT_TYPE],
+            "application/json"
+        );
+        assert_security_headers(&exact_origin);
+
         fixture.database.close().await;
     }
 

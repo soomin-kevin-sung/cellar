@@ -125,12 +125,7 @@ fn safe_asset_path(path: &str) -> bool {
 }
 
 fn is_spa_route(path: &str) -> bool {
-    safe_asset_path(path)
-        && !path.starts_with("assets/")
-        && !path
-            .rsplit('/')
-            .next()
-            .is_some_and(|component| component.contains('.'))
+    safe_asset_path(path) && !path.starts_with("assets/")
 }
 
 fn asset_response(path: &str, bytes: Cow<'static, [u8]>, head: bool) -> Response {
@@ -336,7 +331,6 @@ mod tests {
     async fn missing_asset_and_path_tricks_are_not_spa_routes() {
         for path in [
             "/assets/missing.js",
-            "/missing.txt",
             "/assets/../index.html",
             "/assets/%2e%2e/index.html",
             "/assets\\index-AbC123xy.js",
@@ -352,6 +346,26 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn safe_non_asset_path_with_extension_falls_back_to_index() {
+        let response = response(Method::GET, "/missing.txt").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_security_headers(&response);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "<!doctype html><div id=\"root\"></div>"
+        );
     }
 
     #[tokio::test]
