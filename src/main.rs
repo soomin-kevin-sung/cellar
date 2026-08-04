@@ -9,7 +9,7 @@ use std::{
 
 use axum::Router;
 use cellar::{
-    app::build_cellar_app,
+    app::{build_cellar_app, build_cellar_quick_app},
     auth::{AccessVerifier, CloudflareAccessVerifier},
     config::Config,
     db::Database,
@@ -211,13 +211,21 @@ impl StartupSteps for RuntimeStartup {
         storage: &Self::Storage,
         verifier: &Self::Verifier,
     ) -> Result<Self::App, StartupError> {
-        build_cellar_app(
-            database.clone(),
-            storage.clone(),
-            verifier.clone(),
-            config.external_origin(),
-        )
-        .map_err(|_| StartupError::new("web_assets_missing"))
+        let app = match std::env::var("CELLAR_QUICK_PASSWORD") {
+            Ok(password) if !password.is_empty() => build_cellar_quick_app(
+                database.clone(),
+                storage.clone(),
+                config.external_origin(),
+                &password,
+            ),
+            _ => build_cellar_app(
+                database.clone(),
+                storage.clone(),
+                verifier.clone(),
+                config.external_origin(),
+            ),
+        };
+        app.map_err(|_| StartupError::new("web_assets_missing"))
     }
 
     fn bind<'a>(&'a mut self, config: &'a Self::Config) -> StartupFuture<'a, Self::Listener> {

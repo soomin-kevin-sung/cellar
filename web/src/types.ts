@@ -10,6 +10,19 @@ export interface FileEntry {
   modifiedAt: string;
 }
 
+export type UserRole = "admin" | "member";
+
+export interface CurrentUser {
+  id: string;
+  username: string;
+  role: UserRole;
+}
+
+export interface ManagedUser extends CurrentUser {
+  active: boolean;
+  createdAt: number;
+}
+
 export interface ErrorEnvelope {
   error: {
     code: string;

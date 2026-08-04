@@ -16,7 +16,7 @@ type PanelState = "idle" | "uploading" | "complete" | "error";
 function safeMessage(reason: unknown) {
   return reason instanceof Error && reason.message.trim()
     ? reason.message
-    : "The file could not be uploaded. Please try again.";
+    : "파일을 업로드하지 못했습니다. 다시 시도해주세요.";
 }
 
 export const UploadPanel = forwardRef<HTMLElement, UploadPanelProps>(function UploadPanel(
@@ -80,11 +80,11 @@ export const UploadPanel = forwardRef<HTMLElement, UploadPanelProps>(function Up
   return (
     <section aria-labelledby="upload-title" className="upload-panel" ref={ref} tabIndex={-1}>
       <div className="upload-panel__heading">
-        <div><p className="eyebrow">Transfer</p><h2 id="upload-title">Upload a file</h2></div>
+        <div><p className="eyebrow">업로드</p><h2 id="upload-title">파일 올리기</h2></div>
       </div>
 
       <input
-        aria-label="Choose a file to upload"
+        aria-label="업로드할 파일 선택"
         className="sr-only"
         disabled={busy}
         onChange={inputChanged}
@@ -102,8 +102,8 @@ export const UploadPanel = forwardRef<HTMLElement, UploadPanelProps>(function Up
           onDrop={drop}
         >
           <Upload aria-hidden="true" size={21} strokeWidth={1.7} />
-          <div><strong>Drop one file here</strong><p>or choose it from this device</p></div>
-          <button className="button button--primary" onClick={() => inputRef.current?.click()} type="button">Upload file</button>
+          <div><strong>파일 하나를 여기에 놓으세요</strong><p>또는 이 PC에서 선택하세요</p></div>
+          <button className="button button--primary" onClick={() => inputRef.current?.click()} type="button">파일 선택</button>
         </div>
       ) : null}
 
@@ -113,20 +113,20 @@ export const UploadPanel = forwardRef<HTMLElement, UploadPanelProps>(function Up
             <div><strong>{file.name}</strong><span>{projectName}</span></div>
             <span>{formatBinarySize(String(result ? Number(result.size) : file.size))}</span>
           </div>
-          <progress aria-label="Upload progress" max={100} value={state === "complete" ? 100 : undefined} />
+          <progress aria-label="업로드 진행률" max={100} value={state === "complete" ? 100 : undefined} />
           <div className="upload-status__meta">
-            <span>{state === "uploading" ? "Sending the file" : state === "complete" ? "Saved on this PC" : "Upload failed"}</span>
-            <span role="status">{state === "uploading" ? "Uploading" : state === "complete" ? "Upload complete" : "Needs attention"}</span>
+            <span>{state === "uploading" ? "파일을 보내는 중" : state === "complete" ? "이 PC에 저장됨" : "업로드 실패"}</span>
+            <span role="status">{state === "uploading" ? "업로드 중" : state === "complete" ? "업로드 완료" : "확인 필요"}</span>
           </div>
           {message ? <p className="upload-message" role="alert">{message}</p> : null}
           {state === "error" ? (
             <div className="upload-status__actions">
-              <button className="button button--secondary" onClick={() => void run(file)} type="button">Retry upload</button>
-              <button className="button button--quiet" onClick={reset} type="button">Choose another file</button>
+              <button className="button button--secondary" onClick={() => void run(file)} type="button">다시 업로드</button>
+              <button className="button button--quiet" onClick={reset} type="button">다른 파일 선택</button>
             </div>
           ) : null}
           {state === "complete" ? (
-            <button className="button button--quiet" onClick={reset} type="button">Upload another file</button>
+            <button className="button button--quiet" onClick={reset} type="button">다른 파일 업로드</button>
           ) : null}
         </div>
       ) : null}

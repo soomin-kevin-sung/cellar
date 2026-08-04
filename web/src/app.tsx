@@ -3,12 +3,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "./api";
 import { AppShell } from "./components/app-shell";
+import { AdminPanel } from "./components/admin-panel";
 import { EmptyState } from "./components/empty-state";
 import { FileTable } from "./components/file-table";
 import { ProjectCreateDialog } from "./components/project-create-dialog";
 import { UploadPanel } from "./components/upload-panel";
 import { formatFileSummary } from "./file-format";
-import type { FileEntry, Project } from "./types";
+import type { CurrentUser, FileEntry, Project } from "./types";
 import { uploadFile } from "./upload-client";
 
 export interface ApiClient {
@@ -23,7 +24,17 @@ function safeMessage(reason: unknown, fallback: string) {
   return reason instanceof Error && reason.message.trim() ? reason.message : fallback;
 }
 
-export default function App({ client = api, uploader = uploadFile }: { client?: ApiClient; uploader?: typeof uploadFile }) {
+export default function App({
+  client = api,
+  uploader = uploadFile,
+  currentUser,
+  onLogout,
+}: {
+  client?: ApiClient;
+  uploader?: typeof uploadFile;
+  currentUser?: CurrentUser;
+  onLogout?: () => Promise<void> | void;
+}) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsState, setProjectsState] = useState<LoadState>("loading");
   const [projectsError, setProjectsError] = useState("");
@@ -34,6 +45,7 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
   const [filesReloadKey, setFilesReloadKey] = useState(0);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [section, setSection] = useState<"projects" | "admin">("projects");
   const fileRequestRef = useRef(0);
   const workspaceFocusRef = useRef<HTMLElement>(null);
   const uploadFocusRef = useRef<HTMLElement>(null);
@@ -51,7 +63,7 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
       setProjectsState("ready");
     }).catch((reason: unknown) => {
       if (reason instanceof DOMException && reason.name === "AbortError") return;
-      setProjectsError(safeMessage(reason, "Projects could not be loaded. Please try again."));
+      setProjectsError(safeMessage(reason, "프로젝트를 불러오지 못했습니다. 다시 시도해주세요."));
       setProjectsState("error");
     });
 
@@ -69,7 +81,7 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
       setFilesState("ready");
     }).catch((reason: unknown) => {
       if (controller.signal.aborted || fileRequestRef.current !== requestId) return;
-      setFilesError(safeMessage(reason, "Files could not be loaded. Please try again."));
+      setFilesError(safeMessage(reason, "파일을 불러오지 못했습니다. 다시 시도해주세요."));
       setFilesState("error");
     });
 
@@ -112,7 +124,11 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
       <div aria-hidden={dialogOpen ? "true" : undefined}>
         <AppShell
           onCreateProject={() => setDialogOpen(true)}
+          currentUser={currentUser}
+          onLogout={() => { void onLogout?.(); }}
+          onOpenAdmin={() => setSection("admin")}
           onOpenUploads={() => {
+            setSection("projects");
             const panel = uploadFocusRef.current;
             if (!panel) return;
             panel.focus({ preventScroll: true });
@@ -120,13 +136,16 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
               window.matchMedia("(prefers-reduced-motion: reduce)").matches;
             panel.scrollIntoView?.({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
           }}
-          onSelectProject={selectProject}
+          onSelectProject={(projectId) => { setSection("projects"); selectProject(projectId); }}
           projects={projects}
           selectedProjectId={selectedProjectId}
-          showCreateAction={projectsState === "ready" && projects.length > 0}
+          showCreateAction={section === "projects" && projectsState === "ready" && projects.length > 0}
         >
+        {section === "admin" && currentUser?.role === "admin" ? <AdminPanel currentUser={currentUser} /> : null}
+
+        {section === "projects" ? <>
         {projectsState === "loading" ? (
-          <section aria-label="Loading projects" className="loading-state" role="status">
+          <section aria-label="프로젝트 불러오는 중" className="loading-state" role="status">
             <span className="skeleton skeleton--title" />
             <span className="skeleton skeleton--line" />
             <span className="skeleton skeleton--panel" />
@@ -136,7 +155,7 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
         {projectsState === "error" ? (
           <section className="message-state message-state--error">
             <div aria-live="assertive" role="alert">
-              <h1>Projects unavailable</h1>
+              <h1>프로젝트를 불러오지 못했습니다</h1>
               <p>{projectsError}</p>
             </div>
             <button className="button button--secondary" onClick={() => {
@@ -144,7 +163,7 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
               setProjectsError("");
               setReloadKey((key) => key + 1);
             }} type="button">
-              <RefreshCw aria-hidden="true" size={17} />Try again
+              <RefreshCw aria-hidden="true" size={17} />다시 시도
             </button>
           </section>
         ) : null}
@@ -161,10 +180,10 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
             tabIndex={-1}
           >
             <header className="project-workspace__header">
-              <p className="eyebrow">Project</p>
+              <p className="eyebrow">프로젝트</p>
               <h1 id="project-title">{selectedProject.name}</h1>
               <p className="project-workspace__summary">
-                {filesState === "loading" ? "Loading file summary…" : filesState === "error" ? "File summary unavailable" : formatFileSummary(files)}
+                {filesState === "loading" ? "파일 정보 불러오는 중…" : filesState === "error" ? "파일 정보를 불러오지 못했습니다" : formatFileSummary(files)}
               </p>
             </header>
 
@@ -182,6 +201,7 @@ export default function App({ client = api, uploader = uploadFile }: { client?: 
             />
           </section>
         ) : null}
+        </> : null}
         </AppShell>
       </div>
 

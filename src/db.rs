@@ -375,6 +375,10 @@ pub struct Database {
 }
 
 impl Database {
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     async fn upload_transition_error(&self, id: Uuid) -> DbError {
         match self.get_upload(id).await {
             Ok(None) => DbError::NotFound,
@@ -641,8 +645,12 @@ mod tests {
         assert_eq!(
             objects,
             BTreeSet::from([
+                ("index".to_owned(), "app_session_expiry_idx".to_owned()),
+                ("index".to_owned(), "app_session_user_idx".to_owned()),
                 ("index".to_owned(), "upload_session_project_idx".to_owned()),
                 ("index".to_owned(), "upload_session_state_idx".to_owned()),
+                ("table".to_owned(), "app_session".to_owned()),
+                ("table".to_owned(), "app_user".to_owned()),
                 ("table".to_owned(), "project".to_owned()),
                 ("table".to_owned(), "upload_session".to_owned()),
             ])

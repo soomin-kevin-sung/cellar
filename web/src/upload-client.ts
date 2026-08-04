@@ -16,7 +16,7 @@ export class UploadError extends Error {
   }
 }
 
-const FALLBACK_MESSAGE = "The file could not be uploaded. Please try again.";
+const FALLBACK_MESSAGE = "파일을 업로드하지 못했습니다. 다시 시도해주세요.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

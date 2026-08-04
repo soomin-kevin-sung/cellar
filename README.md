@@ -1,5 +1,34 @@
 # Cellar
 
+## 무료 임시 주소로 실행 (Windows)
+
+릴리스 빌드 후 저장소 루트에서 다음 한 줄로 실행합니다.
+
+```powershell
+.\cellar.ps1
+```
+
+처음 실행할 때 `cloudflared`가 없으면 공식 휴대용 실행 파일을 사용자 폴더에 자동 설치하고 SHA-256을 검증합니다. 관리자 권한은 필요하지 않습니다. 실행이 끝나면 콘솔에 매번 새로 발급된 `trycloudflare.com` 주소와 최초 관리자 암호가 표시됩니다. 사용자 이름은 `cellar`입니다. 최초 로그인 후 계정은 SQLite에 유지되며, 이후에는 웹 관리자 화면에서 다른 사용자 계정을 관리합니다. `Ctrl+C`로 Cellar와 터널을 함께 종료합니다.
+
+Quick Tunnel은 도메인과 Cloudflare 계정 없이 무료로 쓸 수 있지만, 주소가 실행할 때마다 바뀌며 Cloudflare가 개발 및 테스트 용도로만 제공합니다. 중요한 파일은 별도로 백업하고 장기 공개 서비스 용도로 사용하지 마세요.
+
+### Vercel 고정 진입 주소
+
+Vercel 계정에 한 번 로그인한 뒤 프로젝트 이름을 지정하면, Cellar가 시작될 때마다 고정 Vercel 주소의 임시 리다이렉트를 새 Quick Tunnel 주소로 자동 갱신합니다. Vercel은 파일을 중계하지 않습니다.
+
+```powershell
+npx vercel login
+.\cellar.ps1 -VercelProject cellar-entry
+```
+
+프로젝트 이름을 매번 입력하지 않으려면 사용자 환경 변수로 저장할 수 있습니다.
+
+```powershell
+[Environment]::SetEnvironmentVariable('CELLAR_VERCEL_PROJECT', 'cellar-entry', 'User')
+```
+
+Vercel 배포가 실패해도 Quick Tunnel과 Cellar는 계속 실행되며 콘솔에 임시 주소가 표시됩니다.
+
 Cellar is a Windows-first, single-owner file hub. A Rust server stores files and
 SQLite metadata on one local NTFS volume, serves an embedded React application,
 and accepts remote traffic through a separately managed Cloudflare Tunnel and

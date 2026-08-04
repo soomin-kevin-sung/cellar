@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 use uuid::{Uuid, Version};
 
 use crate::{
+    accounts::{self, AccountService},
     auth::{AccessFailure, AccessVerifier},
     config::CanonicalOrigin,
     db::Database,
@@ -61,8 +62,12 @@ pub fn with_request_ids(router: Router) -> Router {
 }
 
 #[derive(Clone)]
-struct ApiSecurityState {
+struct AccessSecurityState {
     verifier: Arc<dyn AccessVerifier>,
+}
+
+#[derive(Clone)]
+struct OriginSecurityState {
     external_origin: Arc<str>,
 }
 
@@ -121,8 +126,8 @@ pub fn secure_api_router(
     verifier: Arc<dyn AccessVerifier>,
     external_origin: &CanonicalOrigin,
 ) -> Router {
-    let state = ApiSecurityState {
-        verifier,
+    let access_state = AccessSecurityState { verifier };
+    let origin_state = OriginSecurityState {
         external_origin: Arc::from(external_origin.as_str()),
     };
     let trace = TraceLayer::new_for_http()
@@ -146,11 +151,45 @@ pub fn secure_api_router(
 
     let secured = router
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            origin_state,
             origin_middleware,
         ))
-        .layer(middleware::from_fn_with_state(state, access_middleware))
+        .layer(middleware::from_fn_with_state(
+            access_state,
+            access_middleware,
+        ))
         .layer(trace);
+    with_request_ids(secured)
+}
+
+fn quick_api_router(router: Router, external_origin: &CanonicalOrigin) -> Router {
+    let origin_state = OriginSecurityState {
+        external_origin: Arc::from(external_origin.as_str()),
+    };
+    let secured = router.layer(middleware::from_fn_with_state(
+        origin_state,
+        origin_middleware,
+    ));
+    with_request_ids(secured)
+}
+
+fn session_api_router(
+    router: Router,
+    accounts: AccountService,
+    external_origin: &CanonicalOrigin,
+) -> Router {
+    let origin_state = OriginSecurityState {
+        external_origin: Arc::from(external_origin.as_str()),
+    };
+    let secured = router
+        .layer(middleware::from_fn_with_state(
+            origin_state,
+            origin_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            accounts,
+            accounts::session_middleware,
+        ));
     with_request_ids(secured)
 }
 
@@ -197,6 +236,45 @@ pub fn build_cellar_app(
     ))
 }
 
+/// Builds the application for a temporary Quick Tunnel with application
+/// accounts and secure cookie-backed sessions.
+pub fn build_cellar_quick_app(
+    database: Arc<Database>,
+    storage: Arc<Storage>,
+    external_origin: &CanonicalOrigin,
+    bootstrap_password: &str,
+) -> Result<Router, WebBuildError> {
+    let accounts = AccountService::new(database.clone(), Arc::<str>::from(bootstrap_password));
+    let projects = project_router(ProjectService::new(database.clone(), storage.clone()));
+    let uploads = upload_router(UploadService::new(database.clone(), storage.clone()));
+    let files = file_router(FileService::new(database, storage));
+    let public_auth = quick_api_router(accounts::public_router(accounts.clone()), external_origin);
+    let api = session_api_router(
+        projects
+            .merge(uploads)
+            .merge(files)
+            .merge(accounts::protected_router(accounts.clone())),
+        accounts.clone(),
+        external_origin,
+    );
+    let api_fallback = session_api_router(
+        Router::new()
+            .route("/api", any(api_not_found))
+            .route("/api/", any(api_not_found))
+            .route("/api/{*path}", any(api_not_found)),
+        accounts,
+        external_origin,
+    );
+
+    Ok(with_security_headers(
+        Router::new()
+            .merge(public_auth)
+            .merge(api)
+            .merge(api_fallback)
+            .merge(web_router()?),
+    ))
+}
+
 fn build_cellar_app_with_web(
     web: Router,
     database: Arc<Database>,
@@ -231,7 +309,7 @@ pub fn secure_upload_api_router(
 }
 
 async fn access_middleware(
-    State(state): State<ApiSecurityState>,
+    State(state): State<AccessSecurityState>,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -276,7 +354,7 @@ async fn access_middleware(
 }
 
 async fn origin_middleware(
-    State(state): State<ApiSecurityState>,
+    State(state): State<OriginSecurityState>,
     request: Request,
     next: Next,
 ) -> Response {

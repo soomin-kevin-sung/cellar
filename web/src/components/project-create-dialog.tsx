@@ -13,9 +13,9 @@ interface ProjectCreateDialogProps {
 
 function validateProjectName(value: string): string | null {
   const normalized = value.trim();
-  if (normalized.length === 0) return "Enter a project name.";
-  if ([...normalized].length > 100) return "Use 100 characters or fewer.";
-  if (/\p{Cc}/u.test(normalized)) return "Project names cannot contain control characters.";
+  if (normalized.length === 0) return "프로젝트 이름을 입력해주세요.";
+  if ([...normalized].length > 100) return "100자 이하로 입력해주세요.";
+  if (/\p{Cc}/u.test(normalized)) return "제어 문자는 사용할 수 없습니다.";
   return null;
 }
 
@@ -96,7 +96,7 @@ export function ProjectCreateDialog({ fallbackFocusRef, open, onClose, onCreate 
       submittingRef.current = false;
       onClose();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Project creation failed. Please try again.");
+      setError(reason instanceof Error ? reason.message : "프로젝트를 만들지 못했습니다. 다시 시도해주세요.");
       submittingRef.current = false;
       setPending(false);
       inputRef.current?.focus();
@@ -116,16 +116,16 @@ export function ProjectCreateDialog({ fallbackFocusRef, open, onClose, onCreate 
       <form className="dialog__surface" onSubmit={handleSubmit}>
         <div className="dialog__header">
           <div>
-            <p className="eyebrow">New workspace</p>
-            <h2 id="create-project-title">Create project</h2>
+            <p className="eyebrow">새 프로젝트</p>
+            <h2 id="create-project-title">프로젝트 만들기</h2>
           </div>
-          <button className="icon-button" disabled={pending} onClick={close} type="button" aria-label="Close dialog">
+          <button className="icon-button" disabled={pending} onClick={close} type="button" aria-label="닫기">
             <X aria-hidden="true" size={19} />
           </button>
         </div>
 
         <div className="field">
-          <label htmlFor="project-name">Project name</label>
+          <label htmlFor="project-name">프로젝트 이름</label>
           <input
             aria-describedby="project-name-hint"
             autoComplete="off"
@@ -136,14 +136,14 @@ export function ProjectCreateDialog({ fallbackFocusRef, open, onClose, onCreate 
             ref={inputRef}
             value={name}
           />
-          <p id="project-name-hint">Use a clear name for the files you’ll keep together.</p>
+          <p id="project-name-hint">함께 보관할 파일을 알아보기 쉬운 이름을 사용하세요.</p>
           {error ? <p className="field__error" role="alert">{error}</p> : null}
         </div>
 
         <div className="dialog__actions">
-          <button className="button button--secondary" disabled={pending} onClick={close} type="button">Cancel</button>
+          <button className="button button--secondary" disabled={pending} onClick={close} type="button">취소</button>
           <button className="button button--primary" disabled={pending} type="submit">
-            {pending ? "Creating project" : "Create project"}
+            {pending ? "만드는 중…" : "프로젝트 만들기"}
           </button>
         </div>
       </form>
