@@ -9,6 +9,7 @@ use axum::{
     http::{HeaderName, HeaderValue, Method, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
+    routing::any,
 };
 use tower_http::trace::TraceLayer;
 use uuid::{Uuid, Version};
@@ -22,6 +23,7 @@ use crate::{
     projects::{ProjectService, project_router},
     storage::Storage,
     uploads::{UploadService, upload_router},
+    web::{WebBuildError, web_router, with_security_headers},
 };
 
 pub const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
@@ -178,6 +180,46 @@ pub fn secure_cellar_api_router(
     )
 }
 
+/// Builds the complete production application: a public embedded SPA and a
+/// Cloudflare Access-protected API, including a JSON-only API fallback.
+pub fn build_cellar_app(
+    database: Arc<Database>,
+    storage: Arc<Storage>,
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: &CanonicalOrigin,
+) -> Result<Router, WebBuildError> {
+    Ok(build_cellar_app_with_web(
+        web_router()?,
+        database,
+        storage,
+        verifier,
+        external_origin,
+    ))
+}
+
+fn build_cellar_app_with_web(
+    web: Router,
+    database: Arc<Database>,
+    storage: Arc<Storage>,
+    verifier: Arc<dyn AccessVerifier>,
+    external_origin: &CanonicalOrigin,
+) -> Router {
+    let api = secure_cellar_api_router(database, storage, verifier.clone(), external_origin);
+    let api_fallback = secure_api_router(
+        Router::new()
+            .route("/api", any(api_not_found))
+            .route("/api/{*path}", any(api_not_found)),
+        verifier,
+        external_origin,
+    );
+
+    with_security_headers(Router::new().merge(api).merge(api_fallback).merge(web))
+}
+
+async fn api_not_found(axum::Extension(request_id): axum::Extension<RequestId>) -> AppError {
+    AppError::not_found(request_id, "api_not_found", "The API route was not found.")
+}
+
 /// Secures an upload router assembled with injected service dependencies.
 pub fn secure_upload_api_router(
     service: UploadService,
@@ -272,20 +314,277 @@ async fn request_id_middleware(mut request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin, sync::Arc};
+
     use axum::{
         Extension, Router,
         body::{Body, to_bytes},
-        http::{Request, StatusCode, header::HeaderName},
+        http::{Method, Request, StatusCode, header, header::HeaderName},
         routing::get,
     };
-    use serde_json::Value;
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
     use tower::ServiceExt;
     use uuid::{Uuid, Version};
 
-    use super::{RequestId, X_REQUEST_ID, with_request_ids};
-    use crate::{auth::AccessFailure, error::AppError};
+    use super::{RequestId, X_REQUEST_ID, build_cellar_app_with_web, with_request_ids};
+    use crate::{
+        auth::{AccessError, AccessFailure, AccessVerifier, OwnerIdentity},
+        config::Config,
+        db::Database,
+        error::AppError,
+        storage::Storage,
+    };
 
     use super::{RejectionReason, rejection_reason};
+
+    #[derive(Clone)]
+    struct FakeAccessVerifier;
+
+    impl AccessVerifier for FakeAccessVerifier {
+        fn verify<'a>(
+            &'a self,
+            assertion: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<OwnerIdentity, AccessError>> + Send + 'a>> {
+            Box::pin(async move {
+                if assertion == "valid" {
+                    OwnerIdentity::try_from_email("owner@example.com")
+                } else {
+                    Err(AccessError::unauthenticated())
+                }
+            })
+        }
+    }
+
+    struct AppFixture {
+        _temp: TempDir,
+        database: Database,
+        app: Router,
+    }
+
+    impl AppFixture {
+        async fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let storage = Arc::new(Storage::new(root.clone()).unwrap());
+            storage.initialize().await.unwrap();
+            let database = Database::open(root.join(".cellar/cellar.db"))
+                .await
+                .unwrap();
+            let config = Config::parse(&format!(
+                r#"bind = "127.0.0.1:8787"
+external_origin = "https://files.example.com"
+data_root = "{}"
+database_path = "{}"
+
+[access]
+team_domain = "https://example.cloudflareaccess.com"
+audience = "audience"
+owner_email = "owner@example.com"
+"#,
+                root.to_string_lossy().replace('\\', "/"),
+                root.join(".cellar/cellar.db")
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            ))
+            .unwrap();
+            let web = Router::new().route("/", get(|| async { "fixture index" }));
+            let app = build_cellar_app_with_web(
+                web,
+                Arc::new(database.clone()),
+                storage,
+                Arc::new(FakeAccessVerifier),
+                config.external_origin(),
+            );
+            Self {
+                _temp: temp,
+                database,
+                app,
+            }
+        }
+    }
+
+    fn api_request(method: Method, uri: &str) -> http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Cf-Access-Jwt-Assertion", "valid")
+    }
+
+    fn assert_security_headers(response: &axum::response::Response) {
+        assert_eq!(
+            response.headers()[header::CONTENT_SECURITY_POLICY],
+            "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src 'self'; script-src 'self'; style-src 'self'"
+        );
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+    }
+
+    #[tokio::test]
+    async fn production_composition_keeps_web_public_and_known_api_secured() {
+        let fixture = AppFixture::new().await;
+        let root = fixture
+            .app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::OK);
+        assert_security_headers(&root);
+
+        let unauthenticated = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_security_headers(&unauthenticated);
+
+        let no_origin_get = fixture
+            .app
+            .clone()
+            .oneshot(
+                api_request(Method::GET, "/api/v1/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_origin_get.status(), StatusCode::OK);
+
+        fixture.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn production_composition_enforces_exact_origin_on_known_writes() {
+        let fixture = AppFixture::new().await;
+        for origin in [
+            None,
+            Some("https://evil.example"),
+            Some("https://files.example.com/"),
+        ] {
+            let mut request = api_request(Method::POST, "/api/v1/projects")
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(request.body(Body::from(r#"{"name":"Project"}"#)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_security_headers(&response);
+        }
+
+        let accepted = fixture
+            .app
+            .clone()
+            .oneshot(
+                api_request(Method::POST, "/api/v1/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ORIGIN, "https://files.example.com")
+                    .body(Body::from(r#"{"name":"Project"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        fixture.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_api_is_secured_json_with_matching_request_id_never_spa() {
+        let fixture = AppFixture::new().await;
+        let unauthenticated = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/not-real")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                api_request(Method::GET, "/api/not-real")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_security_headers(&response);
+        let request_id = response.headers()[&X_REQUEST_ID]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body,
+            json!({"error": {
+                "code": "api_not_found",
+                "message": "The API route was not found.",
+                "requestId": request_id,
+            }})
+        );
+        fixture.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn authenticated_unknown_api_unsafe_methods_require_origin_before_json_not_found() {
+        let fixture = AppFixture::new().await;
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let rejected = fixture
+                .app
+                .clone()
+                .oneshot(
+                    api_request(method.clone(), "/api/v2/not-real")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+            assert_security_headers(&rejected);
+
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(
+                    api_request(method, "/api/v2/not-real")
+                        .header(header::ORIGIN, "https://files.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert!(response.headers().contains_key(&X_REQUEST_ID));
+            assert_security_headers(&response);
+        }
+        fixture.database.close().await;
+    }
 
     #[test]
     fn authentication_log_reasons_are_closed_safe_literals() {
