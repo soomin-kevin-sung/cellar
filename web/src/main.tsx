@@ -1,13 +1,12 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
-import App from "./App";
-import "./styles/globals.css";
-import "./styles/dashboard.css";
+import App from "./app";
+import "./styles.css";
 
 const root = document.getElementById("root");
 
-if (!root) throw new Error("Cellar root element is missing.");
+if (!root) throw new Error("Application root element is missing.");
 
 createRoot(root).render(
   <StrictMode>
