@@ -13,6 +13,7 @@ use cellar::{
     auth::{AccessVerifier, CloudflareAccessVerifier},
     config::Config,
     db::Database,
+    projects::audit_orphan_project_directories,
     storage::Storage,
     uploads::UploadService,
 };
@@ -56,6 +57,11 @@ trait StartupSteps {
         &'a mut self,
         config: &'a Self::Config,
     ) -> StartupFuture<'a, Self::Database>;
+    fn audit_projects<'a>(
+        &'a mut self,
+        database: &'a Self::Database,
+        storage: &'a Self::Storage,
+    ) -> StartupFuture<'a, ()>;
     fn construct_uploads(
         &mut self,
         database: &Self::Database,
@@ -82,6 +88,7 @@ async fn run_startup<S: StartupSteps>(steps: &mut S) -> Result<(), StartupError>
     steps.init_logging()?;
     let storage = steps.init_storage(&config).await?;
     let database = steps.open_database(&config).await?;
+    steps.audit_projects(&database, &storage).await?;
     let uploads = steps.construct_uploads(&database, &storage)?;
     steps.recover_uploads(&uploads).await?;
     let verifier = steps.construct_verifier(&config)?;
@@ -165,6 +172,18 @@ impl StartupSteps for RuntimeStartup {
         storage: &Self::Storage,
     ) -> Result<Self::Uploads, StartupError> {
         Ok(UploadService::new(database.clone(), storage.clone()))
+    }
+
+    fn audit_projects<'a>(
+        &'a mut self,
+        database: &'a Self::Database,
+        storage: &'a Self::Storage,
+    ) -> StartupFuture<'a, ()> {
+        Box::pin(async move {
+            audit_orphan_project_directories(database.as_ref(), storage.as_ref())
+                .await
+                .map_err(|_| StartupError::new("project_audit_failed"))
+        })
     }
 
     fn recover_uploads<'a>(&'a mut self, uploads: &'a Self::Uploads) -> StartupFuture<'a, ()> {
@@ -507,6 +526,14 @@ mod tests {
             self.record("uploads")
         }
 
+        fn audit_projects<'a>(
+            &'a mut self,
+            _database: &'a Self::Database,
+            _storage: &'a Self::Storage,
+        ) -> StartupFuture<'a, ()> {
+            Box::pin(async move { self.record("audit") })
+        }
+
         fn recover_uploads<'a>(&'a mut self, _uploads: &'a Self::Uploads) -> StartupFuture<'a, ()> {
             Box::pin(async move { self.record("recovery") })
         }
@@ -549,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_runs_in_strict_recovery_before_bind_order() {
+    async fn startup_runs_project_audit_after_database_and_before_recovery_and_bind() {
         let mut steps = FakeSteps::new(None);
         run_startup(&mut steps).await.unwrap();
         assert_eq!(
@@ -560,6 +587,7 @@ mod tests {
                 "logging",
                 "storage",
                 "database",
+                "audit",
                 "uploads",
                 "recovery",
                 "verifier",
@@ -586,8 +614,20 @@ mod tests {
                     "logging",
                     "storage",
                     "database",
+                    "audit",
                     "uploads",
                     "recovery",
+                ],
+            ),
+            (
+                "audit",
+                vec![
+                    "config_path",
+                    "config",
+                    "logging",
+                    "storage",
+                    "database",
+                    "audit",
                 ],
             ),
             (
@@ -598,6 +638,7 @@ mod tests {
                     "logging",
                     "storage",
                     "database",
+                    "audit",
                     "uploads",
                     "recovery",
                     "verifier",

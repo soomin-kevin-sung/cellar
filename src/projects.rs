@@ -1,6 +1,6 @@
 //! Project creation and listing.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc};
 
 use axum::{
     Extension, Json, Router,
@@ -9,6 +9,7 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
@@ -118,6 +119,46 @@ impl ProjectService {
             ProjectServiceError::ListFailed
         })
     }
+}
+
+/// A closed startup failure from comparing committed projects with managed storage.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum ProjectAuditError {
+    #[error("project audit database query failed")]
+    Database,
+    #[error("project audit found unsafe managed storage")]
+    Storage,
+}
+
+/// Reports safe, well-formed project directories that have no committed database row.
+///
+/// This audit is intentionally read-only: it never imports, removes, or repairs entries.
+pub async fn audit_orphan_project_directories(
+    database: &Database,
+    storage: &Storage,
+) -> Result<(), ProjectAuditError> {
+    let committed = database
+        .list_projects()
+        .await
+        .map_err(|_| ProjectAuditError::Database)?
+        .into_iter()
+        .map(|project| project.id())
+        .collect::<HashSet<_>>();
+    let project_directories = storage
+        .scan_project_directories()
+        .await
+        .map_err(|_| ProjectAuditError::Storage)?;
+
+    for project_id in project_directories {
+        if !committed.contains(&project_id) {
+            tracing::warn!(
+                reason = "orphan_project_directory",
+                project_id = %project_id,
+                "unreferenced project directory requires manual cleanup"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn create_owned(

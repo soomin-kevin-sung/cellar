@@ -389,6 +389,32 @@ impl Storage {
         fs::remove_dir(&project_dir).await.map_err(map_io)
     }
 
+    /// Returns canonical UUID project directories that have Cellar's exact safe layout.
+    ///
+    /// Non-project names are ignored without traversal. A canonical UUID entry with an
+    /// unexpected shape is managed-state corruption and stops the scan without changing it.
+    pub async fn scan_project_directories(&self) -> Result<Vec<Uuid>, StorageError> {
+        let _guard = self.mutation_lock.lock().await;
+        self.require_projects_dir().await?;
+        let mut directory = fs::read_dir(self.projects_dir()).await.map_err(map_io)?;
+        let mut project_ids = Vec::new();
+        while let Some(entry) = directory.next_entry().await.map_err(map_io)? {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(project_id) = Uuid::parse_str(&name) else {
+                continue;
+            };
+            if project_id.to_string() != name {
+                continue;
+            }
+            require_safe_project_shape(&entry.path()).await?;
+            project_ids.push(project_id);
+        }
+        project_ids.sort_unstable();
+        Ok(project_ids)
+    }
+
     pub async fn create_staging(&self, upload_id: Uuid) -> Result<(), StorageError> {
         let _guard = self.mutation_lock.lock().await;
         self.require_uploads_dir().await?;
@@ -791,6 +817,20 @@ async fn require_safe_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+async fn require_safe_project_shape(project_dir: &Path) -> Result<(), StorageError> {
+    require_safe_directory(project_dir).await?;
+    let mut entries = fs::read_dir(project_dir).await.map_err(map_io)?;
+    let Some(entry) = entries.next_entry().await.map_err(map_io)? else {
+        return Err(StorageError::UnsafeManagedEntry);
+    };
+    if entry.file_name() != "files" || entries.next_entry().await.map_err(map_io)?.is_some() {
+        return Err(StorageError::UnsafeManagedEntry);
+    }
+    require_safe_directory(&entry.path())
+        .await
+        .map_err(|_| StorageError::UnsafeManagedEntry)
+}
+
 #[cfg(windows)]
 fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -1018,6 +1058,86 @@ mod tests {
             storage.create_project_dir(project_id).await,
             Err(StorageError::AlreadyExists)
         ));
+    }
+
+    #[tokio::test]
+    async fn project_directory_scan_returns_only_immediate_canonical_safe_uuid_layouts() {
+        let temp = tempdir().unwrap();
+        let root = existing_root(&temp);
+        let storage = Storage::new(root.clone()).unwrap();
+        storage.initialize().await.unwrap();
+        let first = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000010").unwrap();
+        let second = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000011").unwrap();
+        storage.create_project_dir(second).await.unwrap();
+        storage.create_project_dir(first).await.unwrap();
+        std::fs::create_dir(root.join("projects").join("not-a-project")).unwrap();
+        for noncanonical in [
+            "018F1010-7B2A-7000-8000-000000000013",
+            "018f10107b2a70008000000000000014",
+        ] {
+            let directory = root.join("projects").join(noncanonical);
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::create_dir(directory.join("files")).unwrap();
+        }
+        std::fs::create_dir(
+            root.join("projects")
+                .join(first.to_string())
+                .join("files")
+                .join("nested-uuid-does-not-count"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage.scan_project_directories().await.unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[tokio::test]
+    async fn project_directory_scan_rejects_canonical_uuid_with_unexpected_or_unsafe_shape() {
+        for mutation in [
+            "missing_files",
+            "extra_entry",
+            "linked_files",
+            "linked_project",
+        ] {
+            let temp = tempdir().unwrap();
+            let root = existing_root(&temp);
+            let storage = Storage::new(root.clone()).unwrap();
+            storage.initialize().await.unwrap();
+            let project_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000012").unwrap();
+            storage.create_project_dir(project_id).await.unwrap();
+            let project = root.join("projects").join(project_id.to_string());
+            match mutation {
+                "missing_files" => std::fs::remove_dir(project.join("files")).unwrap(),
+                "extra_entry" => std::fs::write(project.join("unexpected"), b"unsafe").unwrap(),
+                "linked_files" => {
+                    std::fs::remove_dir(project.join("files")).unwrap();
+                    let target = temp.path().join("outside");
+                    std::fs::create_dir(&target).unwrap();
+                    if !try_symlink_dir(&target, &project.join("files")) {
+                        continue;
+                    }
+                }
+                "linked_project" => {
+                    std::fs::remove_dir(project.join("files")).unwrap();
+                    std::fs::remove_dir(&project).unwrap();
+                    let target = temp.path().join("outside");
+                    std::fs::create_dir(&target).unwrap();
+                    std::fs::create_dir(target.join("files")).unwrap();
+                    if !try_symlink_dir(&target, &project) {
+                        continue;
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(matches!(
+                storage.scan_project_directories().await,
+                Err(StorageError::UnsafeManagedEntry)
+            ));
+            assert!(project.exists(), "audit must preserve {mutation}");
+        }
     }
 
     #[tokio::test]
