@@ -1,6 +1,14 @@
 //! Single-request project file uploads.
 
-use std::{future::Future, io, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use axum::{
     Extension, Json, Router,
@@ -144,11 +152,13 @@ impl UploadService {
         let cancellation = UploadCancellation::new();
         let reader = cancellation_aware_reader(body, cancellation.subscribe());
         let operation_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let staging_owned = Arc::new(AtomicBool::new(false));
         let mut waiter = UploadWaiterCleanup::new(
             storage.clone(),
             upload_id,
             cancellation.clone(),
             operation_gate.clone(),
+            staging_owned.clone(),
         );
         let request_id = request_id.clone();
         let worker_gate = operation_gate.clone();
@@ -164,6 +174,7 @@ impl UploadService {
                 request_id,
                 cancellation: worker_cancellation,
                 operation_gate,
+                staging_owned,
             }
             .run()
             .await
@@ -187,6 +198,7 @@ struct OwnedUploadOperation {
     request_id: RequestId,
     cancellation: UploadCancellation,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
+    staging_owned: Arc<AtomicBool>,
 }
 
 impl OwnedUploadOperation {
@@ -200,15 +212,21 @@ impl OwnedUploadOperation {
             request_id,
             cancellation,
             operation_gate,
+            staging_owned,
         } = self;
         if cancellation.is_cancelled() {
             return Err(UploadServiceError::InvalidRequest);
         }
-        let mut cleanup = StagingCleanup::new(storage.clone(), upload_id, operation_gate);
         if let Err(error) = storage.create_staging(upload_id).await {
-            cleanup.disarm();
             return Err(map_internal_storage_error(&error));
         }
+        staging_owned.store(true, Ordering::Release);
+        let mut cleanup = StagingCleanup::new(
+            storage.clone(),
+            upload_id,
+            operation_gate,
+            staging_owned.clone(),
+        );
         if cancellation.is_cancelled() {
             return Err(cleanup_result(
                 &mut cleanup,
@@ -270,6 +288,7 @@ impl OwnedUploadOperation {
             return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
         }
 
+        staging_owned.store(false, Ordering::Release);
         cleanup.disarm();
         Ok(UploadResponse {
             name: name.as_str().to_owned(),
@@ -367,6 +386,7 @@ struct StagingCleanup {
     storage: Arc<dyn UploadStorage>,
     upload_id: Uuid,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
+    staging_owned: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -375,18 +395,25 @@ impl StagingCleanup {
         storage: Arc<dyn UploadStorage>,
         upload_id: Uuid,
         operation_gate: Arc<tokio::sync::Mutex<()>>,
+        staging_owned: Arc<AtomicBool>,
     ) -> Self {
         Self {
             storage,
             upload_id,
             operation_gate,
+            staging_owned,
             armed: true,
         }
     }
 
     async fn cleanup(&mut self) -> Result<(), StorageError> {
+        if !self.staging_owned.load(Ordering::Acquire) {
+            self.disarm();
+            return Ok(());
+        }
         match self.storage.remove_staging(self.upload_id).await {
             Ok(()) => {
+                self.staging_owned.store(false, Ordering::Release);
                 self.disarm();
                 Ok(())
             }
@@ -407,10 +434,16 @@ impl Drop for StagingCleanup {
         let storage = self.storage.clone();
         let upload_id = self.upload_id;
         let operation_gate = self.operation_gate.clone();
+        let staging_owned = self.staging_owned.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _guard = operation_gate.lock().await;
-                if storage.remove_staging(upload_id).await.is_err() {
+                if !staging_owned.load(Ordering::Acquire) {
+                    return;
+                }
+                if storage.remove_staging(upload_id).await.is_ok() {
+                    staging_owned.store(false, Ordering::Release);
+                } else {
                     tracing::warn!(upload_id = %upload_id, "staging cleanup retry failed");
                 }
             });
@@ -423,6 +456,7 @@ struct UploadWaiterCleanup {
     upload_id: Uuid,
     cancellation: UploadCancellation,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
+    staging_owned: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -432,12 +466,14 @@ impl UploadWaiterCleanup {
         upload_id: Uuid,
         cancellation: UploadCancellation,
         operation_gate: Arc<tokio::sync::Mutex<()>>,
+        staging_owned: Arc<AtomicBool>,
     ) -> Self {
         Self {
             storage,
             upload_id,
             cancellation,
             operation_gate,
+            staging_owned,
             armed: true,
         }
     }
@@ -456,10 +492,16 @@ impl Drop for UploadWaiterCleanup {
         let storage = self.storage.clone();
         let upload_id = self.upload_id;
         let operation_gate = self.operation_gate.clone();
+        let staging_owned = self.staging_owned.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let _guard = operation_gate.lock().await;
-                if storage.remove_staging(upload_id).await.is_err() {
+                if !staging_owned.load(Ordering::Acquire) {
+                    return;
+                }
+                if storage.remove_staging(upload_id).await.is_ok() {
+                    staging_owned.store(false, Ordering::Release);
+                } else {
                     tracing::warn!(upload_id = %upload_id, "waiter cleanup retry failed");
                 }
             });

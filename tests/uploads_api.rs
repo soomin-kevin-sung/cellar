@@ -2,7 +2,10 @@ mod common;
 
 use std::{
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
@@ -403,6 +406,127 @@ async fn staging_collision_is_storage_unavailable_not_destination_conflict() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(canonical_staging_files(&context).is_empty());
+    context.close().await;
+}
+
+struct PausedCollisionStorage {
+    storage: Arc<cellar::storage::Storage>,
+    collision_ready: Mutex<Option<tokio::sync::oneshot::Sender<Uuid>>>,
+    release: Arc<tokio::sync::Semaphore>,
+    returned: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    remove_called: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    remove_calls: Arc<AtomicUsize>,
+}
+
+impl UploadStorage for PausedCollisionStorage {
+    fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        let collision_ready = self.collision_ready.lock().unwrap().take();
+        let returned = self.returned.lock().unwrap().take();
+        Box::pin(async move {
+            self.storage.create_staging(upload_id).await?;
+            self.storage
+                .write_chunk(
+                    upload_id,
+                    0,
+                    std::io::Cursor::new(b"pre-existing-staging".to_vec()),
+                )
+                .await?;
+            if let Some(collision_ready) = collision_ready {
+                let _ = collision_ready.send(upload_id);
+            }
+            self.release.acquire().await.unwrap().forget();
+            if let Some(returned) = returned {
+                let _ = returned.send(());
+            }
+            Err(StorageError::AlreadyExists)
+        })
+    }
+
+    fn write_upload<'a>(&'a self, _: Uuid, _: UploadBodyReader) -> UploadStorageFuture<'a, u64> {
+        Box::pin(async { panic!("write must not follow staging collision") })
+    }
+
+    fn sync_staging<'a>(&'a self, _: Uuid) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async { panic!("sync must not follow staging collision") })
+    }
+
+    fn finalize_no_replace<'a>(
+        &'a self,
+        _: Uuid,
+        _: Uuid,
+        _: &'a SafeFileName,
+    ) -> UploadStorageFuture<'a, ()> {
+        Box::pin(async { panic!("finalization must not follow staging collision") })
+    }
+
+    fn remove_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
+        let remove_called = self.remove_called.lock().unwrap().take();
+        Box::pin(async move {
+            self.remove_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(remove_called) = remove_called {
+                let _ = remove_called.send(());
+            }
+            self.storage.remove_staging(upload_id).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn waiter_cancellation_never_removes_unowned_staging_collision() {
+    let context = TestContext::new().await;
+    let project_id = context.create_project("Reports").await;
+    let (collision_tx, collision_rx) = tokio::sync::oneshot::channel();
+    let (returned_tx, returned_rx) = tokio::sync::oneshot::channel();
+    let (remove_tx, remove_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let collision_storage = Arc::new(PausedCollisionStorage {
+        storage: context.storage.clone(),
+        collision_ready: Mutex::new(Some(collision_tx)),
+        release: release.clone(),
+        returned: Mutex::new(Some(returned_tx)),
+        remove_called: Mutex::new(Some(remove_tx)),
+        remove_calls: remove_calls.clone(),
+    });
+    let service = UploadService::new(
+        Arc::new(context.database.clone()),
+        collision_storage.clone(),
+    );
+    let request = tokio::spawn(context.secure_upload(service).oneshot(upload_request(
+        project_id,
+        "fileName=collision.bin",
+        Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>()),
+    )));
+    let upload_id = tokio::time::timeout(std::time::Duration::from_secs(2), collision_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let staging_path = context
+        .temp
+        .path()
+        .join(".cellar/uploads")
+        .join(format!("{upload_id}.part"));
+    assert_eq!(
+        std::fs::read(&staging_path).unwrap(),
+        b"pre-existing-staging"
+    );
+
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    release.add_permits(1);
+    returned_rx.await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), remove_rx)
+            .await
+            .is_err(),
+        "waiter cleanup attempted to remove staging it never owned"
+    );
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read(staging_path).unwrap(),
+        b"pre-existing-staging"
+    );
+    drop(collision_storage);
     context.close().await;
 }
 
