@@ -142,6 +142,7 @@ impl Error for InvalidFileName {}
 pub enum InvalidRootReason {
     NotAbsolute,
     ParentTraversal,
+    UnsupportedVolume,
 }
 
 pub enum StorageError {
@@ -336,6 +337,7 @@ impl Storage {
                 InvalidRootReason::ParentTraversal,
             ));
         }
+        validate_storage_volume(&data_root)?;
         Ok(Self {
             mutation_lock: mutation_lock_for(&data_root),
             root: data_root,
@@ -448,6 +450,33 @@ impl Storage {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(map_io(error)),
         }
+    }
+
+    /// Removes only Cellar-owned canonical UUID `.part` files left by an
+    /// interrupted process. Unrelated entries are ignored.
+    pub async fn cleanup_staging(&self) -> Result<(), StorageError> {
+        let _guard = self.mutation_lock.lock().await;
+        self.require_uploads_dir().await?;
+        let mut directory = fs::read_dir(self.uploads_dir()).await.map_err(map_io)?;
+        while let Some(entry) = directory.next_entry().await.map_err(map_io)? {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(raw_id) = name.strip_suffix(".part") else {
+                continue;
+            };
+            let Ok(upload_id) = Uuid::parse_str(raw_id) else {
+                continue;
+            };
+            if format!("{upload_id}.part") != name {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).await.map_err(map_io)?;
+            require_safe_regular_file_metadata(&metadata)
+                .map_err(|_| StorageError::UnsafeManagedEntry)?;
+            fs::remove_file(entry.path()).await.map_err(map_io)?;
+        }
+        Ok(())
     }
 
     /// Removes one exact UUID staging file only when it is a safe empty regular file.
@@ -741,7 +770,7 @@ async fn atomic_move_no_replace(source: PathBuf, destination: PathBuf) -> Result
     Err(StorageError::Io {
         source: io::Error::new(
             io::ErrorKind::Unsupported,
-            "atomic upload publication is unsupported on this platform",
+            "atomic upload publication is supported only on Windows",
         ),
     })
 }
@@ -832,6 +861,86 @@ async fn require_safe_project_shape(project_dir: &Path) -> Result<(), StorageErr
 }
 
 #[cfg(windows)]
+fn validate_storage_volume(path: &Path) -> Result<(), StorageError> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+    };
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut volume_path = vec![0u16; 32_768];
+    // SAFETY: `path` is NUL-terminated and both buffers remain live for the call.
+    if unsafe {
+        GetVolumePathNameW(
+            path.as_ptr(),
+            volume_path.as_mut_ptr(),
+            volume_path.len() as u32,
+        )
+    } == 0
+    {
+        return Err(StorageError::InvalidRoot(
+            InvalidRootReason::UnsupportedVolume,
+        ));
+    }
+    let Some(volume_end) = volume_path.iter().position(|unit| *unit == 0) else {
+        return Err(StorageError::InvalidRoot(
+            InvalidRootReason::UnsupportedVolume,
+        ));
+    };
+    volume_path.truncate(volume_end + 1);
+    // SAFETY: `volume_path` is the live NUL-terminated root returned above.
+    let drive_type = unsafe { GetDriveTypeW(volume_path.as_ptr()) };
+    let mut file_system = [0u16; 32];
+    // SAFETY: The root and output buffers are valid for the duration of the call;
+    // optional outputs are intentionally null.
+    if unsafe {
+        GetVolumeInformationW(
+            volume_path.as_ptr(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            file_system.as_mut_ptr(),
+            file_system.len() as u32,
+        )
+    } == 0
+    {
+        return Err(StorageError::InvalidRoot(
+            InvalidRootReason::UnsupportedVolume,
+        ));
+    }
+    let file_system_end = file_system
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(file_system.len());
+    let file_system = String::from_utf16_lossy(&file_system[..file_system_end]);
+    if windows_volume_is_supported(drive_type, &file_system) {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidRoot(
+            InvalidRootReason::UnsupportedVolume,
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn windows_volume_is_supported(drive_type: u32, file_system: &str) -> bool {
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
+
+    drive_type == DRIVE_FIXED && file_system.eq_ignore_ascii_case("NTFS")
+}
+
+#[cfg(not(windows))]
+fn validate_storage_volume(_path: &Path) -> Result<(), StorageError> {
+    Ok(())
+}
+
+#[cfg(windows)]
 fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
@@ -848,6 +957,21 @@ fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
 mod tests {
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_volume_contract_requires_fixed_ntfs() {
+        use windows_sys::Win32::System::WindowsProgramming::{
+            DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE,
+        };
+
+        assert!(windows_volume_is_supported(DRIVE_FIXED, "NTFS"));
+        assert!(windows_volume_is_supported(DRIVE_FIXED, "ntfs"));
+        assert!(!windows_volume_is_supported(DRIVE_REMOTE, "NTFS"));
+        assert!(!windows_volume_is_supported(DRIVE_REMOVABLE, "NTFS"));
+        assert!(!windows_volume_is_supported(DRIVE_FIXED, "ReFS"));
+        assert!(!windows_volume_is_supported(DRIVE_FIXED, "exFAT"));
+    }
 
     use super::*;
     use tempfile::{TempDir, tempdir};
@@ -1217,6 +1341,25 @@ mod tests {
         storage.remove_staging(upload_id).await.unwrap();
         storage.remove_staging(upload_id).await.unwrap();
         assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_removes_only_canonical_staging_files() {
+        let temp = tempdir().unwrap();
+        let root = existing_root(&temp);
+        let storage = Storage::new(root.clone()).unwrap();
+        storage.initialize().await.unwrap();
+        let upload_id = Uuid::parse_str("018f1010-7b2a-7000-8000-000000000203").unwrap();
+        let uploads = root.join(".cellar").join("uploads");
+        let owned = uploads.join(format!("{upload_id}.part"));
+        let unrelated = uploads.join("keep.part");
+        std::fs::write(&owned, b"partial").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        storage.cleanup_staging().await.unwrap();
+
+        assert!(!owned.exists());
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"keep");
     }
 
     #[tokio::test]

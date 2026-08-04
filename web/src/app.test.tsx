@@ -260,8 +260,8 @@ describe("App", () => {
     const uploaded: FileEntry = { name: "notes.bin", size: "10", modifiedAt: "2026-08-04T12:00:00Z" };
     const listFiles = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([uploaded]);
     const uploader = vi.fn(async (options) => ({
-      id: "upload-one", projectId: options.projectId, fileName: options.file.name,
-      totalSize: String(options.file.size), committedOffset: String(options.file.size), state: "complete" as const,
+      name: options.file.name,
+      size: String(options.file.size),
     }));
     const user = userEvent.setup();
     render(<App

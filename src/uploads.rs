@@ -58,6 +58,10 @@ impl UploadRepository for Database {
 
 /// Exact staging operations needed to publish one request body.
 pub trait UploadStorage: Send + Sync {
+    fn cleanup_staging(&self) -> UploadStorageFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()>;
 
     fn write_upload<'a>(
@@ -79,6 +83,10 @@ pub trait UploadStorage: Send + Sync {
 }
 
 impl UploadStorage for Storage {
+    fn cleanup_staging(&self) -> UploadStorageFuture<'_, ()> {
+        Box::pin(async move { self.cleanup_staging().await })
+    }
+
     fn create_staging<'a>(&'a self, upload_id: Uuid) -> UploadStorageFuture<'a, ()> {
         Box::pin(async move { self.create_staging(upload_id).await })
     }
@@ -123,10 +131,12 @@ impl UploadService {
         }
     }
 
-    /// Temporary startup compatibility until the following migration task replaces
-    /// session recovery with unconditional staging cleanup.
+    /// Removes temporary upload files left behind by a previous process exit.
     pub async fn recover_uploads(&self) -> Result<(), UploadRecoveryError> {
-        Ok(())
+        self.storage
+            .cleanup_staging()
+            .await
+            .map_err(|_| UploadRecoveryError)
     }
 
     async fn upload(

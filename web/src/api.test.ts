@@ -55,50 +55,6 @@ describe("api", () => {
     });
   });
 
-  it("creates an upload with decimal size and no forbidden headers", async () => {
-    const upload = {
-      id: "upload-one", projectId: "project/id", fileName: "archive.bin",
-      totalSize: "10", committedOffset: "0", state: "active",
-    };
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(upload, { status: 201 }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(api.createUpload("project/id", "archive.bin", 10)).resolves.toEqual(upload);
-    expect(fetchMock).toHaveBeenCalledWith("/api/v1/projects/project%2Fid/uploads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fileName: "archive.bin", totalSize: "10" }),
-      signal: undefined,
-    });
-    const headers = fetchMock.mock.calls[0][1].headers;
-    expect(headers).not.toHaveProperty("Content-Length");
-    expect(headers).not.toHaveProperty("Origin");
-  });
-
-  it("gets and completes an encoded upload session", async () => {
-    const upload = {
-      id: "upload/id", projectId: "project-one", fileName: "archive.bin",
-      totalSize: "10", committedOffset: "10", state: "complete",
-    };
-    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(upload)));
-    vi.stubGlobal("fetch", fetchMock);
-
-    await api.getUpload("upload/id");
-    await api.completeUpload("upload/id");
-
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/uploads/upload%2Fid", { method: "GET", signal: undefined });
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/v1/uploads/upload%2Fid/complete", { method: "POST", signal: undefined });
-  });
-
-  it("rejects a non-safe upload size before fetch", async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-    await expect(api.createUpload("project-one", "huge.bin", Number.MAX_SAFE_INTEGER + 1)).rejects.toThrow(
-      "The selected file is too large for this browser.",
-    );
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it("surfaces only the stable safe server message", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       jsonResponse(

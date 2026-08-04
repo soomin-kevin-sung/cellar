@@ -24,6 +24,18 @@ Cloudflare setup is intentionally outside Cellar. Follow the
 [named Tunnel and Access runbook](docs/cloudflare-access-setup.md); Cellar does
 not install, configure, or supervise `cloudflared`.
 
+## MVP behavior
+
+- Projects group files stored on this Windows PC.
+- Each upload is one request. If it fails, retry starts from the beginning.
+- Files are first written to an application-owned `.part` file and published
+  only after the request completes successfully.
+- Failed uploads are cleaned immediately; leftovers from a forced process exit
+  are removed on the next startup.
+- Existing filenames are never overwritten.
+- Upload resume, cancellation controls, filesystem watching, rename, move,
+  delete, tags, search, and previews are intentionally deferred.
+
 ## Configuration
 
 Create the data root before starting Cellar, copy `config.example.toml` to a
@@ -122,10 +134,10 @@ D:\CellarData\
       `- <upload-uuid>.part
 ```
 
-Project names and upload state live in SQLite. Published file metadata is read
-from the real files under `projects`; `.part` files are resumable upload
-staging. Do not rename, move, edit, or selectively synchronize managed entries
-while Cellar is running.
+Project names live in SQLite. Published file metadata is read from the real
+files under `projects`; `.part` files are temporary upload staging and are
+removed at startup. Do not rename, move, edit, or selectively synchronize
+managed entries while Cellar is running.
 
 ## Backup and restore boundaries
 
