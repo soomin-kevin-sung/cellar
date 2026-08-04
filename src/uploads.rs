@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     routing::post,
 };
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
@@ -125,7 +125,7 @@ impl UploadService {
         &self,
         project_id: Uuid,
         file_name: String,
-        reader: UploadBodyReader,
+        body: Body,
         request_id: &RequestId,
     ) -> Result<UploadResponse, UploadServiceError> {
         let name =
@@ -140,88 +140,201 @@ impl UploadService {
         }
 
         let storage = self.storage.clone();
+        let upload_id = Uuid::now_v7();
+        let cancellation = UploadCancellation::new();
+        let reader = cancellation_aware_reader(body, cancellation.subscribe());
+        let operation_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let mut waiter = UploadWaiterCleanup::new(
+            storage.clone(),
+            upload_id,
+            cancellation.clone(),
+            operation_gate.clone(),
+        );
         let request_id = request_id.clone();
+        let worker_gate = operation_gate.clone();
+        let worker_cancellation = cancellation.clone();
         let operation = tokio::spawn(async move {
-            run_owned_upload(storage, project_id, name, reader, request_id).await
+            let _operation_guard = worker_gate.lock().await;
+            OwnedUploadOperation {
+                storage,
+                upload_id,
+                project_id,
+                name,
+                reader,
+                request_id,
+                cancellation: worker_cancellation,
+                operation_gate,
+            }
+            .run()
+            .await
         });
         match operation.await {
-            Ok(result) => result,
+            Ok(result) => {
+                waiter.disarm();
+                result
+            }
             Err(_) => Err(UploadServiceError::Unavailable),
         }
     }
 }
 
-async fn run_owned_upload(
+struct OwnedUploadOperation {
     storage: Arc<dyn UploadStorage>,
+    upload_id: Uuid,
     project_id: Uuid,
     name: SafeFileName,
     reader: UploadBodyReader,
     request_id: RequestId,
-) -> Result<UploadResponse, UploadServiceError> {
-    let upload_id = Uuid::now_v7();
-    let mut cleanup = StagingCleanup::new(storage.clone(), upload_id);
-    if let Err(error) = storage.create_staging(upload_id).await {
-        cleanup.disarm();
-        return Err(map_internal_storage_error(&error));
-    }
+    cancellation: UploadCancellation,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
+}
 
-    let size = match storage.write_upload(upload_id, reader).await {
-        Ok(size) => size,
-        Err(error) => {
-            let mapped = map_write_error(&error);
-            record_storage_failure(&error, &request_id, project_id);
-            return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
-        }
-    };
-    if size == 0 {
-        return Err(cleanup_result(
-            &mut cleanup,
-            UploadServiceError::InvalidRequest,
-            &request_id,
+impl OwnedUploadOperation {
+    async fn run(self) -> Result<UploadResponse, UploadServiceError> {
+        let Self {
+            storage,
+            upload_id,
             project_id,
-        )
-        .await);
-    }
-
-    if let Err(error) = storage.sync_staging(upload_id).await {
-        let mapped = map_internal_storage_error(&error);
-        record_storage_failure(&error, &request_id, project_id);
-        return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
-    }
-
-    let final_storage = storage.clone();
-    let final_name = name.clone();
-    let cleanup_gate = cleanup.gate();
-    let finalization = tokio::spawn(async move {
-        let _guard = cleanup_gate.lock().await;
-        final_storage
-            .finalize_no_replace(upload_id, project_id, &final_name)
-            .await
-    });
-    let finalization = match finalization.await {
-        Ok(result) => result,
-        Err(_) => {
-            record_failure("finalization_task_failed", &request_id, project_id);
+            name,
+            reader,
+            request_id,
+            cancellation,
+            operation_gate,
+        } = self;
+        if cancellation.is_cancelled() {
+            return Err(UploadServiceError::InvalidRequest);
+        }
+        let mut cleanup = StagingCleanup::new(storage.clone(), upload_id, operation_gate);
+        if let Err(error) = storage.create_staging(upload_id).await {
+            cleanup.disarm();
+            return Err(map_internal_storage_error(&error));
+        }
+        if cancellation.is_cancelled() {
             return Err(cleanup_result(
                 &mut cleanup,
-                UploadServiceError::Unavailable,
+                UploadServiceError::InvalidRequest,
                 &request_id,
                 project_id,
             )
             .await);
         }
-    };
-    if let Err(error) = finalization {
-        let mapped = map_finalization_error(&error);
-        record_storage_failure(&error, &request_id, project_id);
-        return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+
+        let size = match storage.write_upload(upload_id, reader).await {
+            Ok(size) => size,
+            Err(error) => {
+                let mapped = map_write_error(&error);
+                record_storage_failure(&error, &request_id, project_id);
+                return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+            }
+        };
+        if cancellation.is_cancelled() {
+            return Err(cleanup_result(
+                &mut cleanup,
+                UploadServiceError::InvalidRequest,
+                &request_id,
+                project_id,
+            )
+            .await);
+        }
+        if size == 0 {
+            return Err(cleanup_result(
+                &mut cleanup,
+                UploadServiceError::InvalidRequest,
+                &request_id,
+                project_id,
+            )
+            .await);
+        }
+
+        if let Err(error) = storage.sync_staging(upload_id).await {
+            let mapped = map_internal_storage_error(&error);
+            record_storage_failure(&error, &request_id, project_id);
+            return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+        }
+        if cancellation.is_cancelled() {
+            return Err(cleanup_result(
+                &mut cleanup,
+                UploadServiceError::InvalidRequest,
+                &request_id,
+                project_id,
+            )
+            .await);
+        }
+
+        let finalization = storage
+            .finalize_no_replace(upload_id, project_id, &name)
+            .await;
+        if let Err(error) = finalization {
+            let mapped = map_finalization_error(&error);
+            record_storage_failure(&error, &request_id, project_id);
+            return Err(cleanup_result(&mut cleanup, mapped, &request_id, project_id).await);
+        }
+
+        cleanup.disarm();
+        Ok(UploadResponse {
+            name: name.as_str().to_owned(),
+            size: DecimalU64(size),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct UploadCancellation {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl UploadCancellation {
+    fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(false);
+        Self { sender }
     }
 
-    cleanup.disarm();
-    Ok(UploadResponse {
-        name: name.as_str().to_owned(),
-        size: DecimalU64(size),
-    })
+    fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
+}
+
+fn cancellation_aware_reader(
+    body: Body,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+) -> UploadBodyReader {
+    let stream = body
+        .into_data_stream()
+        .map_err(|error| io::Error::other(error.to_string()));
+    let stream = futures_util::stream::unfold(
+        (Box::pin(stream), cancellation, false),
+        |(mut stream, mut cancellation, finished)| async move {
+            if finished {
+                return None;
+            }
+            if *cancellation.borrow() {
+                return Some((Err(cancelled_body_error()), (stream, cancellation, true)));
+            }
+            tokio::select! {
+                item = stream.next() => item.map(|item| (item, (stream, cancellation, false))),
+                changed = cancellation.changed() => {
+                    if changed.is_ok() && *cancellation.borrow() {
+                        Some((Err(cancelled_body_error()), (stream, cancellation, true)))
+                    } else {
+                        None
+                    }
+                }
+            }
+        },
+    );
+    Box::pin(StreamReader::new(stream))
+}
+
+fn cancelled_body_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "upload request was cancelled")
 }
 
 async fn cleanup_result(
@@ -253,23 +366,25 @@ impl std::error::Error for UploadRecoveryError {}
 struct StagingCleanup {
     storage: Arc<dyn UploadStorage>,
     upload_id: Uuid,
-    cleanup_gate: Arc<tokio::sync::Mutex<()>>,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
     armed: bool,
 }
 
 impl StagingCleanup {
-    fn new(storage: Arc<dyn UploadStorage>, upload_id: Uuid) -> Self {
+    fn new(
+        storage: Arc<dyn UploadStorage>,
+        upload_id: Uuid,
+        operation_gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
         Self {
             storage,
             upload_id,
-            cleanup_gate: Arc::new(tokio::sync::Mutex::new(())),
+            operation_gate,
             armed: true,
         }
     }
 
     async fn cleanup(&mut self) -> Result<(), StorageError> {
-        let cleanup_gate = self.cleanup_gate.clone();
-        let _guard = cleanup_gate.lock().await;
         match self.storage.remove_staging(self.upload_id).await {
             Ok(()) => {
                 self.disarm();
@@ -282,10 +397,6 @@ impl StagingCleanup {
     fn disarm(&mut self) {
         self.armed = false;
     }
-
-    fn gate(&self) -> Arc<tokio::sync::Mutex<()>> {
-        self.cleanup_gate.clone()
-    }
 }
 
 impl Drop for StagingCleanup {
@@ -295,12 +406,61 @@ impl Drop for StagingCleanup {
         }
         let storage = self.storage.clone();
         let upload_id = self.upload_id;
-        let cleanup_gate = self.cleanup_gate.clone();
+        let operation_gate = self.operation_gate.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _guard = cleanup_gate.lock().await;
+                let _guard = operation_gate.lock().await;
                 if storage.remove_staging(upload_id).await.is_err() {
                     tracing::warn!(upload_id = %upload_id, "staging cleanup retry failed");
+                }
+            });
+        }
+    }
+}
+
+struct UploadWaiterCleanup {
+    storage: Arc<dyn UploadStorage>,
+    upload_id: Uuid,
+    cancellation: UploadCancellation,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
+    armed: bool,
+}
+
+impl UploadWaiterCleanup {
+    fn new(
+        storage: Arc<dyn UploadStorage>,
+        upload_id: Uuid,
+        cancellation: UploadCancellation,
+        operation_gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
+        Self {
+            storage,
+            upload_id,
+            cancellation,
+            operation_gate,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UploadWaiterCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.cancellation.cancel();
+        let storage = self.storage.clone();
+        let upload_id = self.upload_id;
+        let operation_gate = self.operation_gate.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _guard = operation_gate.lock().await;
+                if storage.remove_staging(upload_id).await.is_err() {
+                    tracing::warn!(upload_id = %upload_id, "waiter cleanup retry failed");
                 }
             });
         }
@@ -362,12 +522,8 @@ async fn create_upload(
     let Query(query) = query.map_err(|_| invalid_request(request_id.clone()))?;
     require_octet_stream(&headers).map_err(|()| invalid_request(request_id.clone()))?;
 
-    let stream = body
-        .into_data_stream()
-        .map_err(|error| io::Error::other(error.to_string()));
-    let reader: UploadBodyReader = Box::pin(StreamReader::new(stream));
     let response = service
-        .upload(project_id, query.file_name, reader, &request_id)
+        .upload(project_id, query.file_name, body, &request_id)
         .await
         .map_err(|error| upload_error(error, request_id))?;
     Ok((StatusCode::CREATED, Json(response)))

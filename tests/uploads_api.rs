@@ -18,7 +18,6 @@ use cellar::{
         UploadStorageFuture,
     },
 };
-use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -562,10 +561,7 @@ async fn cancellation_during_staging_creation_is_supervised_until_ordered_cleanu
             release: release.clone(),
         }),
     );
-    let body = Body::from_stream(futures_util::stream::iter([
-        Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
-        Err(io::Error::other("incomplete body")),
-    ]));
+    let body = Body::from_stream(futures_util::stream::pending::<Result<Bytes, io::Error>>());
     let request = tokio::spawn(context.secure_upload(service).oneshot(upload_request(
         project_id,
         "fileName=cancelled.bin",
@@ -618,6 +614,8 @@ async fn cancellation_during_staging_creation_is_supervised_until_ordered_cleanu
 struct WriteObservingStorage {
     storage: Arc<cellar::storage::Storage>,
     started: Mutex<Option<tokio::sync::oneshot::Sender<Uuid>>>,
+    continued: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 impl UploadStorage for WriteObservingStorage {
@@ -631,9 +629,14 @@ impl UploadStorage for WriteObservingStorage {
         reader: UploadBodyReader,
     ) -> UploadStorageFuture<'a, u64> {
         let started = self.started.lock().unwrap().take();
+        let continued = self.continued.lock().unwrap().take();
         Box::pin(async move {
             if let Some(started) = started {
                 let _ = started.send(upload_id);
+            }
+            self.release.acquire().await.unwrap().forget();
+            if let Some(continued) = continued {
+                let _ = continued.send(());
             }
             self.storage.write_chunk(upload_id, 0, reader).await
         })
@@ -673,17 +676,11 @@ async fn cancellation_during_write_is_supervised_until_body_failure_cleanup() {
         Arc::new(WriteObservingStorage {
             storage: context.storage.clone(),
             started: Mutex::new(Some(started_tx)),
+            continued: Mutex::new(Some(continued_tx)),
+            release: release.clone(),
         }),
     );
-    let body_release = release.clone();
-    let stream = futures_util::stream::once(async {
-        Ok::<Bytes, io::Error>(Bytes::from_static(b"partial"))
-    })
-    .chain(futures_util::stream::once(async move {
-        body_release.acquire().await.unwrap().forget();
-        let _ = continued_tx.send(());
-        Err::<Bytes, io::Error>(io::Error::other("incomplete body"))
-    }));
+    let stream = futures_util::stream::pending::<Result<Bytes, io::Error>>();
     let request = tokio::spawn(context.secure_upload(service).oneshot(upload_request(
         project_id,
         "fileName=write-cancelled.bin",
@@ -693,19 +690,16 @@ async fn cancellation_during_write_is_supervised_until_body_failure_cleanup() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while context.storage.staging_len(upload_id).await.unwrap() != Some(7) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("upload did not reach the paused partial write");
+    assert_eq!(
+        context.storage.staging_len(upload_id).await.unwrap(),
+        Some(0)
+    );
 
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
     assert_eq!(
         context.storage.staging_len(upload_id).await.unwrap(),
-        Some(7)
+        Some(0)
     );
     release.add_permits(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), continued_rx)
