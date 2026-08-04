@@ -1,4 +1,4 @@
-import type { ErrorEnvelope, FileEntry, Project } from "./types";
+import type { ErrorEnvelope, FileEntry, Project, UploadSession } from "./types";
 
 const FALLBACK_MESSAGE = "Something went wrong. Please try again.";
 
@@ -62,5 +62,28 @@ export const api = {
       signal,
     });
     return readJson<FileEntry[]>(response);
+  },
+
+  async createUpload(projectId: string, fileName: string, totalSize: number, signal?: AbortSignal): Promise<UploadSession> {
+    if (!Number.isSafeInteger(totalSize) || totalSize < 0) {
+      throw new ApiError("The selected file is too large for this browser.", 0);
+    }
+    const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectId)}/uploads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileName, totalSize: String(totalSize) }),
+      signal,
+    });
+    return readJson<UploadSession>(response);
+  },
+
+  async getUpload(uploadId: string, signal?: AbortSignal): Promise<UploadSession> {
+    const response = await fetch(`/api/v1/uploads/${encodeURIComponent(uploadId)}`, { method: "GET", signal });
+    return readJson<UploadSession>(response);
+  },
+
+  async completeUpload(uploadId: string, signal?: AbortSignal): Promise<UploadSession> {
+    const response = await fetch(`/api/v1/uploads/${encodeURIComponent(uploadId)}/complete`, { method: "POST", signal });
+    return readJson<UploadSession>(response);
   },
 };

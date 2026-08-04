@@ -8,6 +8,7 @@ interface AppShellProps {
   selectedProjectId: string | null;
   onSelectProject: (projectId: string) => void;
   onCreateProject: () => void;
+  onOpenUploads: () => void;
   showCreateAction: boolean;
   children: ReactNode;
 }
@@ -17,6 +18,7 @@ export function AppShell({
   selectedProjectId,
   onSelectProject,
   onCreateProject,
+  onOpenUploads,
   showCreateAction,
   children,
 }: AppShellProps) {
@@ -46,7 +48,7 @@ export function AppShell({
         </nav>
 
         <nav className="secondary-nav" aria-label="Workspace navigation">
-          <button type="button"><Upload aria-hidden="true" size={17} />Uploads</button>
+          <button onClick={onOpenUploads} type="button"><Upload aria-hidden="true" size={17} />Uploads</button>
           <button type="button"><Settings aria-hidden="true" size={17} />Settings</button>
         </nav>
       </aside>
@@ -66,6 +68,9 @@ export function AppShell({
               {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
             </select>
           </div>
+          <button aria-label="Uploads" className="mobile-upload" onClick={onOpenUploads} type="button">
+            <Upload aria-hidden="true" size={17} />
+          </button>
         </header>
 
         {showCreateAction ? (

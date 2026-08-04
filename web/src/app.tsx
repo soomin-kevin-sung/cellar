@@ -1,11 +1,15 @@
-import { FileText, RefreshCw } from "lucide-react";
+import { RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "./api";
 import { AppShell } from "./components/app-shell";
 import { EmptyState } from "./components/empty-state";
+import { FileTable } from "./components/file-table";
 import { ProjectCreateDialog } from "./components/project-create-dialog";
+import { UploadPanel } from "./components/upload-panel";
+import { formatFileSummary } from "./file-format";
 import type { FileEntry, Project } from "./types";
+import { uploadFile } from "./upload-client";
 
 export interface ApiClient {
   listProjects(signal?: AbortSignal): Promise<Project[]>;
@@ -19,7 +23,7 @@ function safeMessage(reason: unknown, fallback: string) {
   return reason instanceof Error && reason.message.trim() ? reason.message : fallback;
 }
 
-export default function App({ client = api }: { client?: ApiClient }) {
+export default function App({ client = api, uploader = uploadFile }: { client?: ApiClient; uploader?: typeof uploadFile }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsState, setProjectsState] = useState<LoadState>("loading");
   const [projectsError, setProjectsError] = useState("");
@@ -32,6 +36,7 @@ export default function App({ client = api }: { client?: ApiClient }) {
   const [reloadKey, setReloadKey] = useState(0);
   const fileRequestRef = useRef(0);
   const workspaceFocusRef = useRef<HTMLElement>(null);
+  const uploadFocusRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -107,6 +112,14 @@ export default function App({ client = api }: { client?: ApiClient }) {
       <div aria-hidden={dialogOpen ? "true" : undefined}>
         <AppShell
           onCreateProject={() => setDialogOpen(true)}
+          onOpenUploads={() => {
+            const panel = uploadFocusRef.current;
+            if (!panel) return;
+            panel.focus({ preventScroll: true });
+            const reducedMotion = typeof window.matchMedia === "function" &&
+              window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+            panel.scrollIntoView?.({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+          }}
           onSelectProject={selectProject}
           projects={projects}
           selectedProjectId={selectedProjectId}
@@ -150,35 +163,23 @@ export default function App({ client = api }: { client?: ApiClient }) {
             <header className="project-workspace__header">
               <p className="eyebrow">Project</p>
               <h1 id="project-title">{selectedProject.name}</h1>
+              <p className="project-workspace__summary">
+                {filesState === "loading" ? "Loading file summary…" : filesState === "error" ? "File summary unavailable" : formatFileSummary(files)}
+              </p>
             </header>
 
             <div className="files-panel" aria-live="polite">
-              {filesState === "loading" ? <p className="inline-status" role="status">Loading files…</p> : null}
-              {filesState === "error" ? (
-                <div className="files-error">
-                  <p className="inline-error" role="alert">{filesError}</p>
-                  <button
-                    aria-label="Retry loading files"
-                    className="button button--secondary"
-                    onClick={retryFiles}
-                    type="button"
-                  >
-                    <RefreshCw aria-hidden="true" size={16} />Retry
-                  </button>
-                </div>
-              ) : null}
-              {filesState === "ready" && files.length === 0 ? (
-                <div className="files-empty">
-                  <FileText aria-hidden="true" size={22} strokeWidth={1.6} />
-                  <div><h2>No files in this project yet.</h2><p>Uploaded files will appear in this workspace.</p></div>
-                </div>
-              ) : null}
-              {filesState === "ready" && files.length > 0 ? (
-                <div className="file-preview" aria-label="Project files">
-                  {files.map((file) => <div className="file-preview__row" key={file.name}><FileText aria-hidden="true" size={17} /><span>{file.name}</span></div>)}
-                </div>
-              ) : null}
+              <FileTable error={filesError} files={files} onRetry={retryFiles} projectId={selectedProject.id} state={filesState} />
             </div>
+
+            <UploadPanel
+              key={selectedProject.id}
+              onComplete={retryFiles}
+              projectId={selectedProject.id}
+              projectName={selectedProject.name}
+              ref={uploadFocusRef}
+              upload={uploader}
+            />
           </section>
         ) : null}
         </AppShell>
