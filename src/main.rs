@@ -807,28 +807,16 @@ mod tests {
     }
 
     #[test]
-    fn development_launcher_has_only_the_expected_local_build_and_run_flow() {
-        let script =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/run-dev.ps1"))
-                .unwrap();
-        for required in [
-            "node_modules",
-            "npm run build",
-            "CELLAR_CONFIG",
-            "cargo run",
-            "$PSScriptRoot",
-            "Test-Path",
-        ] {
-            assert!(script.contains(required), "missing {required}");
-        }
-        for forbidden in [
-            "cloudflared",
-            "New-Service",
-            "Set-Service",
-            "npm install",
-            "npm ci",
-        ] {
-            assert!(!script.contains(forbidden), "forbidden {forbidden}");
-        }
+    fn script_entrypoints_use_the_shared_launcher() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let launcher = root.join("scripts/start-cellar.ps1");
+        let development = std::fs::read_to_string(root.join("dev.ps1")).unwrap();
+        let deployment = std::fs::read_to_string(root.join("deploy.ps1")).unwrap();
+
+        assert!(launcher.is_file());
+        assert!(development.contains(r"scripts\start-cellar.ps1"));
+        assert!(deployment.contains(r"scripts\start-cellar.ps1"));
+        assert!(!root.join("install.ps1").exists());
+        assert!(!root.join("scripts/run-dev.ps1").exists());
     }
 }

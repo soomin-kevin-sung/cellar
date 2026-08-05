@@ -5,6 +5,7 @@ import { api } from "./api";
 import { AppShell } from "./components/app-shell";
 import { AdminPanel } from "./components/admin-panel";
 import { EmptyState } from "./components/empty-state";
+import { FeaturePortal, type FeaturePortalOrigin, type FeaturePortalPhase } from "./components/feature-portal";
 import { FileTable } from "./components/file-table";
 import { ProjectCreateDialog } from "./components/project-create-dialog";
 import { UploadPanel } from "./components/upload-panel";
@@ -22,6 +23,11 @@ type LoadState = "loading" | "ready" | "error";
 
 function safeMessage(reason: unknown, fallback: string) {
   return reason instanceof Error && reason.message.trim() ? reason.message : fallback;
+}
+
+function prefersReducedMotion() {
+  return typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
 export default function App({
@@ -45,10 +51,75 @@ export default function App({
   const [filesReloadKey, setFilesReloadKey] = useState(0);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [section, setSection] = useState<"projects" | "admin">("projects");
+  const [section, setSection] = useState<"projects" | "upload" | "admin">("projects");
+  const [portalPhase, setPortalPhase] = useState<FeaturePortalPhase>("idle");
+  const [portalOrigin, setPortalOrigin] = useState<FeaturePortalOrigin>({ column: 2, row: 2 });
+  const [activeFeatureKey, setActiveFeatureKey] = useState<string | null>(null);
   const fileRequestRef = useRef(0);
+  const portalTimersRef = useRef<number[]>([]);
   const workspaceFocusRef = useRef<HTMLElement>(null);
   const uploadFocusRef = useRef<HTMLElement>(null);
+
+  const clearPortalTimers = () => {
+    portalTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    portalTimersRef.current = [];
+  };
+
+  const randomPortalOrigin = (): FeaturePortalOrigin => ({
+    column: Math.floor(Math.random() * 5),
+    row: Math.floor(Math.random() * 5),
+  });
+
+  const openFeature = (featureKey: string, activate: () => void) => {
+    if (portalPhase !== "idle" && activeFeatureKey === featureKey) return;
+
+    clearPortalTimers();
+    setPortalOrigin(randomPortalOrigin());
+    const activateFeature = () => {
+      activate();
+      setActiveFeatureKey(featureKey);
+    };
+    const revealFeature = () => {
+      activateFeature();
+      setPortalPhase("opening");
+      portalTimersRef.current.push(window.setTimeout(() => setPortalPhase("open"), 920));
+    };
+
+    if (prefersReducedMotion()) {
+      activateFeature();
+      setPortalPhase("open");
+      return;
+    }
+
+    if (portalPhase === "idle") {
+      revealFeature();
+      return;
+    }
+
+    setPortalPhase("closing");
+    portalTimersRef.current.push(window.setTimeout(() => {
+      revealFeature();
+    }, 580));
+  };
+
+  const returnToCube = () => {
+    clearPortalTimers();
+    setPortalOrigin(randomPortalOrigin());
+    if (prefersReducedMotion() || portalPhase === "idle") {
+      setPortalPhase("idle");
+      setActiveFeatureKey(null);
+      return;
+    }
+    setPortalPhase("closing");
+    portalTimersRef.current.push(window.setTimeout(() => {
+      setPortalPhase("idle");
+      setActiveFeatureKey(null);
+    }, 580));
+  };
+
+  useEffect(() => () => {
+    portalTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -95,12 +166,15 @@ export default function App({
 
   const createProject = async (name: string) => {
     const created = await client.createProject(name);
-    setProjects((current) => current.some((project) => project.id === created.id) ? current : [...current, created]);
-    setFiles([]);
-    setFilesState("loading");
-    setFilesError("");
-    setSelectedProjectId(created.id);
-    setProjectsState("ready");
+    openFeature(`project:${created.id}`, () => {
+      setProjects((current) => current.some((project) => project.id === created.id) ? current : [...current, created]);
+      setFiles([]);
+      setFilesState("loading");
+      setFilesError("");
+      setSelectedProjectId(created.id);
+      setProjectsState("ready");
+      setSection("projects");
+    });
     return created;
   };
 
@@ -119,27 +193,42 @@ export default function App({
     setFilesReloadKey((key) => key + 1);
   };
 
+  useEffect(() => {
+    if (section !== "upload" || portalPhase !== "open") return;
+    const panel = uploadFocusRef.current;
+    if (!panel) return;
+    panel.focus({ preventScroll: true });
+    panel.scrollIntoView?.({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "center" });
+  }, [portalPhase, section]);
+
+  const effectivePortalPhase = projectsState === "ready" ? portalPhase : "open";
+
   return (
     <>
       <div aria-hidden={dialogOpen ? "true" : undefined}>
         <AppShell
+          activeProjectId={portalPhase === "idle" || section !== "projects" ? null : selectedProjectId}
+          activeSection={portalPhase === "idle" ? null : section}
           onCreateProject={() => setDialogOpen(true)}
           currentUser={currentUser}
           onLogout={() => { void onLogout?.(); }}
-          onOpenAdmin={() => setSection("admin")}
+          onOpenAdmin={() => openFeature("admin", () => setSection("admin"))}
+          onOpenHome={returnToCube}
           onOpenUploads={() => {
-            setSection("projects");
-            const panel = uploadFocusRef.current;
-            if (!panel) return;
-            panel.focus({ preventScroll: true });
-            const reducedMotion = typeof window.matchMedia === "function" &&
-              window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-            panel.scrollIntoView?.({ behavior: reducedMotion ? "auto" : "smooth", block: "center" });
+            if (!selectedProjectId) return;
+            openFeature(`upload:${selectedProjectId}`, () => setSection("upload"));
           }}
-          onSelectProject={(projectId) => { setSection("projects"); selectProject(projectId); }}
+          onSelectProject={(projectId) => openFeature(`project:${projectId}`, () => {
+            setSection("projects");
+            selectProject(projectId);
+          })}
           projects={projects}
           selectedProjectId={selectedProjectId}
-          showCreateAction={section === "projects" && projectsState === "ready" && projects.length > 0}
+          showCreateAction={section === "projects" && projectsState === "ready"}
+        >
+        <FeaturePortal
+          origin={portalOrigin}
+          phase={effectivePortalPhase}
         >
         {section === "admin" && currentUser?.role === "admin" ? <AdminPanel currentUser={currentUser} /> : null}
 
@@ -202,6 +291,25 @@ export default function App({
           </section>
         ) : null}
         </> : null}
+
+        {section === "upload" && selectedProject ? (
+          <section className="upload-workspace" aria-labelledby="feature-upload-title">
+            <header className="project-workspace__header">
+              <p className="eyebrow">프로젝트</p>
+              <h1 id="feature-upload-title">{selectedProject.name}</h1>
+              <p className="project-workspace__summary">이 PC로 파일을 전송합니다.</p>
+            </header>
+            <UploadPanel
+              key={`feature-upload-${selectedProject.id}`}
+              onComplete={retryFiles}
+              projectId={selectedProject.id}
+              projectName={selectedProject.name}
+              ref={uploadFocusRef}
+              upload={uploader}
+            />
+          </section>
+        ) : null}
+        </FeaturePortal>
         </AppShell>
       </div>
 

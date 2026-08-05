@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useState } from "react";
 import App from "../app";
 import { api, ApiError } from "../api";
 import type { CurrentUser } from "../types";
+import { CubeMark } from "./cube-mark";
 
 type AuthState = "loading" | "guest" | "ready" | "error";
 
@@ -56,66 +57,30 @@ function LoginPage({ onLogin }: { onLogin: (user: CurrentUser) => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [unlocking, setUnlocking] = useState(false);
   const [error, setError] = useState("");
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSubmitting(true);
     setError("");
-    let authenticated = false;
     try {
       const current = await api.login(username, password);
-      authenticated = true;
-      setUnlocking(true);
-      const reducedMotion = typeof window.matchMedia === "function" &&
-        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      await new Promise((resolve) => window.setTimeout(resolve, reducedMotion ? 0 : 1450));
       onLogin(current);
     } catch (reason) {
       setError(reason instanceof ApiError && reason.status === 401
         ? "사용자 이름 또는 비밀번호가 올바르지 않습니다."
         : "지금은 로그인할 수 없습니다.");
     } finally {
-      if (!authenticated) setSubmitting(false);
+      setSubmitting(false);
     }
   };
 
-  const protocolState = unlocking
-    ? "ACCESS GRANTED"
-    : submitting
-      ? "VERIFYING"
-      : error
-        ? "SIGNAL REJECTED"
-        : "AUTH REQUIRED";
-
   return (
-    <main className={`login-page${submitting ? " is-checking" : ""}${unlocking ? " is-unlocked" : ""}${error ? " is-rejected" : ""}`}>
-      <div className="login-grid" aria-hidden="true" />
-      <div className="login-scan" aria-hidden="true" />
-      <div className="login-orbit" aria-hidden="true" />
-      <div className="login-beam" aria-hidden="true" />
-      <div className="login-channel" aria-hidden="true">
-        <span />
-        <span />
-        <span />
-      </div>
-
-      <div className="login-telemetry" aria-hidden="true">
-        <span className="login-telemetry__node"><i /> NODE ONLINE</span>
-        <span>TLS / ACTIVE</span>
-      </div>
-
+    <main className="login-page">
       <section className="login-panel" aria-labelledby="login-title">
         <div className="login-panel__inner">
+          <CubeMark className="login-cube-mark" size={130} />
           <h1 className="sr-only" id="login-title">로그인</h1>
-
-          <div className="login-protocol" aria-hidden="true">
-            <span>AUTH / 01</span>
-            <span className="login-protocol__line" />
-            <strong>{protocolState}</strong>
-          </div>
-
           <form className="login-form" onSubmit={submit}>
             <label>
               <span className="sr-only">사용자 이름</span>
@@ -132,11 +97,6 @@ function LoginPage({ onLogin }: { onLogin: (user: CurrentUser) => void }) {
           </form>
         </div>
       </section>
-
-      <div className="login-footer" aria-hidden="true">
-        <span>LOCAL STORAGE NODE</span>
-        <span>SESSION / ENCRYPTED</span>
-      </div>
     </main>
   );
 }

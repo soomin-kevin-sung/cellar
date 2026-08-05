@@ -94,6 +94,15 @@ export const api = {
     await ensureOk(response);
   },
 
+  async deleteUser(userId: string, signal?: AbortSignal): Promise<void> {
+    const response = await fetch(`/api/v1/admin/users/${encodeURIComponent(userId)}`, {
+      credentials: "same-origin",
+      method: "DELETE",
+      signal,
+    });
+    await ensureOk(response);
+  },
+
   async listProjects(signal?: AbortSignal): Promise<Project[]> {
     const response = await fetch("/api/v1/projects", { method: "GET", signal });
     return readJson<Project[]>(response);

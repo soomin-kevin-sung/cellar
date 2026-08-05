@@ -1,4 +1,4 @@
-import { KeyRound, UserPlus, Users } from "lucide-react";
+import { KeyRound, Trash2, UserPlus, Users } from "lucide-react";
 import { FormEvent, useEffect, useState } from "react";
 
 import { api } from "../api";
@@ -14,6 +14,9 @@ export function AdminPanel({ currentUser }: { currentUser: CurrentUser }) {
   const [creating, setCreating] = useState(false);
   const [resetUser, setResetUser] = useState<ManagedUser | null>(null);
   const [resetPassword, setResetPassword] = useState("");
+  const [deleteUser, setDeleteUser] = useState<ManagedUser | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
 
   const load = async () => {
     setLoading(true);
@@ -59,6 +62,18 @@ export function AdminPanel({ currentUser }: { currentUser: CurrentUser }) {
     } catch { setError("비밀번호를 변경하지 못했습니다."); }
   };
 
+  const remove = async () => {
+    if (!deleteUser) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      await api.deleteUser(deleteUser.id);
+      setDeleteUser(null);
+      await load();
+    } catch { setDeleteError("사용자를 삭제하지 못했습니다."); }
+    finally { setDeleting(false); }
+  };
+
   return (
     <section className="admin-page" aria-labelledby="admin-title">
       <header className="admin-header">
@@ -86,6 +101,7 @@ export function AdminPanel({ currentUser }: { currentUser: CurrentUser }) {
             <select aria-label={`${user.username} 권한`} disabled={user.id === currentUser.id} onChange={(event) => void update(user, { role: event.target.value as UserRole })} value={user.role}><option value="member">일반 사용자</option><option value="admin">관리자</option></select>
             <button className="button button--quiet" onClick={() => setResetUser(user)} type="button"><KeyRound aria-hidden="true" size={15} />비밀번호 변경</button>
             <button className={`button ${user.active ? "button--quiet button--danger" : "button--secondary"}`} disabled={user.id === currentUser.id} onClick={() => void update(user, { active: !user.active })} type="button">{user.active ? "비활성화" : "활성화"}</button>
+            <button aria-label={`${user.username} 영구 삭제`} className="button button--quiet button--danger user-delete" disabled={user.id === currentUser.id} onClick={() => { setDeleteError(""); setDeleteUser(user); }} type="button"><Trash2 aria-hidden="true" size={15} />삭제</button>
           </article>
         ))}
       </div>
@@ -98,6 +114,22 @@ export function AdminPanel({ currentUser }: { currentUser: CurrentUser }) {
             <button className="button button--primary" type="submit">저장</button>
             <button className="button button--quiet" onClick={() => { setResetUser(null); setResetPassword(""); }} type="button">취소</button>
           </form>
+        </div>
+      ) : null}
+
+      {deleteUser ? (
+        <div aria-labelledby="delete-user-title" aria-modal="true" className="delete-card" role="dialog">
+          <div className="delete-card__surface">
+            <div>
+              <strong id="delete-user-title">{deleteUser.username} 영구 삭제</strong>
+              <span>계정과 로그인 세션이 삭제됩니다. 이 작업은 되돌릴 수 없습니다.</span>
+              {deleteError ? <p className="delete-card__error" role="alert">{deleteError}</p> : null}
+            </div>
+            <div className="delete-card__actions">
+              <button autoFocus className="button button--quiet" disabled={deleting} onClick={() => setDeleteUser(null)} type="button">취소</button>
+              <button className="button button--danger-solid" disabled={deleting} onClick={() => void remove()} type="button">{deleting ? "삭제 중…" : "영구 삭제"}</button>
+            </div>
+          </div>
         </div>
       ) : null}
     </section>

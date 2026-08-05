@@ -314,6 +314,38 @@ impl AccountService {
         }
         Ok(())
     }
+
+    async fn delete_user(&self, actor: &SessionUser, id: Uuid) -> Result<(), AccountError> {
+        if actor.id == id {
+            return Err(AccountError::Invalid);
+        }
+
+        let mut transaction = self
+            .database
+            .pool()
+            .begin()
+            .await
+            .map_err(|_| AccountError::Database)?;
+        sqlx::query("DELETE FROM app_session WHERE user_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AccountError::Database)?;
+        let changed = sqlx::query("DELETE FROM app_user WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AccountError::Database)?
+            .rows_affected();
+        if changed == 0 {
+            return Err(AccountError::NotFound);
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| AccountError::Database)?;
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -350,7 +382,7 @@ pub fn protected_router(service: AccountService) -> Router {
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/admin/users", get(list_users).post(create_user))
-        .route("/api/v1/admin/users/{id}", patch(update_user))
+        .route("/api/v1/admin/users/{id}", patch(update_user).delete(delete_user))
         .with_state(service)
 }
 
@@ -535,6 +567,33 @@ async fn update_user(
     }
 }
 
+async fn delete_user(
+    State(service): State<AccountService>,
+    Path(id): Path<Uuid>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(user): Extension<SessionUser>,
+) -> Result<StatusCode, AppError> {
+    require_admin(&user, request_id.clone())?;
+    match service.delete_user(&user, id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(AccountError::Invalid) => Err(AppError::bad_request(
+            request_id,
+            "invalid_user_delete",
+            "Your own account cannot be deleted.",
+        )),
+        Err(AccountError::NotFound) => Err(AppError::not_found(
+            request_id,
+            "user_not_found",
+            "The user was not found.",
+        )),
+        Err(_) => Err(AppError::service_unavailable(
+            request_id,
+            "user_delete_failed",
+            "The user could not be deleted.",
+        )),
+    }
+}
+
 fn normalize_username(value: &str) -> Result<String, AccountError> {
     let value = value.trim().to_ascii_lowercase();
     if (3..=32).contains(&value.len())
@@ -676,5 +735,11 @@ mod tests {
             service.login("member.one", "member-password").await,
             Err(AccountError::Unauthorized)
         ));
+        assert!(matches!(
+            service.delete_user(&admin, admin.id()).await,
+            Err(AccountError::Invalid)
+        ));
+        service.delete_user(&admin, member.id()).await.unwrap();
+        assert_eq!(service.list_users().await.unwrap().len(), 1);
     }
 }

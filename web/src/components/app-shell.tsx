@@ -5,10 +5,13 @@ import type { Project } from "../types";
 import type { CurrentUser } from "../types";
 
 interface AppShellProps {
+  activeProjectId: string | null;
+  activeSection: "projects" | "upload" | "admin" | null;
   projects: Project[];
   selectedProjectId: string | null;
   onSelectProject: (projectId: string) => void;
   onCreateProject: () => void;
+  onOpenHome: () => void;
   onOpenUploads: () => void;
   showCreateAction: boolean;
   currentUser?: CurrentUser;
@@ -18,10 +21,13 @@ interface AppShellProps {
 }
 
 export function AppShell({
+  activeProjectId,
+  activeSection,
   projects,
   selectedProjectId,
   onSelectProject,
   onCreateProject,
+  onOpenHome,
   onOpenUploads,
   showCreateAction,
   currentUser,
@@ -32,16 +38,16 @@ export function AppShell({
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="sidebar__heading">
+        <button className="sidebar__heading" onClick={onOpenHome} type="button">
           <Folder aria-hidden="true" size={18} strokeWidth={1.8} />
           <span>프로젝트</span>
-        </div>
+        </button>
 
         <nav className="project-nav" aria-label="프로젝트 목록">
           <div className="project-nav__list">
             {projects.map((project) => (
               <button
-                aria-current={selectedProjectId === project.id ? "page" : undefined}
+                aria-current={activeProjectId === project.id ? "page" : undefined}
                 className="project-nav__item"
                 key={project.id}
                 onClick={() => onSelectProject(project.id)}
@@ -55,8 +61,8 @@ export function AppShell({
         </nav>
 
         <nav className="secondary-nav" aria-label="작업 메뉴">
-          <button onClick={onOpenUploads} type="button"><Upload aria-hidden="true" size={17} />업로드</button>
-          {currentUser?.role === "admin" ? <button onClick={onOpenAdmin} type="button"><Users aria-hidden="true" size={17} />사용자</button> : null}
+          <button aria-current={activeSection === "upload" ? "page" : undefined} onClick={onOpenUploads} type="button"><Upload aria-hidden="true" size={17} />업로드</button>
+          {currentUser?.role === "admin" ? <button aria-current={activeSection === "admin" ? "page" : undefined} onClick={onOpenAdmin} type="button"><Users aria-hidden="true" size={17} />사용자</button> : null}
           {currentUser ? (
             <div className="account-nav">
               <div><strong>{currentUser.username}</strong><span>{currentUser.role === "admin" ? "관리자" : "사용자"}</span></div>

@@ -5,7 +5,7 @@
 릴리스 빌드 후 저장소 루트에서 다음 한 줄로 실행합니다.
 
 ```powershell
-.\cellar.ps1
+.\dev.ps1
 ```
 
 처음 실행할 때 `cloudflared`가 없으면 공식 휴대용 실행 파일을 사용자 폴더에 자동 설치하고 SHA-256을 검증합니다. 관리자 권한은 필요하지 않습니다. 실행이 끝나면 콘솔에 매번 새로 발급된 `trycloudflare.com` 주소와 최초 관리자 암호가 표시됩니다. 사용자 이름은 `cellar`입니다. 최초 로그인 후 계정은 SQLite에 유지되며, 이후에는 웹 관리자 화면에서 다른 사용자 계정을 관리합니다. `Ctrl+C`로 Cellar와 터널을 함께 종료합니다.
@@ -18,7 +18,7 @@ Vercel 계정에 한 번 로그인한 뒤 프로젝트 이름을 지정하면, C
 
 ```powershell
 npx vercel login
-.\cellar.ps1 -VercelProject cellar-entry
+.\dev.ps1 -VercelProject cellar-entry
 ```
 
 프로젝트 이름을 매번 입력하지 않으려면 사용자 환경 변수로 저장할 수 있습니다.
@@ -107,6 +107,17 @@ Cellar database.
 
 ## Build
 
+The script surface is intentionally small:
+
+```text
+dev.ps1                     # run remote development with Vite hot reload
+deploy.ps1                  # build and copy the production runtime
+scripts/start-cellar.ps1    # internal server and tunnel launcher
+scripts/check.ps1           # optional full project checks
+```
+
+Most work uses only `dev.ps1` and `deploy.ps1`.
+
 The frontend must be built before the Rust release because `web/dist` is
 embedded into the executable at Rust compile time:
 
@@ -140,8 +151,7 @@ updates the Vercel fixed entry URL, writes the runtime configuration, and starts
 Cellar. `CELLAR_PASSWORD` can be used instead of the `-Password` argument.
 
 Running `deploy.ps1` again updates the executable and start script without
-deleting the existing `data` directory. `install.ps1` remains as a compatibility
-wrapper for the same deployment flow.
+deleting the existing `data` directory.
 
 ## Start locally
 
@@ -152,19 +162,14 @@ data under `D:\Cellar-dev\data`:
 .\dev.ps1
 ```
 
-The script builds the current workspace, creates a separate Quick Tunnel, and
-updates `https://cellar-entry.vercel.app/dev`. Production remains on port
-`8787` with data under `D:\Cellar\data`. Both launchers share only
+The script starts Vite with hot reload, builds the Rust backend, creates a
+separate Quick Tunnel, and updates `https://cellar-entry.vercel.app/dev`.
+Frontend changes appear remotely without restarting the script. Restart it only
+after Rust backend changes. Production remains on port `8787` with data under
+`D:\Cellar\data`. Both launchers share only
 `D:\Cellar\config\vercel-routes.json`, which preserves both redirect targets
 when either temporary tunnel URL changes. Use `CELLAR_DEV_PASSWORD` or the
 `-Password` parameter when a stable development bootstrap password is wanted.
-
-For development, the helper rebuilds the frontend, temporarily sets
-`CELLAR_CONFIG`, and runs the Rust application:
-
-```powershell
-.\scripts\run-dev.ps1 -ConfigPath .\config.toml
-```
 
 For a release start:
 

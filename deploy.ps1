@@ -70,7 +70,7 @@ catch {
     throw 'Could not update cellar.exe. Stop the installed Cellar server and deploy again.'
 }
 
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'cellar.ps1') `
+Copy-Item -LiteralPath (Join-Path $repositoryRoot 'scripts\start-cellar.ps1') `
     -Destination (Join-Path $resolvedDestination 'cellar.ps1') `
     -Force
 

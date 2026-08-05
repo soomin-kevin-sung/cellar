@@ -1,73 +1,105 @@
 [CmdletBinding()]
 param(
-    [ValidateRange(1024, 65535)]
-    [int]$Port = 8788,
-
-    [string]$DataRoot = 'D:\Cellar-dev\data',
-
-    [string]$Password = $env:CELLAR_DEV_PASSWORD,
-
-    [ValidatePattern('^[a-z0-9](?:[a-z0-9-]{0,50}[a-z0-9])?$')]
-    [string]$VercelProject = 'cellar-entry',
-
-    [string]$VercelStatePath = 'D:\Cellar\config\vercel-routes.json',
-
-    [switch]$SkipBuild
+    [string]$Password = $env:CELLAR_DEV_PASSWORD
 )
 
 $ErrorActionPreference = 'Stop'
 $repositoryRoot = $PSScriptRoot
 $webRoot = Join-Path $repositoryRoot 'web'
-$webDistRoot = Join-Path $webRoot 'dist'
-$webDistPlaceholder = Join-Path $webDistRoot '.gitkeep'
-$serverExitCode = 1
+$dataRoot = 'D:\Cellar-dev\data'
+$logsRoot = 'D:\Cellar-dev\logs'
+$backendPort = 8788
+$webPort = 4173
+$viteProcess = $null
 
-if (-not [IO.Path]::IsPathRooted($DataRoot)) {
-    throw 'DataRoot must be an absolute path.'
+function Stop-ProcessTree {
+    param([int]$RootId)
+
+    $processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    $pending = @($RootId)
+    $ids = [Collections.Generic.List[int]]::new()
+    while ($pending.Count -gt 0) {
+        $parentId = $pending[0]
+        $pending = @($pending | Select-Object -Skip 1)
+        $children = @($processes | Where-Object { $_.ParentProcessId -eq $parentId })
+        foreach ($child in $children) {
+            $pending += [int]$child.ProcessId
+        }
+        $ids.Add($parentId)
+    }
+    foreach ($id in @($ids | Sort-Object -Descending)) {
+        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+    }
 }
-if (-not [IO.Path]::IsPathRooted($VercelStatePath)) {
-    throw 'VercelStatePath must be an absolute path.'
+
+$npm = Get-Command 'npm.cmd' -ErrorAction SilentlyContinue
+if ($null -eq $npm) {
+    throw 'Node.js and npm are required.'
 }
-if ($Port -eq 8787) {
-    throw 'Port 8787 is reserved for production. Use the development default, 8788.'
+if (-not (Test-Path -LiteralPath (Join-Path $webRoot 'node_modules') -PathType Container)) {
+    & $npm.Source --prefix $webRoot ci
+    if ($LASTEXITCODE -ne 0) {
+        throw 'The frontend dependency installation failed.'
+    }
 }
+
+& cargo build --manifest-path (Join-Path $repositoryRoot 'Cargo.toml') --release
+if ($LASTEXITCODE -ne 0) {
+    throw 'The Cellar backend build failed.'
+}
+
+[IO.Directory]::CreateDirectory($logsRoot) | Out-Null
+$viteOut = Join-Path $logsRoot 'vite.out.log'
+$viteErr = Join-Path $logsRoot 'vite.err.log'
 
 try {
-    if (-not $SkipBuild) {
-        $npm = Get-Command 'npm.cmd' -ErrorAction SilentlyContinue
-        if ($null -eq $npm) {
-            throw 'Node.js and npm are required to build the frontend.'
-        }
-        if (-not (Test-Path -LiteralPath (Join-Path $webRoot 'node_modules') -PathType Container)) {
-            & $npm.Source --prefix $webRoot ci
-            if ($LASTEXITCODE -ne 0) {
-                throw 'The frontend dependency installation failed.'
+    $viteProcess = Start-Process -FilePath $npm.Source `
+        -ArgumentList @('run', 'dev') `
+        -WorkingDirectory $webRoot `
+        -RedirectStandardOutput $viteOut `
+        -RedirectStandardError $viteErr `
+        -WindowStyle Hidden `
+        -PassThru
+
+    $viteReady = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    while ([DateTime]::UtcNow -lt $deadline -and -not $viteReady) {
+        if ($viteProcess.HasExited) {
+            $details = if (Test-Path -LiteralPath $viteErr) {
+                Get-Content -LiteralPath $viteErr -Raw
             }
+            else { '' }
+            throw "Vite failed to start. $details"
         }
-        & $npm.Source --prefix $webRoot run build
-        if ($LASTEXITCODE -ne 0) {
-            throw 'The frontend build failed.'
+        try {
+            $response = Invoke-WebRequest `
+                -Uri "http://127.0.0.1:$webPort/" `
+                -UseBasicParsing `
+                -TimeoutSec 1
+            $viteReady = $response.StatusCode -eq 200
         }
-        & cargo build --manifest-path (Join-Path $repositoryRoot 'Cargo.toml') --release
-        if ($LASTEXITCODE -ne 0) {
-            throw 'The Cellar development build failed.'
+        catch {
+            Start-Sleep -Milliseconds 250
         }
     }
+    if (-not $viteReady) {
+        throw 'Vite did not become ready within 20 seconds.'
+    }
 
-    & (Join-Path $repositoryRoot 'cellar.ps1') `
-        -Port $Port `
-        -DataRoot $DataRoot `
+    & (Join-Path $repositoryRoot 'scripts\start-cellar.ps1') `
+        -Port $backendPort `
+        -TunnelPort $webPort `
+        -DataRoot $dataRoot `
         -Password $Password `
-        -VercelProject $VercelProject `
+        -VercelProject 'cellar-entry' `
         -VercelPath '/dev' `
-        -VercelStatePath $VercelStatePath
+        -VercelStatePath 'D:\Cellar\config\vercel-routes.json'
     $serverExitCode = $LASTEXITCODE
 }
 finally {
-    if (-not (Test-Path -LiteralPath $webDistRoot -PathType Container)) {
-        [IO.Directory]::CreateDirectory($webDistRoot) | Out-Null
+    if ($null -ne $viteProcess -and -not $viteProcess.HasExited) {
+        Stop-ProcessTree -RootId $viteProcess.Id
     }
-    [IO.File]::WriteAllText($webDistPlaceholder, "`n", [Text.UTF8Encoding]::new($false))
 }
 
 exit $serverExitCode

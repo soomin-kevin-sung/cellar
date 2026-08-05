@@ -3,6 +3,8 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8787,
 
+    [int]$TunnelPort,
+
     [string]$DataRoot,
 
     [string]$Password = $env:CELLAR_PASSWORD,
@@ -17,7 +19,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repositoryRoot = $PSScriptRoot
+$sourceRepositoryRoot = Split-Path -Parent $PSScriptRoot
+$repositoryRoot = if (Test-Path -LiteralPath (Join-Path $sourceRepositoryRoot 'Cargo.toml') -PathType Leaf) {
+    $sourceRepositoryRoot
+}
+else {
+    $PSScriptRoot
+}
 $installedExe = Join-Path $repositoryRoot 'app\cellar.exe'
 $developmentExe = Join-Path $repositoryRoot 'target\release\cellar.exe'
 $installedLayout = Test-Path -LiteralPath $installedExe -PathType Leaf
@@ -60,6 +68,13 @@ if (Test-Path -LiteralPath $launcherConfigPath -PathType Leaf) {
 
 if ([string]::IsNullOrWhiteSpace($VercelPath)) {
     $VercelPath = '/'
+}
+
+if (-not $PSBoundParameters.ContainsKey('TunnelPort')) {
+    $TunnelPort = $Port
+}
+if ($TunnelPort -lt 1024 -or $TunnelPort -gt 65535) {
+    throw 'TunnelPort must be between 1024 and 65535.'
 }
 
 if ([string]::IsNullOrWhiteSpace($VercelStatePath)) {
@@ -311,7 +326,7 @@ $previousPassword = [Environment]::GetEnvironmentVariable('CELLAR_QUICK_PASSWORD
 
 try {
     $tunnelProcess = Start-Process -FilePath $cloudflaredExe `
-        -ArgumentList @('tunnel', '--url', "http://127.0.0.1:$Port", '--no-autoupdate') `
+        -ArgumentList @('tunnel', '--url', "http://127.0.0.1:$TunnelPort", '--no-autoupdate') `
         -RedirectStandardOutput $tunnelOut `
         -RedirectStandardError $tunnelErr `
         -WindowStyle Hidden `

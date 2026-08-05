@@ -120,7 +120,7 @@ service. A remotely managed tunnel needs its tunnel token to run; protect that
 token as a credential. Cloudflare documents token handling in
 [Tunnel permissions](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/remote-tunnel-permissions/).
 
-Do not launch `cloudflared` from Cellar, `scripts/run-dev.ps1`, or
+Do not launch the named connector from the Cellar binary or
 `scripts/check.ps1`. The two process lifecycles and their logs stay separate.
 On Windows, `cloudflared` does not automatically update, so include it in the
 operator's normal patch routine.
