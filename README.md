@@ -56,7 +56,9 @@ not install, configure, or supervise `cloudflared`.
 ## MVP behavior
 
 - Projects group files stored on this Windows PC.
-- Each upload is one request. If it fails, retry starts from the beginning.
+- Uploads are sent sequentially in 32 MiB requests so files larger than a
+  Cloudflare request limit can still be transferred. If any request fails,
+  retry starts from the beginning.
 - Files are first written to an application-owned `.part` file and published
   only after the request completes successfully.
 - Failed uploads are cleaned immediately; leftovers from a forced process exit

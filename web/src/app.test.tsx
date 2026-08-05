@@ -39,22 +39,33 @@ function asUploader(mock: ReturnType<typeof vi.fn>) {
   return mock as unknown as typeof uploadFile;
 }
 
+function createAction() {
+  const button = document.querySelector<HTMLButtonElement>(".workspace__create");
+  if (!button) throw new Error("Project create action is missing.");
+  return button;
+}
+
 describe("App", () => {
+  beforeEach(() => {
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
   it("shows a status skeleton while projects load", () => {
     const pending = deferred<Project[]>();
     render(<App client={makeClient({ listProjects: vi.fn(() => pending.promise) })} />);
 
-    expect(screen.getByRole("status", { name: "Loading projects" })).toBeVisible();
+    expect(screen.getByRole("status", { name: "프로젝트 불러오는 중" })).toBeVisible();
   });
 
   it("shows the brandless empty-first shell with one create action", async () => {
     render(<App client={makeClient()} />);
 
-    expect(await screen.findByRole("heading", { name: "Create your first project" })).toBeVisible();
-    expect(screen.getByText("Projects")).toBeVisible();
-    expect(screen.getByText("Uploads")).toBeVisible();
-    expect(screen.getByText("Settings")).toBeVisible();
-    expect(screen.getAllByRole("button", { name: "Create project" })).toHaveLength(1);
+    await waitFor(() => expect(createAction()).toBeVisible());
+    expect(screen.getByRole("button", { name: "프로젝트" })).toBeVisible();
+    expect(screen.getAllByRole("button", { name: "업로드" }).length).toBeGreaterThan(0);
+    expect(document.querySelectorAll(".workspace__create")).toHaveLength(1);
     expect(document.body).not.toHaveTextContent(/Cellar|Photos/i);
     expect(document.querySelector('[aria-label*="logo" i]')).not.toBeInTheDocument();
   });
@@ -68,20 +79,20 @@ describe("App", () => {
     render(<App client={makeClient({ listProjects })} />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Projects are temporarily unavailable.");
-    await user.click(screen.getByRole("button", { name: "Try again" }));
+    await user.click(screen.getByRole("button", { name: "다시 시도" }));
 
-    expect(await screen.findByRole("heading", { name: "Create your first project" })).toBeVisible();
+    await waitFor(() => expect(createAction()).toBeVisible());
     expect(listProjects).toHaveBeenCalledTimes(2);
   });
 
   it("renders only returned project names and exposes a mobile selector", async () => {
     render(<App client={makeClient({ listProjects: vi.fn().mockResolvedValue([firstProject, secondProject]) })} />);
 
-    const navigation = await screen.findByRole("navigation", { name: "Projects navigation" });
+    const navigation = await screen.findByRole("navigation", { name: "프로젝트 목록" });
     expect(within(navigation).getByRole("button", { name: "Records" })).toBeVisible();
     expect(within(navigation).getByRole("button", { name: "Field notes" })).toBeVisible();
     expect(within(navigation).queryByText("Photos")).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "Select project" })).toHaveValue("project-one");
+    expect(screen.getByRole("combobox", { name: "프로젝트 선택" })).toHaveValue("project-one");
   });
 
   it("loads files for project selection changes", async () => {
@@ -96,13 +107,15 @@ describe("App", () => {
       />,
     );
 
-    await screen.findByRole("heading", { name: "Records" });
+    await user.click(await screen.findByRole("button", { name: "Records" }));
+    expect(await screen.findByRole("heading", { name: "Records" })).toBeVisible();
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith("project-one", expect.any(AbortSignal)));
     await user.click(screen.getByRole("button", { name: "Field notes" }));
 
     expect(await screen.findByRole("heading", { name: "Field notes" })).toBeVisible();
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith("project-two", expect.any(AbortSignal)));
-    expect(screen.getByText("No files in this project yet.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "파일 탐색" }));
+    expect(screen.getByText("아직 파일이 없습니다.")).toBeVisible();
   });
 
   it("retries the current project file list and recovers to the empty state", async () => {
@@ -121,15 +134,17 @@ describe("App", () => {
       />,
     );
 
+    await user.click(await screen.findByRole("button", { name: "Records" }));
+    await user.click(screen.getByRole("button", { name: "파일 탐색" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Files are temporarily unavailable.");
     expect(listFiles).toHaveBeenNthCalledWith(1, "project-one", expect.any(AbortSignal));
 
-    await user.click(screen.getByRole("button", { name: "Retry loading files" }));
-    expect(screen.getByRole("status")).toHaveTextContent("Loading files");
+    await user.click(screen.getByRole("button", { name: "파일 다시 불러오기" }));
+    expect(screen.getByRole("status")).toHaveTextContent("파일 불러오는 중");
     expect(listFiles).toHaveBeenNthCalledWith(2, "project-one", expect.any(AbortSignal));
 
     await act(async () => recovery.resolve([]));
-    expect(await screen.findByText("No files in this project yet.")).toBeVisible();
+    expect(await screen.findByText("아직 파일이 없습니다.")).toBeVisible();
   });
 
   it("does not let a stale file response override the selected project", async () => {
@@ -149,6 +164,7 @@ describe("App", () => {
       />,
     );
 
+    await user.click(await screen.findByRole("button", { name: "Records" }));
     await screen.findByRole("heading", { name: "Records" });
     await user.click(screen.getByRole("button", { name: "Field notes" }));
     await act(async () => {
@@ -170,9 +186,10 @@ describe("App", () => {
     const user = userEvent.setup();
     render(<App client={makeClient({ listProjects, listFiles, createProject: vi.fn().mockResolvedValue(created) })} />);
 
-    await user.click(await screen.findByRole("button", { name: "Create project" }));
-    await user.type(screen.getByRole("textbox", { name: "Project name" }), "  New records  ");
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(createAction()).toBeVisible());
+    await user.click(createAction());
+    await user.type(screen.getByRole("textbox", { name: "프로젝트 이름" }), "  New records  ");
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
 
     expect(await screen.findByRole("heading", { name: "New records" })).toBeVisible();
     await waitFor(() => expect(listFiles).toHaveBeenCalledWith("created-project", expect.any(AbortSignal)));
@@ -191,9 +208,10 @@ describe("App", () => {
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Create project" }));
-    await user.type(screen.getByRole("textbox", { name: "Project name" }), "New records");
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(createAction()).toBeVisible());
+    await user.click(createAction());
+    await user.type(screen.getByRole("textbox", { name: "프로젝트 이름" }), "New records");
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
 
     const workspace = await screen.findByRole("region", { name: "New records" });
     expect(workspace).toHaveFocus();
@@ -209,9 +227,9 @@ describe("App", () => {
       />,
     );
 
-    const opener = await screen.findByRole("button", { name: "Create project" });
+    const opener = await screen.findByRole("button", { name: "프로젝트 만들기" });
     await user.click(opener);
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "취소" }));
 
     expect(opener).toHaveFocus();
   });
@@ -222,22 +240,25 @@ describe("App", () => {
       listFiles: vi.fn().mockResolvedValue([{ name: "notes.txt", size: "1536", modifiedAt: "2026-08-04T10:00:00Z" }]),
     })} />);
 
-    const table = await screen.findByRole("table", { name: "Project files" });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Records" }));
+    await user.click(screen.getByRole("button", { name: "파일 탐색" }));
+    const table = await screen.findByRole("table", { name: "프로젝트 파일" });
     expect(within(table).getByRole("link", { name: "notes.txt" })).toHaveAttribute(
       "href", "/api/v1/projects/project-one/files/notes.txt",
     );
     expect(within(table).getByText("1.5 KiB")).toBeVisible();
-    expect(screen.getByText("1 file · 1.5 KiB")).toBeVisible();
+    expect(screen.getByText("1개 파일 · 1.5 KiB")).toBeVisible();
   });
 
   it("focuses the upload panel from Uploads navigation", async () => {
     const user = userEvent.setup();
     render(<App client={makeClient({ listProjects: vi.fn().mockResolvedValue([firstProject]) })} />);
-    const navigation = await screen.findByRole("navigation", { name: "Workspace navigation" });
+    const navigation = await screen.findByRole("navigation", { name: "작업 메뉴" });
 
-    await user.click(within(navigation).getByRole("button", { name: "Uploads" }));
+    await user.click(within(navigation).getByRole("button", { name: "업로드" }));
 
-    expect(screen.getByRole("region", { name: "Upload a file" })).toHaveFocus();
+    expect(screen.getByRole("region", { name: "파일 올리기" })).toHaveFocus();
   });
 
   it("uses auto scrolling for Uploads navigation when reduced motion is preferred", async () => {
@@ -247,9 +268,9 @@ describe("App", () => {
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({ matches: true }));
     const user = userEvent.setup();
     render(<App client={makeClient({ listProjects: vi.fn().mockResolvedValue([firstProject]) })} />);
-    const navigation = await screen.findByRole("navigation", { name: "Workspace navigation" });
+    const navigation = await screen.findByRole("navigation", { name: "작업 메뉴" });
 
-    await user.click(within(navigation).getByRole("button", { name: "Uploads" }));
+    await user.click(within(navigation).getByRole("button", { name: "업로드" }));
 
     expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "center" });
     HTMLElement.prototype.scrollIntoView = originalScroll;
@@ -269,12 +290,14 @@ describe("App", () => {
       uploader={asUploader(uploader)}
     />);
 
-    await screen.findByText("No files in this project yet.");
-    expect(screen.getByText("No files")).toBeVisible();
-    await user.upload(screen.getByLabelText("Choose a file to upload"), new File([new Uint8Array(10)], "notes.bin"));
+    await user.click(await screen.findByRole("button", { name: "Records" }));
+    expect(await screen.findByText("아직 파일이 없습니다.")).toBeVisible();
+    await user.upload(screen.getByLabelText("현재 프로젝트에 파일 업로드"), new File([new Uint8Array(10)], "notes.bin"));
 
+    await waitFor(() => expect(listFiles).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "파일 탐색" }));
     expect(await screen.findByRole("link", { name: "notes.bin" })).toBeVisible();
-    expect(screen.getByText("1 file · 10 B")).toBeVisible();
+    expect(screen.getByText("1개 파일 · 10 B")).toBeVisible();
     expect(listFiles).toHaveBeenCalledTimes(2);
   });
 });

@@ -97,7 +97,7 @@ describe("ProjectCreateDialog", () => {
     const user = userEvent.setup();
     render(<DialogHarness onClose={onClose} />);
 
-    const input = screen.getByRole("textbox", { name: "Project name" });
+    const input = screen.getByRole("textbox", { name: "프로젝트 이름" });
     expect(input).toHaveFocus();
 
     await user.keyboard("{Escape}");
@@ -113,7 +113,7 @@ describe("ProjectCreateDialog", () => {
     opener.focus();
     const { rerender } = render(<DialogHarness onCreate={onCreate} />);
 
-    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "취소" }));
     expect(onCreate).not.toHaveBeenCalled();
 
     rerender(<ProjectCreateDialog open={false} onCreate={onCreate} onClose={vi.fn()} />);
@@ -126,12 +126,12 @@ describe("ProjectCreateDialog", () => {
     const user = userEvent.setup();
     render(<DialogHarness onCreate={onCreate} />);
 
-    await user.click(screen.getByRole("button", { name: "Create project" }));
-    expect(screen.getByRole("alert")).toHaveTextContent("Enter a project name.");
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("프로젝트 이름을 입력해주세요.");
 
-    const input = screen.getByRole("textbox", { name: "Project name" });
+    const input = screen.getByRole("textbox", { name: "프로젝트 이름" });
     await user.type(input, " 保存庫 ");
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
     expect(onCreate).toHaveBeenLastCalledWith("保存庫");
   });
 
@@ -139,19 +139,19 @@ describe("ProjectCreateDialog", () => {
     const onCreate = vi.fn().mockResolvedValue(createdProject);
     const user = userEvent.setup();
     const { unmount } = render(<DialogHarness onCreate={onCreate} />);
-    const input = screen.getByRole("textbox", { name: "Project name" });
+    const input = screen.getByRole("textbox", { name: "프로젝트 이름" });
 
     fireEvent.change(input, { target: { value: "🗂️".repeat(50) } });
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
     expect(onCreate).toHaveBeenCalledOnce();
 
     unmount();
     render(<DialogHarness onCreate={onCreate} />);
-    const longInput = screen.getByRole("textbox", { name: "Project name" });
+    const longInput = screen.getByRole("textbox", { name: "프로젝트 이름" });
     fireEvent.change(longInput, { target: { value: "📁".repeat(101) } });
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
     expect(onCreate).toHaveBeenCalledOnce();
-    expect(screen.getByRole("alert")).toHaveTextContent("100 characters or fewer");
+    expect(screen.getByRole("alert")).toHaveTextContent("100자 이하");
   });
 
   it("disables controls while pending and prevents duplicate submission", async () => {
@@ -160,14 +160,14 @@ describe("ProjectCreateDialog", () => {
     const user = userEvent.setup();
     render(<DialogHarness onCreate={onCreate} />);
 
-    await user.type(screen.getByRole("textbox", { name: "Project name" }), "Records");
-    const submit = screen.getByRole("button", { name: "Create project" });
+    await user.type(screen.getByRole("textbox", { name: "프로젝트 이름" }), "Records");
+    const submit = screen.getByRole("button", { name: "프로젝트 만들기" });
     await user.dblClick(submit);
 
     expect(onCreate).toHaveBeenCalledOnce();
-    expect(screen.getByRole("textbox", { name: "Project name" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Creating project" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "프로젝트 이름" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "취소" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "만드는 중…" })).toBeDisabled();
   });
 
   it("announces a safe server error and remains open", async () => {
@@ -175,8 +175,8 @@ describe("ProjectCreateDialog", () => {
     const user = userEvent.setup();
     render(<DialogHarness onCreate={onCreate} />);
 
-    await user.type(screen.getByRole("textbox", { name: "Project name" }), "Records");
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await user.type(screen.getByRole("textbox", { name: "프로젝트 이름" }), "Records");
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Project creation is temporarily unavailable.");
     expect(screen.getByRole("dialog")).toBeVisible();
@@ -187,12 +187,12 @@ describe("ProjectCreateDialog", () => {
     const user = userEvent.setup();
     const { rerender } = render(<ProjectCreateDialog open onCreate={onCreate} onClose={vi.fn()} />);
 
-    await user.type(screen.getByRole("textbox", { name: "Project name" }), "Records");
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await user.type(screen.getByRole("textbox", { name: "프로젝트 이름" }), "Records");
+    await user.click(screen.getByRole("button", { name: "프로젝트 만들기" }));
     rerender(<ProjectCreateDialog open={false} onCreate={onCreate} onClose={vi.fn()} />);
     rerender(<ProjectCreateDialog open onCreate={onCreate} onClose={vi.fn()} />);
 
-    expect(screen.getByRole("textbox", { name: "Project name" })).toBeEnabled();
-    expect(screen.getByRole("textbox", { name: "Project name" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "프로젝트 이름" })).toBeEnabled();
+    expect(screen.getByRole("textbox", { name: "프로젝트 이름" })).toHaveValue("");
   });
 });

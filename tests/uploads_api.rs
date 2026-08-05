@@ -119,6 +119,142 @@ async fn raw_upload_publishes_exact_bytes_and_appears_in_file_listing() {
 }
 
 #[tokio::test]
+async fn chunk_upload_publishes_only_after_all_chunks_are_committed() {
+    let context = TestContext::new().await;
+    let project_id = context.create_project("Large files").await;
+    let app = context.app();
+
+    let started = app
+        .clone()
+        .oneshot(
+            authenticated_request(
+                "POST",
+                &format!("/api/v1/projects/{project_id}/upload-sessions"),
+            )
+            .header("origin", EXTERNAL_ORIGIN)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"fileName": "archive.bin", "totalSize": "11"}).to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, started) = response_json(started).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(started["offset"], "0");
+    assert_eq!(started["chunkSize"], (32_u64 * 1024 * 1024).to_string());
+    let upload_id = started["uploadId"].as_str().unwrap();
+
+    for (offset, bytes, next_offset) in [(0, "cellar", "6"), (6, "-data", "11")] {
+        let chunk = app
+            .clone()
+            .oneshot(
+                authenticated_request(
+                    "PUT",
+                    &format!("/api/v1/upload-sessions/{upload_id}/chunks?offset={offset}"),
+                )
+                .header("origin", EXTERNAL_ORIGIN)
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(bytes))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, chunk) = response_json(chunk).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(chunk["offset"], next_offset);
+        assert!(
+            !context
+                .project_path(project_id)
+                .join("files/archive.bin")
+                .exists()
+        );
+    }
+
+    let completed = app
+        .clone()
+        .oneshot(
+            authenticated_request(
+                "POST",
+                &format!("/api/v1/upload-sessions/{upload_id}/complete"),
+            )
+            .header("origin", EXTERNAL_ORIGIN)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, completed) = response_json(completed).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(completed, json!({"name": "archive.bin", "size": "11"}));
+    assert_eq!(
+        std::fs::read(context.project_path(project_id).join("files/archive.bin")).unwrap(),
+        b"cellar-data"
+    );
+    assert!(canonical_staging_files(&context).is_empty());
+    context.close().await;
+}
+
+#[tokio::test]
+async fn invalid_chunk_removes_the_entire_staging_upload() {
+    let context = TestContext::new().await;
+    let project_id = context.create_project("Cleanup").await;
+    let app = context.app();
+    let started = app
+        .clone()
+        .oneshot(
+            authenticated_request(
+                "POST",
+                &format!("/api/v1/projects/{project_id}/upload-sessions"),
+            )
+            .header("origin", EXTERNAL_ORIGIN)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"fileName": "too-large.bin", "totalSize": "4"}).to_string(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (_, started) = response_json(started).await;
+    let upload_id = started["uploadId"].as_str().unwrap();
+
+    let invalid = app
+        .clone()
+        .oneshot(
+            authenticated_request(
+                "PUT",
+                &format!("/api/v1/upload-sessions/{upload_id}/chunks?offset=0"),
+            )
+            .header("origin", EXTERNAL_ORIGIN)
+            .header("content-type", "application/octet-stream")
+            .body(Body::from("12345"))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert!(canonical_staging_files(&context).is_empty());
+
+    let complete = app
+        .clone()
+        .oneshot(
+            authenticated_request(
+                "POST",
+                &format!("/api/v1/upload-sessions/{upload_id}/complete"),
+            )
+            .header("origin", EXTERNAL_ORIGIN)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete.status(), StatusCode::NOT_FOUND);
+    context.close().await;
+}
+
+#[tokio::test]
 async fn upload_to_missing_project_returns_not_found_without_staging() {
     let context = TestContext::new().await;
     let response = context

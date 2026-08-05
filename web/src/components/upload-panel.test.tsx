@@ -1,63 +1,74 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import { UploadPanel } from "./upload-panel";
-import type { uploadFile } from "../upload-client";
+import { UploadPanel, type UploadTask } from "./upload-panel";
 
-function asUploader(mock: ReturnType<typeof vi.fn>) {
-  return mock as unknown as typeof uploadFile;
+const baseProps = {
+  onReset: vi.fn(),
+  onRetry: vi.fn(),
+  onUpload: vi.fn(),
+  projectId: "project-one",
+  projectName: "Records",
+  task: null,
+};
+
+function task(change: Partial<UploadTask> = {}): UploadTask {
+  return {
+    projectId: "project-one",
+    projectName: "Records",
+    file: new File(["cellar"], "notes.txt"),
+    state: "uploading",
+    progress: 42,
+    result: null,
+    message: "",
+    ...change,
+  };
 }
 
 describe("UploadPanel", () => {
-  it("starts with one simple file picker", () => {
-    render(<UploadPanel onComplete={vi.fn()} projectId="project-one" projectName="Records" />);
+  beforeEach(() => vi.clearAllMocks());
 
-    expect(screen.getByText("Drop one file here")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Upload file" })).toBeVisible();
-    expect(screen.queryByText(/paused|resume|recover/i)).not.toBeInTheDocument();
+  it("starts with one simple file picker", () => {
+    render(<UploadPanel {...baseProps} />);
+
+    expect(screen.getByText("파일 하나를 여기에 놓으세요")).toBeVisible();
+    expect(screen.getByRole("button", { name: "파일 선택" })).toBeVisible();
   });
 
-  it("uploads once and refreshes the completed file list", async () => {
-    let finish!: (value: { name: string; size: string }) => void;
-    const uploader = vi.fn(() => new Promise<{ name: string; size: string }>((resolve) => { finish = resolve; }));
-    const onComplete = vi.fn();
+  it("passes the selected file to the persistent upload owner", async () => {
+    const onUpload = vi.fn();
     const user = userEvent.setup();
-    render(<UploadPanel onComplete={onComplete} projectId="project-one" projectName="Records" upload={asUploader(uploader)} />);
+    render(<UploadPanel {...baseProps} onUpload={onUpload} />);
     const file = new File(["cellar"], "notes.txt");
 
-    await user.upload(screen.getByLabelText("Choose a file to upload"), file);
-    expect(screen.getByRole("status")).toHaveTextContent("Uploading");
-    expect(uploader).toHaveBeenCalledWith(expect.objectContaining({ projectId: "project-one", file }));
+    await user.upload(screen.getByLabelText("업로드할 파일 선택"), file);
+    expect(onUpload).toHaveBeenCalledWith(file);
+  });
 
-    await act(async () => finish({ name: file.name, size: String(file.size) }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Upload complete");
-    expect(onComplete).toHaveBeenCalledOnce();
+  it("renders committed background progress supplied by the app", () => {
+    render(<UploadPanel {...baseProps} task={task()} />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("업로드 중 42%");
+    expect(screen.getByRole("progressbar")).toHaveValue(42);
+    expect(screen.getByText("다른 화면에서도 계속 전송됩니다")).toBeVisible();
   });
 
   it("retries a failed upload from the beginning", async () => {
-    const uploader = vi.fn()
-      .mockRejectedValueOnce(new Error("The connection was interrupted."))
-      .mockResolvedValueOnce({ name: "notes.txt", size: "6" });
+    const onRetry = vi.fn();
     const user = userEvent.setup();
-    render(<UploadPanel onComplete={vi.fn()} projectId="project-one" projectName="Records" upload={asUploader(uploader)} />);
-    const file = new File(["cellar"], "notes.txt");
+    render(<UploadPanel {...baseProps} onRetry={onRetry} task={task({ state: "error", message: "연결이 끊겼습니다." })} />);
 
-    await user.upload(screen.getByLabelText("Choose a file to upload"), file);
-    expect(await screen.findByRole("alert")).toHaveTextContent("The connection was interrupted.");
-    await user.click(screen.getByRole("button", { name: "Retry upload" }));
-
-    expect(await screen.findByRole("status")).toHaveTextContent("Upload complete");
-    expect(uploader).toHaveBeenCalledTimes(2);
-    expect(uploader.mock.calls[1][0].file).toBe(file);
+    expect(screen.getByRole("alert")).toHaveTextContent("연결이 끊겼습니다.");
+    await user.click(screen.getByRole("button", { name: "처음부터 다시 업로드" }));
+    expect(onRetry).toHaveBeenCalledOnce();
   });
 
   it("accepts a dropped file", () => {
-    const uploader = vi.fn().mockResolvedValue({ name: "drop.txt", size: "4" });
-    render(<UploadPanel onComplete={vi.fn()} projectId="project-one" projectName="Records" upload={asUploader(uploader)} />);
+    const onUpload = vi.fn();
+    render(<UploadPanel {...baseProps} onUpload={onUpload} />);
     const file = new File(["drop"], "drop.txt");
 
     fireEvent.drop(screen.getByTestId("upload-drop-target"), { dataTransfer: { files: [file] } });
-
-    expect(uploader).toHaveBeenCalledWith(expect.objectContaining({ file }));
+    expect(onUpload).toHaveBeenCalledWith(file);
   });
 });

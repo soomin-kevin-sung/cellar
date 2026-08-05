@@ -1,5 +1,5 @@
-import { RefreshCw } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { RefreshCw, Upload } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 
 import { api } from "./api";
 import { AppShell } from "./components/app-shell";
@@ -8,7 +8,9 @@ import { EmptyState } from "./components/empty-state";
 import { FeaturePortal, type FeaturePortalOrigin, type FeaturePortalPhase } from "./components/feature-portal";
 import { FileTable } from "./components/file-table";
 import { ProjectCreateDialog } from "./components/project-create-dialog";
-import { UploadPanel } from "./components/upload-panel";
+import { ProjectHome } from "./components/project-home";
+import { UploadDock } from "./components/upload-dock";
+import { UploadPanel, type UploadTask } from "./components/upload-panel";
 import { formatFileSummary } from "./file-format";
 import type { CurrentUser, FileEntry, Project } from "./types";
 import { uploadFile } from "./upload-client";
@@ -51,14 +53,20 @@ export default function App({
   const [filesReloadKey, setFilesReloadKey] = useState(0);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [section, setSection] = useState<"projects" | "upload" | "admin">("projects");
+  const [section, setSection] = useState<"project-home" | "projects" | "upload" | "admin">("projects");
+  const [uploadTask, setUploadTask] = useState<UploadTask | null>(null);
   const [portalPhase, setPortalPhase] = useState<FeaturePortalPhase>("idle");
   const [portalOrigin, setPortalOrigin] = useState<FeaturePortalOrigin>({ column: 2, row: 2 });
-  const [activeFeatureKey, setActiveFeatureKey] = useState<string | null>(null);
   const fileRequestRef = useRef(0);
+  const portalPhaseRef = useRef<FeaturePortalPhase>("idle");
+  const activeFeatureKeyRef = useRef<string | null>(null);
   const portalTimersRef = useRef<number[]>([]);
   const workspaceFocusRef = useRef<HTMLElement>(null);
   const uploadFocusRef = useRef<HTMLElement>(null);
+  const projectUploadInputRef = useRef<HTMLInputElement>(null);
+  const uploadControllerRef = useRef<AbortController | null>(null);
+  const selectedProjectIdRef = useRef<string | null>(null);
+  selectedProjectIdRef.current = selectedProjectId;
 
   const clearPortalTimers = () => {
     portalTimersRef.current.forEach((timer) => window.clearTimeout(timer));
@@ -70,33 +78,43 @@ export default function App({
     row: Math.floor(Math.random() * 5),
   });
 
+  const changePortalPhase = (phase: FeaturePortalPhase) => {
+    portalPhaseRef.current = phase;
+    setPortalPhase(phase);
+  };
+
+  const changeActiveFeature = (featureKey: string | null) => {
+    activeFeatureKeyRef.current = featureKey;
+  };
+
   const openFeature = (featureKey: string, activate: () => void) => {
-    if (portalPhase !== "idle" && activeFeatureKey === featureKey) return;
+    const currentPhase = portalPhaseRef.current;
+    if (currentPhase !== "idle" && activeFeatureKeyRef.current === featureKey) return;
 
     clearPortalTimers();
     setPortalOrigin(randomPortalOrigin());
     const activateFeature = () => {
       activate();
-      setActiveFeatureKey(featureKey);
+      changeActiveFeature(featureKey);
     };
     const revealFeature = () => {
       activateFeature();
-      setPortalPhase("opening");
-      portalTimersRef.current.push(window.setTimeout(() => setPortalPhase("open"), 920));
+      changePortalPhase("opening");
+      portalTimersRef.current.push(window.setTimeout(() => changePortalPhase("open"), 920));
     };
 
     if (prefersReducedMotion()) {
       activateFeature();
-      setPortalPhase("open");
+      changePortalPhase("open");
       return;
     }
 
-    if (portalPhase === "idle") {
+    if (currentPhase === "idle") {
       revealFeature();
       return;
     }
 
-    setPortalPhase("closing");
+    changePortalPhase("closing");
     portalTimersRef.current.push(window.setTimeout(() => {
       revealFeature();
     }, 580));
@@ -105,20 +123,21 @@ export default function App({
   const returnToCube = () => {
     clearPortalTimers();
     setPortalOrigin(randomPortalOrigin());
-    if (prefersReducedMotion() || portalPhase === "idle") {
-      setPortalPhase("idle");
-      setActiveFeatureKey(null);
+    if (prefersReducedMotion() || portalPhaseRef.current === "idle") {
+      changePortalPhase("idle");
+      changeActiveFeature(null);
       return;
     }
-    setPortalPhase("closing");
+    changePortalPhase("closing");
     portalTimersRef.current.push(window.setTimeout(() => {
-      setPortalPhase("idle");
-      setActiveFeatureKey(null);
+      changePortalPhase("idle");
+      changeActiveFeature(null);
     }, 580));
   };
 
   useEffect(() => () => {
     portalTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    uploadControllerRef.current?.abort();
   }, []);
 
   useEffect(() => {
@@ -166,14 +185,14 @@ export default function App({
 
   const createProject = async (name: string) => {
     const created = await client.createProject(name);
-    openFeature(`project:${created.id}`, () => {
+    openFeature(`project-home:${created.id}`, () => {
       setProjects((current) => current.some((project) => project.id === created.id) ? current : [...current, created]);
       setFiles([]);
       setFilesState("loading");
       setFilesError("");
       setSelectedProjectId(created.id);
       setProjectsState("ready");
-      setSection("projects");
+      setSection("project-home");
     });
     return created;
   };
@@ -193,6 +212,72 @@ export default function App({
     setFilesReloadKey((key) => key + 1);
   };
 
+  const runUpload = async (file: File, project: Project) => {
+    if (uploadControllerRef.current) return;
+    const controller = new AbortController();
+    uploadControllerRef.current = controller;
+    setUploadTask({
+      projectId: project.id,
+      projectName: project.name,
+      file,
+      state: "uploading",
+      progress: 0,
+      result: null,
+      message: "",
+    });
+    try {
+      const result = await uploader({
+        projectId: project.id,
+        file,
+        onProgress: (uploadedBytes, totalBytes) => {
+          const progress = totalBytes > 0 ? Math.round((uploadedBytes / totalBytes) * 100) : 0;
+          setUploadTask((current) => current?.file === file ? { ...current, progress } : current);
+        },
+        signal: controller.signal,
+      });
+      setUploadTask((current) => current?.file === file ? {
+        ...current,
+        state: "complete",
+        progress: 100,
+        result,
+      } : current);
+      if (selectedProjectIdRef.current === project.id) retryFiles();
+    } catch (reason) {
+      if (controller.signal.aborted) return;
+      setUploadTask((current) => current?.file === file ? {
+        ...current,
+        state: "error",
+        message: safeMessage(reason, "파일을 업로드하지 못했습니다. 다시 시도해주세요."),
+      } : current);
+    } finally {
+      if (uploadControllerRef.current === controller) uploadControllerRef.current = null;
+    }
+  };
+
+  const retryUpload = () => {
+    if (!uploadTask || uploadTask.state === "uploading") return;
+    void runUpload(uploadTask.file, { id: uploadTask.projectId, name: uploadTask.projectName, createdAt: "" });
+  };
+
+  const resetUpload = () => {
+    if (uploadTask?.state === "uploading") return;
+    setUploadTask(null);
+  };
+
+  const projectUploadChanged = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (file && selectedProject) void runUpload(file, selectedProject);
+  };
+
+  const openUploadTask = () => {
+    if (!uploadTask) return;
+    openFeature(`upload:${uploadTask.projectId}`, () => {
+      setSection("upload");
+      selectProject(uploadTask.projectId);
+    });
+  };
+
   useEffect(() => {
     if (section !== "upload" || portalPhase !== "open") return;
     const panel = uploadFocusRef.current;
@@ -207,30 +292,57 @@ export default function App({
     <>
       <div aria-hidden={dialogOpen ? "true" : undefined}>
         <AppShell
-          activeProjectId={portalPhase === "idle" || section !== "projects" ? null : selectedProjectId}
+          activeProjectId={portalPhase === "idle" || (section !== "project-home" && section !== "projects") ? null : selectedProjectId}
           activeSection={portalPhase === "idle" ? null : section}
           onCreateProject={() => setDialogOpen(true)}
           currentUser={currentUser}
           onLogout={() => { void onLogout?.(); }}
           onOpenAdmin={() => openFeature("admin", () => setSection("admin"))}
           onOpenHome={returnToCube}
+          onOpenProjectHome={() => {
+            if (!selectedProjectId) return;
+            openFeature(`project-home:${selectedProjectId}`, () => setSection("project-home"));
+          }}
           onOpenUploads={() => {
             if (!selectedProjectId) return;
             openFeature(`upload:${selectedProjectId}`, () => setSection("upload"));
           }}
-          onSelectProject={(projectId) => openFeature(`project:${projectId}`, () => {
-            setSection("projects");
+          onSelectProject={(projectId) => openFeature(`project-home:${projectId}`, () => {
+            setSection("project-home");
             selectProject(projectId);
           })}
           projects={projects}
           selectedProjectId={selectedProjectId}
-          showCreateAction={section === "projects" && projectsState === "ready"}
+          showCreateAction={portalPhase === "idle" && projectsState === "ready"}
         >
         <FeaturePortal
           origin={portalOrigin}
           phase={effectivePortalPhase}
         >
+        {selectedProject ? (
+          <input
+            aria-label="현재 프로젝트에 파일 업로드"
+            className="sr-only"
+            disabled={uploadTask?.state === "uploading"}
+            onChange={projectUploadChanged}
+            ref={projectUploadInputRef}
+            type="file"
+          />
+        ) : null}
         {section === "admin" && currentUser?.role === "admin" ? <AdminPanel currentUser={currentUser} /> : null}
+
+        {section === "project-home" && projectsState === "ready" && selectedProject ? (
+          <ProjectHome
+            files={files}
+            focusRef={workspaceFocusRef}
+            onBrowseFiles={() => openFeature(`project:${selectedProject.id}`, () => {
+              setSection("projects");
+            })}
+            onUpload={() => projectUploadInputRef.current?.click()}
+            project={selectedProject}
+            state={filesState}
+          />
+        ) : null}
 
         {section === "projects" ? <>
         {projectsState === "loading" ? (
@@ -269,25 +381,27 @@ export default function App({
             tabIndex={-1}
           >
             <header className="project-workspace__header">
-              <p className="eyebrow">프로젝트</p>
-              <h1 id="project-title">{selectedProject.name}</h1>
-              <p className="project-workspace__summary">
-                {filesState === "loading" ? "파일 정보 불러오는 중…" : filesState === "error" ? "파일 정보를 불러오지 못했습니다" : formatFileSummary(files)}
-              </p>
+              <div>
+                <p className="eyebrow">프로젝트 / 파일</p>
+                <h1 id="project-title">{selectedProject.name}</h1>
+                <p className="project-workspace__summary">
+                  {filesState === "loading" ? "파일 정보 불러오는 중…" : filesState === "error" ? "파일 정보를 불러오지 못했습니다" : formatFileSummary(files)}
+                </p>
+              </div>
+              <button
+                className="button button--primary project-workspace__upload"
+                disabled={uploadTask?.state === "uploading"}
+                onClick={() => projectUploadInputRef.current?.click()}
+                type="button"
+              >
+                <Upload aria-hidden="true" size={16} />파일 올리기
+              </button>
             </header>
 
             <div className="files-panel" aria-live="polite">
               <FileTable error={filesError} files={files} onRetry={retryFiles} projectId={selectedProject.id} state={filesState} />
             </div>
 
-            <UploadPanel
-              key={selectedProject.id}
-              onComplete={retryFiles}
-              projectId={selectedProject.id}
-              projectName={selectedProject.name}
-              ref={uploadFocusRef}
-              upload={uploader}
-            />
           </section>
         ) : null}
         </> : null}
@@ -300,16 +414,25 @@ export default function App({
               <p className="project-workspace__summary">이 PC로 파일을 전송합니다.</p>
             </header>
             <UploadPanel
-              key={`feature-upload-${selectedProject.id}`}
-              onComplete={retryFiles}
+              onReset={resetUpload}
+              onRetry={retryUpload}
+              onUpload={(file) => { void runUpload(file, selectedProject); }}
               projectId={selectedProject.id}
               projectName={selectedProject.name}
               ref={uploadFocusRef}
-              upload={uploader}
+              task={uploadTask}
             />
           </section>
         ) : null}
         </FeaturePortal>
+        {uploadTask && !(section === "upload" && portalPhase === "open") ? (
+          <UploadDock
+            onOpen={openUploadTask}
+            onReset={resetUpload}
+            onRetry={retryUpload}
+            task={uploadTask}
+          />
+        ) : null}
         </AppShell>
       </div>
 

@@ -83,6 +83,6 @@ describe("api", () => {
   ])("uses a safe fallback for a %s failure", async (_label, response) => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
 
-    await expect(api.listProjects()).rejects.toThrow("Something went wrong. Please try again.");
+    await expect(api.listProjects()).rejects.toThrow("문제가 발생했습니다. 다시 시도해주세요.");
   });
 });

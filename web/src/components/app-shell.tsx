@@ -6,12 +6,13 @@ import type { CurrentUser } from "../types";
 
 interface AppShellProps {
   activeProjectId: string | null;
-  activeSection: "projects" | "upload" | "admin" | null;
+  activeSection: "project-home" | "projects" | "upload" | "admin" | null;
   projects: Project[];
   selectedProjectId: string | null;
   onSelectProject: (projectId: string) => void;
   onCreateProject: () => void;
   onOpenHome: () => void;
+  onOpenProjectHome: () => void;
   onOpenUploads: () => void;
   showCreateAction: boolean;
   currentUser?: CurrentUser;
@@ -28,6 +29,7 @@ export function AppShell({
   onSelectProject,
   onCreateProject,
   onOpenHome,
+  onOpenProjectHome,
   onOpenUploads,
   showCreateAction,
   currentUser,
@@ -36,7 +38,7 @@ export function AppShell({
   children,
 }: AppShellProps) {
   return (
-    <div className="app-shell">
+    <div className={`app-shell${showCreateAction ? " app-shell--create-visible" : ""}`}>
       <aside className="sidebar">
         <button className="sidebar__heading" onClick={onOpenHome} type="button">
           <Folder aria-hidden="true" size={18} strokeWidth={1.8} />
@@ -89,6 +91,9 @@ export function AppShell({
           </div>
           <button aria-label="업로드" className="mobile-upload" onClick={onOpenUploads} type="button">
             <Upload aria-hidden="true" size={17} />
+          </button>
+          <button aria-label="프로젝트 홈" className="mobile-upload" onClick={onOpenProjectHome} type="button">
+            <Folder aria-hidden="true" size={17} />
           </button>
         </header>
 
