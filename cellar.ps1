@@ -8,7 +8,12 @@ param(
     [string]$Password = $env:CELLAR_PASSWORD,
 
     [ValidatePattern('^[a-z0-9](?:[a-z0-9-]{0,50}[a-z0-9])?$')]
-    [string]$VercelProject = $env:CELLAR_VERCEL_PROJECT
+    [string]$VercelProject = $env:CELLAR_VERCEL_PROJECT,
+
+    [ValidatePattern('^/(?:[a-z0-9-]+)?$')]
+    [string]$VercelPath = $env:CELLAR_VERCEL_PATH,
+
+    [string]$VercelStatePath = $env:CELLAR_VERCEL_STATE_PATH
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +45,29 @@ if (Test-Path -LiteralPath $launcherConfigPath -PathType Leaf) {
     if ([string]::IsNullOrWhiteSpace($VercelProject) -and
         $launcherConfig.PSObject.Properties.Name -contains 'vercelProject') {
         $VercelProject = [string]$launcherConfig.vercelProject
+    }
+
+    if ([string]::IsNullOrWhiteSpace($VercelPath) -and
+        $launcherConfig.PSObject.Properties.Name -contains 'vercelPath') {
+        $VercelPath = [string]$launcherConfig.vercelPath
+    }
+
+    if ([string]::IsNullOrWhiteSpace($VercelStatePath) -and
+        $launcherConfig.PSObject.Properties.Name -contains 'vercelStatePath') {
+        $VercelStatePath = [string]$launcherConfig.vercelStatePath
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($VercelPath)) {
+    $VercelPath = '/'
+}
+
+if ([string]::IsNullOrWhiteSpace($VercelStatePath)) {
+    $VercelStatePath = if ($installedLayout) {
+        Join-Path $repositoryRoot 'config\vercel-routes.json'
+    }
+    else {
+        Join-Path $env:LOCALAPPDATA 'Cellar\vercel-routes.json'
     }
 }
 
@@ -84,6 +112,12 @@ function Publish-VercelEntry {
         [string]$Destination,
 
         [Parameter(Mandatory = $true)]
+        [string]$RoutePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$StatePath,
+
+        [Parameter(Mandatory = $true)]
         [string]$WorkingDirectory
     )
 
@@ -92,17 +126,100 @@ function Publish-VercelEntry {
         throw 'Vercel 진입 주소를 배포하려면 Node.js와 npx가 필요합니다.'
     }
 
+    $destinationUri = $null
+    if (-not [Uri]::TryCreate($Destination, [UriKind]::Absolute, [ref]$destinationUri) -or
+        $destinationUri.Scheme -ne 'https' -or
+        $destinationUri.AbsolutePath -ne '/' -or
+        -not [string]::IsNullOrEmpty($destinationUri.Query) -or
+        -not [string]::IsNullOrEmpty($destinationUri.Fragment)) {
+        throw 'Vercel destination must be an HTTPS origin without a path, query, or fragment.'
+    }
+    $normalizedDestination = $destinationUri.GetLeftPart([UriPartial]::Authority)
+
+    $resolvedStatePath = [IO.Path]::GetFullPath($StatePath)
+    $stateDirectory = Split-Path -Parent $resolvedStatePath
+    [IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
+
+    $routes = [ordered]@{}
+    if (Test-Path -LiteralPath $resolvedStatePath -PathType Leaf) {
+        try {
+            $savedState = Get-Content -LiteralPath $resolvedStatePath -Raw -Encoding utf8 |
+                ConvertFrom-Json
+            if ($savedState.project -and [string]$savedState.project -ne $Project) {
+                throw "The saved Vercel project is '$($savedState.project)', not '$Project'."
+            }
+            if ($savedState.routes) {
+                foreach ($property in $savedState.routes.PSObject.Properties) {
+                    $routes[$property.Name] = [string]$property.Value
+                }
+            }
+        }
+        catch {
+            throw "Invalid Vercel route state: $resolvedStatePath. $($_.Exception.Message)"
+        }
+    }
+
+    if ($RoutePath -ne '/' -and -not $routes.Contains('/')) {
+        $request = [Net.HttpWebRequest]::Create("https://$Project.vercel.app/")
+        $request.Method = 'HEAD'
+        $request.AllowAutoRedirect = $false
+        $response = $null
+        try {
+            $response = $request.GetResponse()
+        }
+        catch [Net.WebException] {
+            $response = $_.Exception.Response
+        }
+        if ($null -ne $response) {
+            try {
+                $existingLocation = $response.Headers['Location']
+                $existingUri = $null
+                if ([Uri]::TryCreate($existingLocation, [UriKind]::Absolute, [ref]$existingUri) -and
+                    $existingUri.Scheme -eq 'https') {
+                    $routes['/'] = $existingUri.GetLeftPart([UriPartial]::Authority)
+                }
+            }
+            finally {
+                $response.Close()
+            }
+        }
+    }
+
+    $routes[$RoutePath] = $normalizedDestination
+    if (-not $routes.Contains('/')) {
+        throw 'The production Vercel route is missing. Start production once before publishing /dev.'
+    }
+
+    $redirects = [Collections.Generic.List[object]]::new()
+    foreach ($path in @($routes.Keys | Where-Object { $_ -ne '/' } | Sort-Object Length -Descending)) {
+        $target = [string]$routes[$path]
+        $redirects.Add([ordered]@{
+            source = $path
+            destination = $target
+            permanent = $false
+        })
+        $redirects.Add([ordered]@{
+            source = "$path/:path*"
+            destination = "$target/:path*"
+            permanent = $false
+        })
+    }
+    $redirects.Add([ordered]@{
+        source = '/'
+        destination = [string]$routes['/']
+        permanent = $false
+    })
+    $redirects.Add([ordered]@{
+        source = '/:path*'
+        destination = "$($routes['/'])/:path*"
+        permanent = $false
+    })
+
     $entryRoot = Join-Path $WorkingDirectory 'vercel-entry'
     [IO.Directory]::CreateDirectory($entryRoot) | Out-Null
-    $vercelConfig = @{
+    $vercelConfig = [ordered]@{
         '$schema' = 'https://openapi.vercel.sh/vercel.json'
-        redirects = @(
-            @{
-                source = '/(.*)'
-                destination = $Destination
-                permanent = $false
-            }
-        )
+        redirects = $redirects
     } | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText(
         (Join-Path $entryRoot 'vercel.json'),
@@ -110,11 +227,29 @@ function Publish-VercelEntry {
         [Text.UTF8Encoding]::new($false)
     )
 
-    $output = & $npx.Source --yes vercel deploy $entryRoot --prod --yes --project $Project --no-color 2>&1
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & $npx.Source --yes vercel deploy $entryRoot --prod --yes --project $Project --no-color 2>&1
+        $vercelExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     $outputText = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-    if ($LASTEXITCODE -ne 0) {
+    if ($vercelExitCode -ne 0) {
         throw "Vercel 배포에 실패했습니다. 먼저 'npx vercel login'을 실행해 로그인하세요.`n$outputText"
     }
+
+    $state = [ordered]@{
+        schemaVersion = 1
+        project = $Project
+        routes = $routes
+        updatedAt = [DateTimeOffset]::Now.ToString('o')
+    } | ConvertTo-Json -Depth 5
+    $temporaryStatePath = "$resolvedStatePath.tmp"
+    [IO.File]::WriteAllText($temporaryStatePath, $state, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporaryStatePath -Destination $resolvedStatePath -Force
 
     $urls = [regex]::Matches($outputText, 'https://[a-z0-9.-]+\.vercel\.app')
     if ($urls.Count -gt 0) {
@@ -209,6 +344,8 @@ try {
             $entryUrl = Publish-VercelEntry `
                 -Project $VercelProject `
                 -Destination $publicUrl `
+                -RoutePath $VercelPath `
+                -StatePath $VercelStatePath `
                 -WorkingDirectory $runtimeRoot
         }
         catch {

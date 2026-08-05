@@ -70,7 +70,7 @@ function LoginPage({ onLogin }: { onLogin: (user: CurrentUser) => void }) {
       setUnlocking(true);
       const reducedMotion = typeof window.matchMedia === "function" &&
         window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      await new Promise((resolve) => window.setTimeout(resolve, reducedMotion ? 0 : 1150));
+      await new Promise((resolve) => window.setTimeout(resolve, reducedMotion ? 0 : 1450));
       onLogin(current);
     } catch (reason) {
       setError(reason instanceof ApiError && reason.status === 401
@@ -81,13 +81,40 @@ function LoginPage({ onLogin }: { onLogin: (user: CurrentUser) => void }) {
     }
   };
 
+  const protocolState = unlocking
+    ? "ACCESS GRANTED"
+    : submitting
+      ? "VERIFYING"
+      : error
+        ? "SIGNAL REJECTED"
+        : "AUTH REQUIRED";
+
   return (
-    <main className={`login-page${submitting ? " is-checking" : ""}${unlocking ? " is-unlocked" : ""}`}>
+    <main className={`login-page${submitting ? " is-checking" : ""}${unlocking ? " is-unlocked" : ""}${error ? " is-rejected" : ""}`}>
+      <div className="login-grid" aria-hidden="true" />
+      <div className="login-scan" aria-hidden="true" />
       <div className="login-orbit" aria-hidden="true" />
       <div className="login-beam" aria-hidden="true" />
+      <div className="login-channel" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </div>
+
+      <div className="login-telemetry" aria-hidden="true">
+        <span className="login-telemetry__node"><i /> NODE ONLINE</span>
+        <span>TLS / ACTIVE</span>
+      </div>
+
       <section className="login-panel" aria-labelledby="login-title">
         <div className="login-panel__inner">
           <h1 className="sr-only" id="login-title">로그인</h1>
+
+          <div className="login-protocol" aria-hidden="true">
+            <span>AUTH / 01</span>
+            <span className="login-protocol__line" />
+            <strong>{protocolState}</strong>
+          </div>
 
           <form className="login-form" onSubmit={submit}>
             <label>
@@ -105,6 +132,11 @@ function LoginPage({ onLogin }: { onLogin: (user: CurrentUser) => void }) {
           </form>
         </div>
       </section>
+
+      <div className="login-footer" aria-hidden="true">
+        <span>LOCAL STORAGE NODE</span>
+        <span>SESSION / ENCRYPTED</span>
+      </div>
     </main>
   );
 }

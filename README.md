@@ -145,6 +145,20 @@ wrapper for the same deployment flow.
 
 ## Start locally
 
+Run the isolated remote development environment on port `8788` with its own
+data under `D:\Cellar-dev\data`:
+
+```powershell
+.\dev.ps1
+```
+
+The script builds the current workspace, creates a separate Quick Tunnel, and
+updates `https://cellar-entry.vercel.app/dev`. Production remains on port
+`8787` with data under `D:\Cellar\data`. Both launchers share only
+`D:\Cellar\config\vercel-routes.json`, which preserves both redirect targets
+when either temporary tunnel URL changes. Use `CELLAR_DEV_PASSWORD` or the
+`-Password` parameter when a stable development bootstrap password is wanted.
+
 For development, the helper rebuilds the frontend, temporarily sets
 `CELLAR_CONFIG`, and runs the Rust application:
 

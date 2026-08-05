@@ -75,7 +75,11 @@ finally {
                 throw 'Refusing to replace an unsafe web/dist/.gitkeep entry.'
             }
         }
-        [System.IO.File]::WriteAllBytes($webDistPlaceholder, [byte[]]@())
+        [System.IO.File]::WriteAllText(
+            $webDistPlaceholder,
+            "`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
     }
     catch {
         [Console]::Error.WriteLine("Failed to restore web/dist/.gitkeep: $($_.Exception.Message)")

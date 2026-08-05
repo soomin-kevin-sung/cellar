@@ -40,7 +40,7 @@ if (-not $SkipBuild) {
         throw 'The frontend build failed.'
     }
 
-    & cargo build --release
+    & cargo build --manifest-path (Join-Path $repositoryRoot 'Cargo.toml') --release
     if ($LASTEXITCODE -ne 0) {
         throw 'The Cellar release build failed.'
     }
@@ -95,6 +95,8 @@ if ($null -ne $cloudflaredSource) {
 $launcherConfig = [ordered]@{
     port = $Port
     vercelProject = $VercelProject
+    vercelPath = '/'
+    vercelStatePath = (Join-Path $configRoot 'vercel-routes.json')
 } | ConvertTo-Json
 [IO.File]::WriteAllText(
     (Join-Path $configRoot 'launcher.json'),
